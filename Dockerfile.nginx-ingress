@@ -1,29 +1,28 @@
 # NGINX Ingress Controller with Embedded Paygress Plugin
 FROM rust:1.85 AS builder
 
+# Install musl target for Alpine compatibility
+RUN rustup target add x86_64-unknown-linux-musl
+RUN apt-get update && apt-get install -y musl-tools
+
 WORKDIR /app
 COPY Cargo.toml .
 COPY src/ src/
 
-# Build the plugin library with embedded Nostr listener
-RUN cargo build --release --features nginx --lib
+# Build the plugin library for musl (Alpine Linux compatibility)
+RUN cargo build --release --target x86_64-unknown-linux-musl --features nginx --lib
 
 # NGINX Ingress Controller with Paygress Plugin
 FROM registry.k8s.io/ingress-nginx/controller:v1.8.1
 
 USER root
 
-# Install dependencies for dynamic library loading (Alpine Linux)
+# Install minimal dependencies for musl binary
 RUN apk update && apk add --no-cache \
-    openssl \
-    ca-certificates \
-    libc6-compat \
-    gcompat \
-    libgcc \
-    libstdc++
+    ca-certificates
 
-# Copy the compiled plugin library (for Lua FFI, not NGINX module)
-COPY --from=builder /app/target/release/libpaygress.so /etc/nginx/modules/paygress.so
+# Copy the musl-compiled plugin library (for Lua FFI)
+COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/libpaygress.so /etc/nginx/modules/paygress.so
 RUN chmod 644 /etc/nginx/modules/paygress.so
 
 # Verify the library can be loaded via FFI
