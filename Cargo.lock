@@ -789,6 +789,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "console_error_panic_hook"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a06aeb73f470f66dcdbf7223caeebb85984942f22f1adb2a088cf9668146bbbc"
+dependencies = [
+ "cfg-if",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "core-foundation"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2235,16 +2245,25 @@ dependencies = [
  "cdk",
  "cdk-redb",
  "chrono",
+ "console_error_panic_hook",
+ "js-sys",
  "k8s-openapi",
  "kube",
+ "libc",
+ "log",
  "nostr-sdk",
+ "proxy-wasm",
  "rand 0.8.5",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]
@@ -2407,6 +2426,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "89ae43fd86e4158d6db51ad8e2b80f313af9cc74f5c0e03ccb87de09998732de"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "proxy-wasm"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1091bf0c55673146a93a310b28375282b64e2681acfd501684135ee85cdc4ad"
+dependencies = [
+ "hashbrown 0.15.5",
+ "log",
 ]
 
 [[package]]

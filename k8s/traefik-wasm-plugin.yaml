@@ -1,0 +1,132 @@
+# Traefik with WASM Plugin
+# This loads your Rust WASM module directly into Traefik
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: traefik-wasm-config
+  namespace: traefik-system
+data:
+  traefik.yml: |
+    experimental:
+      plugins:
+        paygress:
+          moduleName: github.com/your-org/paygress-traefik-plugin
+          version: v1.0.0
+          
+    # WASM plugin configuration
+    wasm:
+      paygress:
+        filename: /plugins/paygress.wasm
+        config:
+          amount: 1000
+          enable_pod_provisioning: true
+          cashu_mint_url: "https://mint.example.com"
+---
+# Traefik Middleware using WASM plugin
+apiVersion: traefik.containo.us/v1alpha1
+kind: Middleware
+metadata:
+  name: paygress-wasm-auth
+  namespace: default
+spec:
+  plugin:
+    paygress:
+      amount: 1000
+      enable_pod_provisioning: true
+      cashu_mint_url: "https://mint.example.com"
+---
+# IngressRoute using the WASM plugin
+apiVersion: traefik.containo.us/v1alpha1
+kind: IngressRoute
+metadata:
+  name: paygress-wasm-protected
+  namespace: default
+spec:
+  entryPoints:
+    - websecure
+  routes:
+  - match: Host(`api.example.com`) && PathPrefix(`/premium`)
+    kind: Rule
+    services:
+    - name: premium-backend
+      port: 80
+    middlewares:
+    - name: paygress-wasm-auth
+  
+  - match: Host(`api.example.com`) && PathPrefix(`/api/v1/premium`)
+    kind: Rule
+    services:
+    - name: api-backend
+      port: 80
+    middlewares:
+    - name: paygress-wasm-auth
+  
+  # Free tier - no payment required
+  - match: Host(`api.example.com`) && PathPrefix(`/free`)
+    kind: Rule
+    services:
+    - name: free-backend
+      port: 80
+      
+  tls:
+    certResolver: letsencrypt
+---
+# Traefik deployment with WASM support
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: traefik-with-wasm
+  namespace: traefik-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: traefik-with-wasm
+  template:
+    metadata:
+      labels:
+        app: traefik-with-wasm
+    spec:
+      containers:
+      - name: traefik
+        image: traefik:v3.0
+        args:
+          - --configfile=/config/traefik.yml
+          - --log.level=INFO
+        ports:
+        - containerPort: 80
+        - containerPort: 443
+        - containerPort: 8080  # Dashboard
+        volumeMounts:
+        - name: config
+          mountPath: /config
+        - name: wasm-plugins
+          mountPath: /plugins
+      volumes:
+      - name: config
+        configMap:
+          name: traefik-wasm-config
+      - name: wasm-plugins
+        configMap:
+          name: paygress-wasm-plugin
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: traefik-with-wasm
+  namespace: traefik-system
+spec:
+  selector:
+    app: traefik-with-wasm
+  ports:
+  - name: http
+    port: 80
+    targetPort: 80
+  - name: https
+    port: 443
+    targetPort: 443
+  - name: dashboard
+    port: 8080
+    targetPort: 8080
+  type: LoadBalancer

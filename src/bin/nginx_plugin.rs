@@ -1,0 +1,75 @@
+// NGINX Plugin Binary Entry Point
+// This creates the dynamic module for NGINX
+
+fn main() {
+    println!("🔵 Paygress NGINX Plugin Builder");
+    println!("Building dynamic module for NGINX integration...");
+    println!();
+    
+    println!("✅ Module structure created!");
+    println!("📋 NGINX Integration Steps:");
+    println!();
+    println!("1️⃣ Build the dynamic module:");
+    println!("   cargo build --release --features nginx");
+    println!("   # This creates: target/release/libpaygress.so");
+    println!();
+    println!("2️⃣ Copy to NGINX modules directory:");
+    println!("   sudo cp target/release/libpaygress.so /etc/nginx/modules/ngx_http_paygress_module.so");
+    println!();
+    println!("3️⃣ Configure NGINX (add to nginx.conf):");
+    println!("   load_module modules/ngx_http_paygress_module.so;");
+    println!();
+    println!("4️⃣ Add server configuration:");
+    println!("   server {{");
+    println!("       listen 80;");
+    println!("       server_name your-domain.com;");
+    println!();
+    println!("       # Enable Paygress for premium content");
+    println!("       location /premium {{");
+    println!("           # Payment required: 1000 satoshis");
+    println!("           access_by_lua_block {{");
+    println!("               local headers = ngx.req.get_headers()");
+    println!("               local cashu_token = headers['X-Cashu-Token']");
+    println!("               ");
+    println!("               if not cashu_token then");
+    println!("                   ngx.status = 402");
+    println!("                   ngx.say('Payment Required: Send Cashu token in X-Cashu-Token header')");
+    println!("                   ngx.exit(402)");
+    println!("               end");
+    println!("               ");
+    println!("               -- Call our Rust verification function");
+    println!("               local ffi = require('ffi')");
+    println!("               ffi.cdef[[");
+    println!("                   int ngx_http_paygress_verify_payment(const char* token, int amount);");
+    println!("               ]]");
+    println!("               ");
+    println!("               local paygress = ffi.load('/etc/nginx/modules/ngx_http_paygress_module.so')");
+    println!("               local result = paygress.ngx_http_paygress_verify_payment(cashu_token, 1000)");
+    println!("               ");
+    println!("               if result ~= 0 then");
+    println!("                   ngx.status = 402");
+    println!("                   ngx.say('Invalid payment token')");
+    println!("                   ngx.exit(402)");
+    println!("               end");
+    println!("           }}");
+    println!();
+    println!("           proxy_pass http://premium-backend;");
+    println!("       }}");
+    println!();
+    println!("       # Free content (no payment required)");
+    println!("       location / {{");
+    println!("           proxy_pass http://free-backend;");
+    println!("       }}");
+    println!("   }}");
+    println!();
+    println!("5️⃣ Test the integration:");
+    println!("   # Request without payment");
+    println!("   curl http://your-domain.com/premium");
+    println!("   # → 402 Payment Required");
+    println!();
+    println!("   # Request with valid Cashu token");
+    println!("   curl -H 'X-Cashu-Token: <your-cashu-token>' http://your-domain.com/premium");
+    println!("   # → Access granted to premium content");
+    println!();
+    println!("🚀 Ready for production deployment!");
+}

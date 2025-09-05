@@ -1,0 +1,182 @@
+# Enhanced NGINX Ingress Controller Integration with Paygress
+# This uses the external auth pattern - the recommended approach
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: paygress-system
+---
+# Paygress External Auth Service
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: paygress-auth
+  namespace: paygress-system
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: paygress-auth
+  template:
+    metadata:
+      labels:
+        app: paygress-auth
+    spec:
+      containers:
+      - name: paygress
+        image: paygress:latest
+        ports:
+        - containerPort: 8080
+        env:
+        - name: PAYGRESS_MODE
+          value: "complete"
+        - name: ENABLE_POD_PROVISIONING
+          value: "true"
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: paygress-auth
+  namespace: paygress-system
+spec:
+  selector:
+    app: paygress-auth
+  ports:
+  - port: 8080
+    targetPort: 8080
+---
+# Example protected application
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: premium-app
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: premium-app
+  template:
+    metadata:
+      labels:
+        app: premium-app
+    spec:
+      containers:
+      - name: app
+        image: nginx:alpine
+        ports:
+        - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: premium-app
+  namespace: default
+spec:
+  selector:
+    app: premium-app
+  ports:
+  - port: 80
+    targetPort: 80
+---
+# NGINX Ingress with Paygress Authentication
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: paygress-protected-ingress
+  namespace: default
+  annotations:
+    # Use NGINX Ingress Controller
+    kubernetes.io/ingress.class: "nginx"
+    
+    # External Authentication with Paygress
+    nginx.ingress.kubernetes.io/auth-url: "http://paygress-auth.paygress-system.svc.cluster.local:8080/auth"
+    nginx.ingress.kubernetes.io/auth-method: "GET"
+    
+    # Forward auth headers
+    nginx.ingress.kubernetes.io/auth-response-headers: |
+      X-Payment-Verified,X-Payment-Amount,X-Provisioned-Pod,X-Auth-Reason
+    
+    # Pass original request info to auth service
+    nginx.ingress.kubernetes.io/auth-snippet: |
+      proxy_set_header X-Original-URL $scheme://$http_host$request_uri;
+      proxy_set_header X-Forwarded-Method $request_method;
+      proxy_set_header X-Forwarded-Proto $scheme;
+      proxy_set_header X-Forwarded-For $remote_addr;
+      proxy_set_header X-Real-IP $remote_addr;
+    
+    # Custom error responses
+    nginx.ingress.kubernetes.io/server-snippet: |
+      error_page 401 402 403 = @payment_required;
+      location @payment_required {
+        internal;
+        add_header Content-Type application/json always;
+        return 402 '{"error":"Payment Required","message":"Send Cashu token in Authorization header","amount":1000}';
+      }
+
+spec:
+  rules:
+  - host: your-domain.com
+    http:
+      paths:
+      # Free tier - no auth required
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: premium-app
+            port:
+              number: 80
+      
+      # Premium tier - requires payment
+      - path: /premium
+        pathType: Prefix
+        backend:
+          service:
+            name: premium-app
+            port:
+              number: 80
+      
+      # API endpoints - require payment
+      - path: /api/v1/premium
+        pathType: Prefix
+        backend:
+          service:
+            name: premium-app
+            port:
+              number: 80
+---
+# Separate ingress for completely free content (no auth)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: free-content-ingress
+  namespace: default
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+spec:
+  rules:
+  - host: your-domain.com
+    http:
+      paths:
+      - path: /free
+        pathType: Prefix
+        backend:
+          service:
+            name: premium-app
+            port:
+              number: 80
+      - path: /health
+        pathType: Prefix
+        backend:
+          service:
+            name: premium-app
+            port:
+              number: 80

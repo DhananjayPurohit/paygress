@@ -3,10 +3,18 @@ use serde_json::Value;
 use serde::Deserialize;
 
 // Module declarations
-mod cashu;
+pub mod cashu;
 pub mod nostr;
 pub mod nginx_auth;
 pub mod complete_plugin;
+
+// NGINX plugin module (compiles to .so)
+#[cfg(feature = "nginx-plugin")]
+pub mod nginx_plugin;
+
+// Direct NGINX module (no Lua required)
+#[cfg(feature = "nginx-direct")]
+pub mod nginx_direct;
 
 // Re-export public types and functions for easy access
 pub use nostr::{NostrRelaySubscriber, RelayConfig, default_relay_config, custom_relay_config};

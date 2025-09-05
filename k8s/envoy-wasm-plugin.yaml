@@ -1,0 +1,179 @@
+# Envoy/Istio with WASM Plugin
+# This loads your Rust WASM module directly into Envoy
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: paygress-envoy-wasm
+  namespace: istio-system
+data:
+  paygress.wasm: |
+    # Base64 encoded WASM binary
+    # Generated from: pkg/envoy-wasm/paygress.wasm
+---
+# Envoy Filter for Istio
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: paygress-wasm-filter
+  namespace: istio-system
+spec:
+  configPatches:
+  - applyTo: HTTP_FILTER
+    match:
+      context: SIDECAR_INBOUND
+      listener:
+        filterChain:
+          filter:
+            name: "envoy.filters.network.http_connection_manager"
+    patch:
+      operation: INSERT_BEFORE
+      value:
+        name: envoy.filters.http.wasm
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.http.wasm.v3.Wasm
+          config:
+            name: "paygress"
+            root_id: "paygress_root"
+            vm_config:
+              vm_id: "paygress"
+              runtime: "envoy.wasm.runtime.v8"
+              code:
+                local:
+                  inline_string: |
+                    # WASM binary data would be here
+                    # Load from ConfigMap: paygress-envoy-wasm
+            configuration:
+              "@type": type.googleapis.com/google.protobuf.StringValue
+              value: |
+                {
+                  "amount": 1000,
+                  "enable_pod_provisioning": true,
+                  "cashu_mint_url": "https://mint.example.com"
+                }
+---
+# Authorization Policy for premium content
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: paygress-payment-required
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      app: premium-backend
+  rules:
+  - when:
+    - key: custom.payment_verified
+      values: ["true"]
+---
+# Virtual Service for routing
+apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
+metadata:
+  name: paygress-premium-service
+  namespace: default
+spec:
+  hosts:
+  - api.example.com
+  http:
+  # Premium routes - payment required
+  - match:
+    - uri:
+        prefix: /premium
+    route:
+    - destination:
+        host: premium-backend
+        port:
+          number: 80
+    # WASM filter will handle payment verification
+    
+  - match:
+    - uri:
+        prefix: /api/v1/premium
+    route:
+    - destination:
+        host: api-backend
+        port:
+          number: 80
+        
+  # Free routes - no payment required
+  - match:
+    - uri:
+        prefix: /free
+    route:
+    - destination:
+        host: free-backend
+        port:
+          number: 80
+---
+# Example premium backend
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: premium-backend
+  namespace: default
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: premium-backend
+  template:
+    metadata:
+      labels:
+        app: premium-backend
+        # Istio sidecar injection
+      annotations:
+        sidecar.istio.io/inject: "true"
+    spec:
+      containers:
+      - name: backend
+        image: nginx:alpine
+        ports:
+        - containerPort: 80
+        volumeMounts:
+        - name: content
+          mountPath: /usr/share/nginx/html
+      volumes:
+      - name: content
+        configMap:
+          name: premium-content
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: premium-backend
+  namespace: default
+spec:
+  selector:
+    app: premium-backend
+  ports:
+  - port: 80
+    targetPort: 80
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: premium-content
+  namespace: default
+data:
+  index.html: |
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Premium Content</title>
+        <style>
+            body { font-family: Arial, sans-serif; text-align: center; padding: 50px; }
+            .premium { color: #f39c12; }
+        </style>
+    </head>
+    <body>
+        <h1 class="premium">💎 Premium Content</h1>
+        <p>Congratulations! Your payment was verified by the WASM plugin.</p>
+        <p>This content is only accessible with a valid Cashu token.</p>
+        <hr>
+        <p><strong>Paygress WASM Plugin Status:</strong> ✅ Active</p>
+        <p><strong>Payment Status:</strong> ✅ Verified</p>
+        <p><strong>Pod Status:</strong> ✅ Provisioned</p>
+    </body>
+    </html>
