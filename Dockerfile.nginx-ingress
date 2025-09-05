@@ -1,28 +1,32 @@
 # NGINX Ingress Controller with Embedded Paygress Plugin
 FROM rust:1.85 AS builder
 
-# Install musl target for Alpine compatibility
-RUN rustup target add x86_64-unknown-linux-musl
-RUN apt-get update && apt-get install -y musl-tools
 
 WORKDIR /app
 COPY Cargo.toml .
 COPY src/ src/
 
-# Build the plugin library for musl (Alpine Linux compatibility)
-RUN cargo build --release --target x86_64-unknown-linux-musl --features nginx --lib
+# Build a static binary to avoid glibc issues
+ENV RUSTFLAGS="-C target-feature=+crt-static"
+RUN cargo build --release --target x86_64-unknown-linux-gnu --features nginx --lib
 
 # NGINX Ingress Controller with Paygress Plugin
 FROM registry.k8s.io/ingress-nginx/controller:v1.8.1
 
 USER root
 
-# Install minimal dependencies for musl binary
+# Install glibc compatibility for glibc binary
 RUN apk update && apk add --no-cache \
-    ca-certificates
+    ca-certificates \
+    wget \
+    && wget -q -O /etc/apk/keys/sgerrand.rsa.pub https://alpine-pkgs.sgerrand.com/sgerrand.rsa.pub \
+    && wget https://github.com/sgerrand/alpine-pkg-glibc/releases/download/2.34-r0/glibc-2.34-r0.apk \
+    && apk add --force-overwrite glibc-2.34-r0.apk \
+    && rm glibc-2.34-r0.apk \
+    && apk del wget
 
-# Copy the musl-compiled plugin library (for Lua FFI)
-COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/libpaygress.so /etc/nginx/modules/paygress.so
+# Copy the static compiled plugin library
+COPY --from=builder /app/target/x86_64-unknown-linux-gnu/release/libpaygress.so /etc/nginx/modules/paygress.so
 RUN chmod 644 /etc/nginx/modules/paygress.so
 
 # Verify the library can be loaded via FFI
