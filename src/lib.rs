@@ -5,23 +5,13 @@ use serde::Deserialize;
 // Module declarations
 pub mod cashu;
 pub mod nostr;
-pub mod nginx_auth;
-pub mod complete_plugin;
-
-// NGINX plugin module (compiles to .so)
-#[cfg(feature = "nginx-plugin")]
 pub mod nginx_plugin;
-
-// Direct NGINX module (no Lua required)
-#[cfg(feature = "nginx-direct")]
-pub mod nginx_direct;
 
 // Re-export public types and functions for easy access
 pub use nostr::{NostrRelaySubscriber, RelayConfig, default_relay_config, custom_relay_config};
 
 // Re-export cashu functions for initialization
 pub use cashu::{initialize_cashu, verify_cashu_token};
-
 pub struct IngressPlugin {
     cashu_db_path: String,
 }
@@ -36,7 +26,7 @@ impl IngressPlugin {
         })
     }
 
-    pub async fn handle_nostr_event(&self, event: NostrEvent) -> Result<PodProvisionResponse, String> {
+    pub async fn handle_nostr_event(&self, event: crate::nostr::NostrEvent) -> Result<PodProvisionResponse, String> {
         // Verify the event signature and structure
         self.verify_event_structure(&event)?;
         
@@ -63,7 +53,7 @@ impl IngressPlugin {
         })
     }
 
-    fn verify_event_structure(&self, event: &NostrEvent) -> Result<(), String> {
+    fn verify_event_structure(&self, event: &crate::nostr::NostrEvent) -> Result<(), String> {
         // Verify event has required fields
         if event.content.is_empty() {
             return Err("Event content is empty".to_string());
@@ -81,7 +71,7 @@ impl IngressPlugin {
         Ok(())
     }
 
-    fn extract_cashu_token(&self, event: &NostrEvent) -> Result<String, String> {
+    fn extract_cashu_token(&self, event: &crate::nostr::NostrEvent) -> Result<String, String> {
         // Parse event content as JSON
         let content: Value = serde_json::from_str(&event.content)
             .map_err(|e| format!("Failed to parse event content: {}", e))?;
@@ -93,7 +83,7 @@ impl IngressPlugin {
             .ok_or_else(|| "Cashu token not found in event content".to_string())
     }
 
-    fn extract_pod_requirements(&self, event: &NostrEvent) -> Result<(i64, PodDescription), String> {
+    fn extract_pod_requirements(&self, event: &crate::nostr::NostrEvent) -> Result<(i64, PodDescription), String> {
         // Parse event content as JSON
         let content: Value = serde_json::from_str(&event.content)
             .map_err(|e| format!("Failed to parse event content: {}", e))?;
@@ -202,7 +192,7 @@ pub struct PodProvisionResponse {
 // Example usage function
 pub async fn process_nostr_relay_event(event_json: &str, db_path: &str) -> Result<PodProvisionResponse, String> {
     // Parse Nostr event
-    let event: NostrEvent = serde_json::from_str(event_json)
+    let event: crate::nostr::NostrEvent = serde_json::from_str(event_json)
         .map_err(|e| format!("Failed to parse Nostr event: {}", e))?;
     
     // Create ingress plugin
@@ -231,7 +221,7 @@ pub async fn start_ingress_system(
         .map_err(|e| format!("Failed to create Nostr client: {}", e))?;
     
     // Define the event handler that processes Cashu payments and provisions pods
-    let handler = move |event: NostrEvent| -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> {
+    let handler = move |event: crate::nostr::NostrEvent| -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> {
         let plugin_clone = plugin.clone();
         Box::pin(async move {
             match plugin_clone.handle_nostr_event(event).await {
@@ -262,3 +252,4 @@ impl Clone for IngressPlugin {
         }
     }
 }
+

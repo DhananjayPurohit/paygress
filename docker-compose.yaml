@@ -1,0 +1,34 @@
+# Paygress - Single NGINX Ingress with Embedded Nostr Listener
+version: '3.8'
+
+services:
+  # NGINX Ingress Controller with embedded Nostr listener
+  nginx-ingress:
+    build:
+      context: .
+      dockerfile: Dockerfile.nginx-ingress
+    ports:
+      - "8080:80"
+      - "8443:443"
+    environment:
+      - NOSTR_RELAYS=wss://relay.damus.io,wss://nos.lol
+      - CASHU_DB_PATH=/data/cashu.db
+    volumes:
+      - ./data:/data
+      - /var/run/docker.sock:/var/run/docker.sock  # For pod provisioning
+    restart: unless-stopped
+    networks:
+      - paygress
+
+  # Example backend service (represents provisioned pods)
+  example-backend:
+    image: nginx:alpine
+    networks:
+      - paygress
+
+networks:
+  paygress:
+    driver: bridge
+
+volumes:
+  data:

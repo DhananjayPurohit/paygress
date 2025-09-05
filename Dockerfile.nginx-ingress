@@ -1,0 +1,37 @@
+# NGINX Ingress Controller with Embedded Paygress Plugin
+FROM rust:1.85 AS builder
+
+WORKDIR /app
+COPY Cargo.toml .
+COPY src/ src/
+
+# Build the plugin library with embedded Nostr listener
+RUN cargo build --release --features nginx --lib
+
+# NGINX Ingress Controller with Paygress Plugin
+FROM registry.k8s.io/ingress-nginx/controller:v1.8.1
+
+USER root
+
+# Install dependencies for dynamic library loading (Alpine Linux)
+RUN apk update && apk add --no-cache \
+    openssl \
+    ca-certificates \
+    libc6-compat \
+    gcompat \
+    libgcc \
+    libstdc++
+
+# Copy the compiled plugin library (for Lua FFI, not NGINX module)
+COPY --from=builder /app/target/release/libpaygress.so /etc/nginx/modules/paygress.so
+RUN chmod 644 /etc/nginx/modules/paygress.so
+
+# Verify the library can be loaded via FFI
+RUN ldd /etc/nginx/modules/paygress.so || echo "Dynamic library dependencies check completed"
+
+# The plugin includes:
+# - Embedded Nostr event listener (auto-starts when loaded)
+# - Pod provisioning (triggered by Nostr events) 
+# - Payment verification (for HTTP requests via Lua FFI)
+
+USER www-data

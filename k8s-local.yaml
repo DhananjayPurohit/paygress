@@ -1,0 +1,362 @@
+# Namespace for our testing
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: paygress-test
+---
+# ConfigMap for NGINX Ingress Controller
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nginx-configuration
+  namespace: paygress-test
+data:
+  enable-opentracing: "false"
+  lua-shared-dicts: "paygress_data:10m"
+---
+# Service Account for Ingress Controller
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: nginx-ingress-serviceaccount
+  namespace: paygress-test
+---
+# ClusterRole for Ingress Controller
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: nginx-ingress-clusterrole
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - configmaps
+      - endpoints
+      - nodes
+      - pods
+      - secrets
+      - namespaces
+      - services
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - "extensions"
+      - "networking.k8s.io"
+    resources:
+      - ingresses
+      - ingressclasses
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - "discovery.k8s.io"
+    resources:
+      - endpointslices
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - ""
+    resources:
+      - events
+    verbs:
+      - create
+      - patch
+  - apiGroups:
+      - "extensions"
+      - "networking.k8s.io"
+    resources:
+      - ingresses/status
+    verbs:
+      - update
+  - apiGroups:
+      - "coordination.k8s.io"
+    resources:
+      - leases
+    verbs:
+      - "*"
+---
+# ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: nginx-ingress-clusterrole-nisa-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: nginx-ingress-clusterrole
+subjects:
+  - kind: ServiceAccount
+    name: nginx-ingress-serviceaccount
+    namespace: paygress-test
+---
+# Role for namespace-specific permissions
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: paygress-test
+  name: nginx-ingress-role
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - configmaps
+      - pods
+      - secrets
+      - namespaces
+    verbs:
+      - get
+  - apiGroups:
+      - ""
+    resources:
+      - configmaps
+    resourceNames:
+      - "ingress-controller-leader"
+    verbs:
+      - get
+      - update
+  - apiGroups:
+      - ""
+    resources:
+      - configmaps
+    verbs:
+      - create
+  - apiGroups:
+      - ""
+    resources:
+      - endpoints
+    verbs:
+      - get
+---
+# RoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: nginx-ingress-role-nisa-binding
+  namespace: paygress-test
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: nginx-ingress-role
+subjects:
+  - kind: ServiceAccount
+    name: nginx-ingress-serviceaccount
+    namespace: paygress-test
+---
+# Paygress NGINX Ingress Controller Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: paygress-nginx-ingress-controller
+  namespace: paygress-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: paygress-nginx-ingress-controller
+  template:
+    metadata:
+      labels:
+        app: paygress-nginx-ingress-controller
+    spec:
+      serviceAccountName: nginx-ingress-serviceaccount
+      containers:
+      - name: nginx-ingress-controller
+        image: paygress-nginx-ingress:latest
+        imagePullPolicy: Never  # Use local Docker image
+        args:
+          - /nginx-ingress-controller
+          - --configmap=$(POD_NAMESPACE)/nginx-configuration
+          - --publish-service=$(POD_NAMESPACE)/ingress-nginx
+          - --annotations-prefix=nginx.ingress.kubernetes.io
+          - --enable-ssl-passthrough
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: NOSTR_RELAYS
+          value: "wss://relay.damus.io,wss://nos.lol"
+        - name: CASHU_DB_PATH
+          value: "/data/cashu.db"
+        ports:
+        - name: http
+          containerPort: 80
+        - name: https
+          containerPort: 443
+        securityContext:
+          allowPrivilegeEscalation: true
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+          runAsUser: 101
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 10254
+          initialDelaySeconds: 30
+          timeoutSeconds: 5
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 10254
+          initialDelaySeconds: 5
+          timeoutSeconds: 1
+        volumeMounts:
+        - name: data
+          mountPath: /data
+      volumes:
+      - name: data
+        emptyDir: {}
+---
+# IngressClass for NGINX
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: nginx
+spec:
+  controller: k8s.io/ingress-nginx
+---
+# Service for Ingress Controller
+apiVersion: v1
+kind: Service
+metadata:
+  name: ingress-nginx
+  namespace: paygress-test
+spec:
+  type: NodePort
+  ports:
+  - name: http
+    port: 80
+    targetPort: 80
+    nodePort: 30080
+  - name: https
+    port: 443
+    targetPort: 443
+    nodePort: 30443
+  selector:
+    app: paygress-nginx-ingress-controller
+---
+# Test Backend Service
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: test-backend
+  namespace: paygress-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: test-backend
+  template:
+    metadata:
+      labels:
+        app: test-backend
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:alpine
+        ports:
+        - containerPort: 80
+        volumeMounts:
+        - name: html
+          mountPath: /usr/share/nginx/html/index.html
+          subPath: index.html
+      volumes:
+      - name: html
+        configMap:
+          name: test-backend-html
+---
+# ConfigMap for test backend HTML
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: test-backend-html
+  namespace: paygress-test
+data:
+  index.html: |
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Paygress Premium Content</title>
+        <style>
+            body { 
+                font-family: Arial, sans-serif; 
+                max-width: 800px; 
+                margin: 50px auto; 
+                padding: 20px;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: white;
+            }
+            .container {
+                background: rgba(255,255,255,0.1);
+                padding: 30px;
+                border-radius: 10px;
+                backdrop-filter: blur(10px);
+            }
+            .success { color: #00ff88; font-weight: bold; }
+            .info { background: rgba(255,255,255,0.2); padding: 15px; border-radius: 5px; margin: 20px 0; }
+            code { background: rgba(0,0,0,0.3); padding: 2px 6px; border-radius: 3px; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>🎉 Paygress Premium Content</h1>
+            <p class="success">✅ Payment verified successfully!</p>
+            
+            <div class="info">
+                <h3>🔐 You have access to premium content because:</h3>
+                <ul>
+                    <li>Your Cashu token was verified by the Paygress plugin</li>
+                    <li>The NGINX ingress controller allowed your request through</li>
+                    <li>The embedded Nostr listener is running in the background</li>
+                </ul>
+            </div>
+
+            <h3>🚀 What's happening:</h3>
+            <ol>
+                <li><strong>Nostr Listener:</strong> Monitoring for pod provisioning events (kind 1000)</li>
+                <li><strong>Payment Gateway:</strong> Verifying Cashu tokens in real-time</li>
+                <li><strong>Pod Provisioning:</strong> Ready to create pods on valid payments</li>
+            </ol>
+
+            <div class="info">
+                <h4>📡 Send a Nostr event to provision a pod:</h4>
+                <pre><code>{
+      "cashu_token": "cashu_token_1000_sats_demo",
+      "amount": 1000,
+      "pod_description": {
+        "image": "nginx:alpine",
+        "cpu": "100m", 
+        "memory": "128Mi"
+      }
+    }</code></pre>
+            </div>
+
+            <p><em>This content is only accessible with valid Cashu payment verification!</em></p>
+        </div>
+    </body>
+    </html>
+---
+# Backend Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: test-backend-service
+  namespace: paygress-test
+spec:
+  selector:
+    app: test-backend
+  ports:
+  - port: 80
+    targetPort: 80
