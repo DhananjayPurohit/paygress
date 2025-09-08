@@ -7,15 +7,10 @@ description = "Cashu payment verification and pod provisioning for ingress contr
 license = "MIT"
 
 
-# Library for embedding
-[lib]
-name = "paygress"
-path = "src/lib.rs"
-crate-type = ["cdylib", "rlib"]
-
-[features]
-default = ["nginx"]
-nginx = ["libc"]
+# Binary for sidecar service
+[[bin]]
+name = "paygress-sidecar"
+path = "src/main.rs"
 
 [dependencies]
 # Core dependencies
@@ -39,13 +34,14 @@ kube = { version = "0.93", features = ["runtime", "derive"] }
 k8s-openapi = { version = "0.22", features = ["v1_28"] }
 uuid = { version = "1.0", features = ["v4"] }
 
-# NGINX plugin dependencies  
-libc = { version = "0.2", optional = true }
+# HTTP server dependencies
+warp = "0.3"
+tokio = { version = "1.0", features = ["full"] }
 chrono = { version = "0.4", features = ["serde"] }
 
 
 [profile.release]
-# Optimize for small binary size (important for plugins)
+# Optimize for small binary size  
 opt-level = "s"
 lto = true
 codegen-units = 1

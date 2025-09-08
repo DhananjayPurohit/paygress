@@ -1,0 +1,39 @@
+# Paygress Sidecar Service Dockerfile
+FROM rust:1.85 as builder
+
+WORKDIR /app
+COPY Cargo.toml .
+COPY src/ src/
+
+# Build the sidecar binary
+RUN cargo build --release --bin paygress-sidecar
+
+# Runtime image
+FROM debian:bookworm-slim
+
+# Install SSL certificates and ca-certificates for HTTPS requests
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy the binary
+COPY --from=builder /app/target/release/paygress-sidecar /usr/local/bin/paygress-sidecar
+
+# Create non-root user
+RUN useradd -r -s /bin/false paygress
+USER paygress
+
+# Expose the API port
+EXPOSE 3000
+
+# Set environment variables
+ENV PORT=3000
+ENV CASHU_DB_PATH=/data/cashu.db
+ENV NOSTR_RELAYS=wss://relay.damus.io,wss://nos.lol
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:3000/health || exit 1
+
+# Run the service
+CMD ["paygress-sidecar"]

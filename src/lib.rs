@@ -5,7 +5,6 @@ use serde::Deserialize;
 // Module declarations
 pub mod cashu;
 pub mod nostr;
-pub mod nginx_plugin;
 
 // Re-export public types and functions for easy access
 pub use nostr::{NostrRelaySubscriber, RelayConfig, default_relay_config, custom_relay_config};

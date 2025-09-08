@@ -5,56 +5,18 @@ metadata:
   name: paygress-ingress
   namespace: paygress-test
   annotations:
-    
-    # Load and use the plugin
+    # Use auth_request to call Paygress sidecar
+    nginx.ingress.kubernetes.io/auth-url: "http://localhost:3000/auth"
+    nginx.ingress.kubernetes.io/auth-method: "GET"
+    nginx.ingress.kubernetes.io/auth-signin: "http://localhost:3000/auth"
+    nginx.ingress.kubernetes.io/auth-response-headers: "X-Payment-Verified"
     nginx.ingress.kubernetes.io/configuration-snippet: |
-      access_by_lua_block {
-          local ffi = require("ffi")
-          
-          -- Define plugin functions
-          ffi.cdef[[
-              int paygress_init();
-              int paygress_verify_payment(const char* token, int amount);
-              int paygress_check_pod_access(const char* pod_id);
-              int paygress_get_pod_count();
-              const char* paygress_version();
-          ]]
-          
-          -- Load plugin
-          local paygress = ffi.load("/etc/nginx/modules/paygress.so")
-          
-          -- Initialize plugin (starts Nostr listener)
-          local init_result = paygress.paygress_init()
-          if init_result ~= 0 then
-              ngx.log(ngx.ERR, "Failed to initialize Paygress plugin")
-          end
-          
-          -- Get auth token
-          local auth = ngx.req.get_headers()["Authorization"] or ""
-          local token = string.gsub(auth, "Bearer ", "")
-          
-          -- Verify payment
-          if token == "" or paygress.paygress_verify_payment(token, 1000) ~= 0 then
-              ngx.status = 402
-              ngx.header["Content-Type"] = "application/json"
-              ngx.say('{"error":"Payment Required","message":"Send valid Cashu token","amount":1000}')
-              ngx.exit(402)
-          end
-          
-          -- Extract pod ID from request path or headers
-          local pod_id = ngx.req.get_headers()["X-Pod-ID"]
-          if pod_id and paygress.paygress_check_pod_access then
-              local pod_access = paygress.paygress_check_pod_access(pod_id)
-              if pod_access ~= 0 then
-                  ngx.status = 404
-                  ngx.say('{"error":"Pod not found or not accessible"}')
-                  ngx.exit(404)
-              end
-              ngx.req.set_header("X-Pod-Verified", "true")
-          end
-          
-          -- Payment verified
-          ngx.req.set_header("X-Payment-Verified", "true")
+      # Custom error responses for payment failures
+      error_page 401 402 = @payment_required;
+      
+      location @payment_required {
+          add_header Content-Type application/json always;
+          return 402 '{"error":"Payment Required","message":"Send valid Cashu token in Authorization header","amount":1000,"example":"Authorization: Bearer cashu_token_1000_demo"}';
       }
 
 spec:
