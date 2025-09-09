@@ -35,8 +35,7 @@ k8s-openapi = { version = "0.22", features = ["v1_28"] }
 uuid = { version = "1.0", features = ["v4"] }
 
 # HTTP server dependencies
-warp = "0.3"
-tokio = { version = "1.0", features = ["full"] }
+axum = "0.7"
 chrono = { version = "0.4", features = ["serde"] }
 
 

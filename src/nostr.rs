@@ -1,6 +1,6 @@
 // Nostr client for receiving pod provisioning events
 use anyhow::{Context, Result};
-use nostr_sdk::{Client, Keys, Filter, Kind, RelayPoolNotification, Url};
+use nostr_sdk::{Client, Keys, Filter, Kind, RelayPoolNotification, Url, EventBuilder, Tag};
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 use std::future::Future;
@@ -23,8 +23,10 @@ pub struct NostrEvent {
     pub sig: String,
 }
 
+#[derive(Clone)]
 pub struct NostrRelaySubscriber {
     client: Client,
+    keys: Keys,
     config: RelayConfig,
 }
 
@@ -49,7 +51,7 @@ impl NostrRelaySubscriber {
         client.connect().await;
         info!("Connected to {} relays", config.relays.len());
 
-        Ok(Self { client, config })
+        Ok(Self { client, keys, config })
     }
 
     pub async fn subscribe_to_pod_events<F>(&self, handler: F) -> Result<()>
@@ -84,6 +86,35 @@ impl NostrRelaySubscriber {
         Ok(())
     }
 
+    pub async fn publish_offer(&self, offer: OfferEventContent) -> Result<String> {
+        let content = serde_json::to_string(&offer)?;
+        let tags = vec![
+            Tag::hashtag("paygress"),
+            Tag::hashtag("offer"),
+        ];
+        let builder = EventBuilder::new(Kind::Custom(20000), content, tags);
+        let event = builder.to_event(&self.keys)?;
+        let event_id = event.id.to_hex();
+        self.client.send_event(event).await?;
+        info!("Published offer event: {}", event_id);
+        Ok(event_id)
+    }
+
+    pub async fn publish_access_details(&self, request_event_id: &str, details: AccessDetailsContent) -> Result<String> {
+        let content = serde_json::to_string(&details)?;
+        let tags = vec![
+            Tag::event(request_event_id.parse()?),
+            Tag::hashtag("paygress"),
+            Tag::hashtag("response"),
+        ];
+        let builder = EventBuilder::new(Kind::Custom(1001), content, tags);
+        let event = builder.to_event(&self.keys)?;
+        let event_id = event.id.to_hex();
+        self.client.send_event(event).await?;
+        info!("Published access details event in reply to {}: {}", request_event_id, event_id);
+        Ok(event_id)
+    }
+
     fn convert_event(&self, event: &nostr_sdk::Event) -> NostrEvent {
         NostrEvent {
             id: event.id.to_hex(),
@@ -112,4 +143,27 @@ pub fn default_relay_config() -> RelayConfig {
 
 pub fn custom_relay_config(relays: Vec<String>, private_key: Option<String>) -> RelayConfig {
     RelayConfig { relays, private_key }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OfferEventContent {
+    pub kind: String, // "offer"
+    pub rate_sats_per_hour: u64,
+    pub default_duration_minutes: u64,
+    pub ssh_port: u16,
+    pub pod_namespace: String,
+    pub image: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccessDetailsContent {
+    pub kind: String, // "access_details"
+    pub pod_name: String,
+    pub namespace: String,
+    pub ssh_username: String,
+    pub ssh_password: String,
+    pub ssh_port: u16,
+    pub node_port: u16,
+    pub expires_at: String,
+    pub instructions: Vec<String>,
 }
