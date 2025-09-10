@@ -44,14 +44,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("🔧 RUN_MODE environment variable: '{}'", run_mode);
     println!("🔧 RUN_MODE comparison: nostr == '{}' -> {}", run_mode, run_mode == "nostr");
 
-    if run_mode.trim() == "nostr" {
-        println!("🚀 Starting in Nostr mode...");
-        // Nostr-only mode: publish offer loop and handle provisioning requests
-        run_nostr_mode(config).await?;
-    } else {
-        println!("🌐 Starting in HTTP mode...");
-        start_sidecar_service(&bind_addr, config).await?;
-    }
+    run_nostr_mode(config).await?;
+    // if run_mode.trim() == "nostr" {
+    //     println!("🚀 Starting in Nostr mode...");
+    //     // Nostr-only mode: publish offer loop and handle provisioning requests
+    //     run_nostr_mode(config).await?;
+    // } else {
+    //     println!("🌐 Starting in HTTP mode...");
+    //     start_sidecar_service(&bind_addr, config).await?;
+    // }
 
     Ok(())
 }

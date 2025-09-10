@@ -43,7 +43,7 @@ WORKDIR /app
 EXPOSE 8080
 
 # Set default environment variables
-ENV PAYGRESS_MODE=sidecar
+ENV PAYGRESS_MODE=nostr
 ENV BIND_ADDR=0.0.0.0:8080
 ENV CASHU_DB_PATH=/app/data/cashu.db
 ENV POD_NAMESPACE=user-workloads

@@ -60,7 +60,7 @@ metadata:
   name: paygress-sidecar-config
   namespace: ingress-system
 data:
-  PAYGRESS_MODE: "sidecar"
+  : "sidecar"
   RUN_MODE: "nostr"
   BIND_ADDR: "0.0.0.0:8080"
   CASHU_DB_PATH: "/app/data/cashu.db"
