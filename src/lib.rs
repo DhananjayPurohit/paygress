@@ -14,15 +14,17 @@ pub use nostr::{NostrRelaySubscriber, RelayConfig, default_relay_config, custom_
 pub use cashu::{initialize_cashu, verify_cashu_token};
 pub struct IngressPlugin {
     cashu_db_path: String,
+    whitelisted_mints: Vec<String>,
 }
 
 impl IngressPlugin {
-    pub async fn new(cashu_db_path: String) -> Result<Self, String> {
+    pub async fn new(cashu_db_path: String, whitelisted_mints: Vec<String>) -> Result<Self, String> {
         // Initialize Cashu database
         cashu::initialize_cashu(&cashu_db_path).await?;
         
         Ok(IngressPlugin {
             cashu_db_path,
+            whitelisted_mints,
         })
     }
 
@@ -37,7 +39,7 @@ impl IngressPlugin {
         let (required_amount, pod_description) = self.extract_pod_requirements(&event)?;
         
         // Verify Cashu token
-        let token_valid = cashu::verify_cashu_token(&cashu_token, required_amount).await?;
+        let token_valid = cashu::verify_cashu_token(&cashu_token, required_amount, &self.whitelisted_mints).await?;
         
         if !token_valid {
             return Err("Invalid or insufficient Cashu token".to_string());
@@ -190,13 +192,13 @@ pub struct PodProvisionResponse {
 }
 
 // Example usage function
-pub async fn process_nostr_relay_event(event_json: &str, db_path: &str) -> Result<PodProvisionResponse, String> {
+pub async fn process_nostr_relay_event(event_json: &str, db_path: &str, whitelisted_mints: Vec<String>) -> Result<PodProvisionResponse, String> {
     // Parse Nostr event
     let event: crate::nostr::NostrEvent = serde_json::from_str(event_json)
         .map_err(|e| format!("Failed to parse Nostr event: {}", e))?;
     
     // Create ingress plugin
-    let plugin = IngressPlugin::new(db_path.to_string()).await?;
+    let plugin = IngressPlugin::new(db_path.to_string(), whitelisted_mints).await?;
     
     // Handle the event
     plugin.handle_nostr_event(event).await
@@ -206,6 +208,7 @@ pub async fn process_nostr_relay_event(event_json: &str, db_path: &str) -> Resul
 pub async fn start_ingress_system(
     relay_config: RelayConfig,
     cashu_db_path: String,
+    whitelisted_mints: Vec<String>,
 ) -> Result<(), String> {
     use std::pin::Pin;
     use std::future::Future;
@@ -214,7 +217,7 @@ pub async fn start_ingress_system(
     initialize_cashu(&cashu_db_path).await?;
     
     // Create ingress plugin
-    let plugin = IngressPlugin::new(cashu_db_path).await?;
+    let plugin = IngressPlugin::new(cashu_db_path, whitelisted_mints).await?;
     
     // Create Nostr client
     let nostr_client = NostrRelaySubscriber::new(relay_config).await
@@ -249,6 +252,7 @@ impl Clone for IngressPlugin {
     fn clone(&self) -> Self {
         Self {
             cashu_db_path: self.cashu_db_path.clone(),
+            whitelisted_mints: self.whitelisted_mints.clone(),
         }
     }
 }

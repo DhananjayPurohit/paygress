@@ -20,6 +20,9 @@ rules:
 - apiGroups: [""]
   resources: ["pods/log"]
   verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create"]
 # Service management for SSH access
 - apiGroups: [""]
   resources: ["services"]
@@ -60,7 +63,6 @@ metadata:
   name: paygress-sidecar-config
   namespace: ingress-system
 data:
-  : "sidecar"
   RUN_MODE: "nostr"
   BIND_ADDR: "0.0.0.0:8080"
   CASHU_DB_PATH: "/app/data/cashu.db"
@@ -70,6 +72,10 @@ data:
   SSH_BASE_IMAGE: "linuxserver/openssh-server:latest"
   SSH_PORT: "2222"
   ENABLE_CLEANUP_TASK: "true"
+  ENABLE_TOR_SIDECAR: "true"
+  TOR_IMAGE: "dperson/torproxy:latest"
+  NOSTR_RELAYS: "wss://relay.damus.io,wss://nos.lol,wss://relay.nostr.band"
+  WHITELISTED_MINTS: "https://nofees.testnut.cashu.space"
   RUST_LOG: "info"
 ---
 apiVersion: apps/v1
@@ -81,7 +87,7 @@ metadata:
     app: paygress-sidecar
     component: payment-sidecar
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       app: paygress-sidecar
@@ -105,20 +111,7 @@ spec:
         volumeMounts:
         - name: data
           mountPath: /app/data
-        livenessProbe:
-          httpGet:
-            path: /healthz
-            port: 8080
-          initialDelaySeconds: 30
-          periodSeconds: 60
-          timeoutSeconds: 10
-        readinessProbe:
-          httpGet:
-            path: /healthz
-            port: 8080
-          initialDelaySeconds: 10
-          periodSeconds: 15
-          timeoutSeconds: 5
+        # No health checks for Nostr mode - no HTTP endpoints
         resources:
           requests:
             cpu: 200m

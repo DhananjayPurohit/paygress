@@ -32,11 +32,15 @@ pub struct NostrRelaySubscriber {
 
 impl NostrRelaySubscriber {
     pub async fn new(config: RelayConfig) -> Result<Self> {
-        let keys = if let Some(private_key_hex) = &config.private_key {
-            Keys::parse(private_key_hex)
-                .context("Invalid private key format")?
-        } else {
-            Keys::generate()
+        let keys = match &config.private_key {
+            Some(private_key_hex) if !private_key_hex.is_empty() => {
+                Keys::parse(private_key_hex)
+                    .context("Invalid private key format")?
+            }
+            _ => {
+                // Always generate a new key for security
+                Keys::generate()
+            }
         };
 
         let client = Client::new(&keys);
@@ -163,7 +167,7 @@ pub struct AccessDetailsContent {
     pub ssh_username: String,
     pub ssh_password: String,
     pub ssh_port: u16,
-    pub node_port: u16,
+    pub node_port: Option<u16>,
     pub expires_at: String,
     pub instructions: Vec<String>,
 }

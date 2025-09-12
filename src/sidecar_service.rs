@@ -26,6 +26,9 @@ pub struct SidecarConfig {
     pub ssh_base_image: String, // Base image with SSH server
     pub ssh_port: u16,
     pub enable_cleanup_task: bool,
+    pub enable_tor_sidecar: bool, // Enable Tor onion service for SSH access
+    pub tor_image: String, // Tor container image
+    pub whitelisted_mints: Vec<String>, // Allowed Cashu mint URLs
 }
 
 impl Default for SidecarConfig {
@@ -38,6 +41,13 @@ impl Default for SidecarConfig {
             ssh_base_image: "linuxserver/openssh-server:latest".to_string(),
             ssh_port: 2222,
             enable_cleanup_task: true,
+            enable_tor_sidecar: false, // Disabled by default
+            tor_image: "dperson/torproxy:latest".to_string(),
+            whitelisted_mints: vec![
+                "https://mint.cashu.space".to_string(),
+                "https://mint.f7z.io".to_string(),
+                "https://legend.lnbits.com/cashu/api/v1".to_string(),
+            ],
         }
     }
 }
@@ -107,9 +117,12 @@ impl PodManager {
         username: &str,
         password: &str,
         duration_minutes: u64,
+        enable_tor: bool,
+        tor_image: &str,
     ) -> Result<u16, String> {
         use k8s_openapi::api::core::v1::{
             Container, Pod, PodSpec, EnvVar, ContainerPort, Service, ServiceSpec, ServicePort,
+            Volume, VolumeMount, EmptyDirVolumeSource,
         };
         use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
         use kube::api::PostParams;
@@ -117,6 +130,7 @@ impl PodManager {
 
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
         let services: Api<Service> = Api::namespaced(self.client.clone(), namespace);
+        let configmaps: Api<k8s_openapi::api::core::v1::ConfigMap> = Api::namespaced(self.client.clone(), namespace);
 
         // Create SSH environment variables
         let env_vars = vec![
@@ -171,6 +185,99 @@ impl PodManager {
         annotations.insert("paygress.io/duration-minutes".to_string(), duration_minutes.to_string());
         annotations.insert("paygress.io/ssh-username".to_string(), username.to_string());
 
+        // Create volumes (including Tor volume if enabled)
+        let mut volumes = Vec::new();
+        if enable_tor {
+            volumes.push(Volume {
+                name: "tor-hs".to_string(),
+                empty_dir: Some(EmptyDirVolumeSource::default()),
+                ..Default::default()
+            });
+            volumes.push(Volume {
+                name: "tor-config".to_string(),
+                config_map: Some(k8s_openapi::api::core::v1::ConfigMapVolumeSource {
+                    name: Some(format!("{}-tor-config", pod_name)),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        }
+
+        // Create containers
+        let mut containers = vec![Container {
+            name: "ssh-server".to_string(),
+            image: Some(image.to_string()),
+            ports: Some(vec![ContainerPort {
+                container_port: ssh_port as i32,
+                name: Some("ssh".to_string()),
+                protocol: Some("TCP".to_string()),
+                ..Default::default()
+            }]),
+            env: Some(env_vars),
+            image_pull_policy: Some("IfNotPresent".to_string()),
+            ..Default::default()
+        }];
+
+        // Add Tor sidecar container if enabled
+        if enable_tor {
+            containers.push(Container {
+                name: "tor-sidecar".to_string(),
+                image: Some(tor_image.to_string()),
+                env: Some(vec![
+                    EnvVar {
+                        name: "TZ".to_string(),
+                        value: Some("UTC".to_string()),
+                        value_from: None,
+                    },
+                ]),
+                volume_mounts: Some(vec![
+                    VolumeMount {
+                        name: "tor-hs".to_string(),
+                        mount_path: "/var/lib/tor/hidden_service".to_string(),
+                        ..Default::default()
+                    },
+                    VolumeMount {
+                        name: "tor-config".to_string(),
+                        mount_path: "/etc/tor/torrc".to_string(),
+                        sub_path: Some("torrc".to_string()),
+                        ..Default::default()
+                    },
+                ]),
+                image_pull_policy: Some("IfNotPresent".to_string()),
+                ..Default::default()
+            });
+        }
+
+        // Create Tor ConfigMap if Tor is enabled
+        if enable_tor {
+            let tor_config = format!(
+                "HiddenServiceDir /var/lib/tor/hidden_service/\n\
+                 HiddenServicePort 80 127.0.0.1:{}\n\
+                 Log notice stdout\n\
+                 DataDirectory /var/lib/tor\n",
+                ssh_port
+            );
+
+            let configmap = k8s_openapi::api::core::v1::ConfigMap {
+                metadata: kube::core::ObjectMeta {
+                    name: Some(format!("{}-tor-config", pod_name)),
+                    labels: Some(BTreeMap::from([
+                        ("app".to_string(), "paygress-ssh-pod".to_string()),
+                        ("managed-by".to_string(), "paygress-sidecar".to_string()),
+                        ("pod-name".to_string(), pod_name.to_string()),
+                    ])),
+                    ..Default::default()
+                },
+                data: Some(BTreeMap::from([
+                    ("torrc".to_string(), tor_config),
+                ])),
+                ..Default::default()
+            };
+
+            let pp = PostParams::default();
+            configmaps.create(&pp, &configmap).await.map_err(|e| format!("Failed to create Tor ConfigMap: {}", e))?;
+        }
+
         // Create the pod
         let pod = Pod {
             metadata: kube::core::ObjectMeta {
@@ -180,19 +287,8 @@ impl PodManager {
                 ..Default::default()
             },
             spec: Some(PodSpec {
-                containers: vec![Container {
-                    name: "ssh-server".to_string(),
-                    image: Some(image.to_string()),
-                    ports: Some(vec![ContainerPort {
-                        container_port: ssh_port as i32,
-                        name: Some("ssh".to_string()),
-                        protocol: Some("TCP".to_string()),
-                        ..Default::default()
-                    }]),
-                    env: Some(env_vars),
-                    image_pull_policy: Some("IfNotPresent".to_string()),
-                    ..Default::default()
-                }],
+                containers,
+                volumes: if volumes.is_empty() { None } else { Some(volumes) },
                 restart_policy: Some("Never".to_string()),
                 ..Default::default()
             }),
@@ -258,10 +354,11 @@ impl PodManager {
     pub async fn delete_pod(&self, namespace: &str, pod_name: &str) -> Result<(), String> {
         use kube::api::DeleteParams;
         use kube::Api;
-        use k8s_openapi::api::core::v1::{Pod, Service};
+        use k8s_openapi::api::core::v1::{Pod, Service, ConfigMap};
 
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
         let services: Api<Service> = Api::namespaced(self.client.clone(), namespace);
+        let configmaps: Api<ConfigMap> = Api::namespaced(self.client.clone(), namespace);
 
         // Delete the pod
         let dp = DeleteParams::default();
@@ -271,7 +368,11 @@ impl PodManager {
         let service_name = format!("{}-ssh", pod_name);
         let _ = services.delete(&service_name, &dp).await;
 
-        info!(pod_name = %pod_name, namespace = %namespace, "Deleted pod and service");
+        // Delete the associated ConfigMap
+        let configmap_name = format!("{}-tor-config", pod_name);
+        let _ = configmaps.delete(&configmap_name, &dp).await;
+
+        info!(pod_name = %pod_name, namespace = %namespace, "Deleted pod, service, and configmap");
         Ok(())
     }
 }
@@ -417,7 +518,7 @@ async fn auth_check(
     }
 
     // Verify Cashu token validity (not amount, just validity)
-    match cashu::verify_cashu_token(&token, 1).await {
+    match cashu::verify_cashu_token(&token, 1, &state.config.whitelisted_mints).await {
         Ok(true) => {
             info!("✅ Payment verified: {} sats → {} minutes", payment_amount_sats, duration_minutes);
             StatusCode::OK.into_response()
@@ -478,7 +579,7 @@ async fn spawn_pod_handler(
     info!("💰 Payment: {} sats → ⏱️ Duration: {} minutes", payment_amount_sats, duration_minutes);
 
     // Verify payment (now we just need to verify the token is valid, not check amount)
-    match cashu::verify_cashu_token(&request.cashu_token, 1).await { // Just verify with 1 msat to check validity
+    match cashu::verify_cashu_token(&request.cashu_token, 1, &state.config.whitelisted_mints).await { // Just verify with 1 msat to check validity
         Ok(false) => {
             return (StatusCode::PAYMENT_REQUIRED, Json(SpawnPodResponse {
                 success: false,
@@ -517,6 +618,8 @@ async fn spawn_pod_handler(
         &username,
         &password,
         duration_minutes,
+        state.config.enable_tor_sidecar,
+        &state.config.tor_image,
     ).await {
         Ok(node_port) => {
             let pod_info = PodInfo {

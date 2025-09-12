@@ -2235,6 +2235,7 @@ dependencies = [
  "cdk",
  "cdk-redb",
  "chrono",
+ "futures-util",
  "k8s-openapi",
  "kube",
  "nostr-sdk",

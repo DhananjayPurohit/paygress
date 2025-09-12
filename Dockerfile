@@ -21,6 +21,11 @@ RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
+# Install kubectl
+RUN curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" \
+    && chmod +x kubectl \
+    && mv kubectl /usr/local/bin/
+
 # Create non-root user
 RUN useradd -r -s /bin/false -u 1000 paygress
 
@@ -43,7 +48,7 @@ WORKDIR /app
 EXPOSE 8080
 
 # Set default environment variables
-ENV PAYGRESS_MODE=nostr
+ENV RUN_MODE=nostr
 ENV BIND_ADDR=0.0.0.0:8080
 ENV CASHU_DB_PATH=/app/data/cashu.db
 ENV POD_NAMESPACE=user-workloads
@@ -52,11 +57,15 @@ ENV DEFAULT_POD_DURATION_MINUTES=60
 ENV SSH_BASE_IMAGE=linuxserver/openssh-server:latest
 ENV SSH_PORT=2222
 ENV ENABLE_CLEANUP_TASK=true
+ENV ENABLE_TOR_SIDECAR=true
+ENV TOR_IMAGE=goldy/tor-hidden-service:latest
+ENV NOSTR_RELAYS=wss://relay.damus.io,wss://nos.lol,wss://relay.nostr.band
+ENV WHITELISTED_MINTS=https://nofees.testnut.cashu.space
 ENV RUST_LOG=info
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8080/healthz || exit 1
+# Health check (disabled for Nostr mode - no HTTP endpoints)
+# HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+#     CMD curl -f http://localhost:8080/healthz || exit 1
 
 # Run the service
 CMD ["paygress-sidecar"]
