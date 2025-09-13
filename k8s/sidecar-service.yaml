@@ -72,8 +72,6 @@ data:
   SSH_BASE_IMAGE: "linuxserver/openssh-server:latest"
   SSH_PORT: "2222"
   ENABLE_CLEANUP_TASK: "true"
-  ENABLE_TOR_SIDECAR: "false"
-  TOR_IMAGE: "dperson/torproxy:latest"
   NOSTR_RELAYS: "wss://relay.damus.io,wss://nos.lol,wss://relay.nostr.band"
   WHITELISTED_MINTS: "https://nofees.testnut.cashu.space"
   RUST_LOG: "info"

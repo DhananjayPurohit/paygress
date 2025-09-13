@@ -47,21 +47,10 @@ WORKDIR /app
 # Expose the service port
 EXPOSE 8080
 
-# Set default environment variables
-ENV RUN_MODE=nostr
+# Set only essential environment variables (others configured via Kubernetes ConfigMap)
+ENV RUST_LOG=info
 ENV BIND_ADDR=0.0.0.0:8080
 ENV CASHU_DB_PATH=/app/data/cashu.db
-ENV POD_NAMESPACE=user-workloads
-ENV PAYMENT_RATE_SATS_PER_HOUR=100
-ENV DEFAULT_POD_DURATION_MINUTES=60
-ENV SSH_BASE_IMAGE=linuxserver/openssh-server:latest
-ENV SSH_PORT=2222
-ENV ENABLE_CLEANUP_TASK=true
-ENV ENABLE_TOR_SIDECAR=true
-ENV TOR_IMAGE=goldy/tor-hidden-service:latest
-ENV NOSTR_RELAYS=wss://relay.damus.io,wss://nos.lol,wss://relay.nostr.band
-ENV WHITELISTED_MINTS=https://nofees.testnut.cashu.space
-ENV RUST_LOG=info
 
 # Health check (disabled for Nostr mode - no HTTP endpoints)
 # HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \

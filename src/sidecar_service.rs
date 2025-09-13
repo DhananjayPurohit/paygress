@@ -26,8 +26,6 @@ pub struct SidecarConfig {
     pub ssh_base_image: String, // Base image with SSH server
     pub ssh_port: u16,
     pub enable_cleanup_task: bool,
-    pub enable_tor_sidecar: bool, // Enable Tor onion service for SSH access
-    pub tor_image: String, // Tor container image
     pub whitelisted_mints: Vec<String>, // Allowed Cashu mint URLs
 }
 
@@ -41,8 +39,6 @@ impl Default for SidecarConfig {
             ssh_base_image: "linuxserver/openssh-server:latest".to_string(),
             ssh_port: 2222,
             enable_cleanup_task: true,
-            enable_tor_sidecar: false, // Disabled by default
-            tor_image: "dperson/torproxy:latest".to_string(),
             whitelisted_mints: vec![
                 "https://mint.cashu.space".to_string(),
                 "https://mint.f7z.io".to_string(),
@@ -117,8 +113,6 @@ impl PodManager {
         username: &str,
         password: &str,
         duration_minutes: u64,
-        enable_tor: bool,
-        tor_image: &str,
     ) -> Result<u16, String> {
         use k8s_openapi::api::core::v1::{
             Container, Pod, PodSpec, EnvVar, ContainerPort, Service, ServiceSpec, ServicePort,
@@ -185,26 +179,11 @@ impl PodManager {
         annotations.insert("paygress.io/duration-minutes".to_string(), duration_minutes.to_string());
         annotations.insert("paygress.io/ssh-username".to_string(), username.to_string());
 
-        // Create volumes (including Tor volume if enabled)
-        let mut volumes = Vec::new();
-        if enable_tor {
-            volumes.push(Volume {
-                name: "tor-hs".to_string(),
-                empty_dir: Some(EmptyDirVolumeSource::default()),
-                ..Default::default()
-            });
-            volumes.push(Volume {
-                name: "tor-config".to_string(),
-                config_map: Some(k8s_openapi::api::core::v1::ConfigMapVolumeSource {
-                    name: Some(format!("{}-tor-config", pod_name)),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            });
-        }
+        // Create volumes
+        let volumes = Vec::new();
 
         // Create containers
-        let mut containers = vec![Container {
+        let containers = vec![Container {
             name: "ssh-server".to_string(),
             image: Some(image.to_string()),
             ports: Some(vec![ContainerPort {
@@ -218,65 +197,6 @@ impl PodManager {
             ..Default::default()
         }];
 
-        // Add Tor sidecar container if enabled
-        if enable_tor {
-            containers.push(Container {
-                name: "tor-sidecar".to_string(),
-                image: Some(tor_image.to_string()),
-                env: Some(vec![
-                    EnvVar {
-                        name: "TZ".to_string(),
-                        value: Some("UTC".to_string()),
-                        value_from: None,
-                    },
-                ]),
-                volume_mounts: Some(vec![
-                    VolumeMount {
-                        name: "tor-hs".to_string(),
-                        mount_path: "/var/lib/tor/hidden_service".to_string(),
-                        ..Default::default()
-                    },
-                    VolumeMount {
-                        name: "tor-config".to_string(),
-                        mount_path: "/etc/tor/torrc".to_string(),
-                        sub_path: Some("torrc".to_string()),
-                        ..Default::default()
-                    },
-                ]),
-                image_pull_policy: Some("IfNotPresent".to_string()),
-                ..Default::default()
-            });
-        }
-
-        // Create Tor ConfigMap if Tor is enabled
-        if enable_tor {
-            let tor_config = format!(
-                "HiddenServiceDir /var/lib/tor/hidden_service/\n\
-                 HiddenServicePort 80 127.0.0.1:{}\n\
-                 Log notice stdout\n\
-                 DataDirectory /var/lib/tor\n",
-                ssh_port
-            );
-
-            let configmap = k8s_openapi::api::core::v1::ConfigMap {
-                metadata: kube::core::ObjectMeta {
-                    name: Some(format!("{}-tor-config", pod_name)),
-                    labels: Some(BTreeMap::from([
-                        ("app".to_string(), "paygress-ssh-pod".to_string()),
-                        ("managed-by".to_string(), "paygress-sidecar".to_string()),
-                        ("pod-name".to_string(), pod_name.to_string()),
-                    ])),
-                    ..Default::default()
-                },
-                data: Some(BTreeMap::from([
-                    ("torrc".to_string(), tor_config),
-                ])),
-                ..Default::default()
-            };
-
-            let pp = PostParams::default();
-            configmaps.create(&pp, &configmap).await.map_err(|e| format!("Failed to create Tor ConfigMap: {}", e))?;
-        }
 
         // Create the pod
         let pod = Pod {
@@ -288,7 +208,7 @@ impl PodManager {
             },
             spec: Some(PodSpec {
                 containers,
-                volumes: if volumes.is_empty() { None } else { Some(volumes) },
+                volumes: None,
                 restart_policy: Some("Never".to_string()),
                 ..Default::default()
             }),
@@ -299,7 +219,8 @@ impl PodManager {
         let pp = PostParams::default();
         pods.create(&pp, &pod).await.map_err(|e| format!("Failed to create pod: {}", e))?;
 
-        // Create a service to expose the SSH port
+        // With host network, we don't need a service - SSH is directly accessible
+        // But we'll create a simple service for compatibility
         let service = Service {
             metadata: kube::core::ObjectMeta {
                 name: Some(format!("{}-ssh", pod_name)),
@@ -312,32 +233,27 @@ impl PodManager {
                     ("pod-name".to_string(), pod_name.to_string()),
                 ])),
                 ports: Some(vec![ServicePort {
-                    port: ssh_port as i32,
-                    target_port: Some(IntOrString::Int(ssh_port as i32)),
+                    port: 2222, // Always use port 2222 for the service
+                    target_port: Some(IntOrString::Int(2222)), // Always target port 2222 (SSH server port)
                     name: Some("ssh".to_string()),
                     protocol: Some("TCP".to_string()),
                     ..Default::default()
                 }]),
-                type_: Some("NodePort".to_string()),
+                type_: Some("NodePort".to_string()), // Use NodePort for external access
                 ..Default::default()
             }),
             ..Default::default()
         };
 
-        services.create(&pp, &service).await.map_err(|e| format!("Failed to create service: {}", e))?;
+        let created_service = services.create(&pp, &service).await.map_err(|e| format!("Failed to create service: {}", e))?;
 
-        // Read back the created service to get the allocated NodePort
-        let created = services
-            .get(&format!("{}-ssh", pod_name))
-            .await
-            .map_err(|e| format!("Failed to read created service: {}", e))?;
-        let node_port = created
+        // Get the actual node port that Kubernetes assigned
+        let node_port = created_service
             .spec
-            .as_ref()
-            .and_then(|s| s.ports.as_ref())
+            .and_then(|spec| spec.ports)
             .and_then(|ports| ports.first())
-            .and_then(|p| p.node_port)
-            .ok_or_else(|| "Service did not allocate a nodePort".to_string())? as u16;
+            .and_then(|port| port.node_port)
+            .unwrap_or(2222) as u16;
 
         info!(
             pod_name = %pod_name, 
@@ -368,11 +284,8 @@ impl PodManager {
         let service_name = format!("{}-ssh", pod_name);
         let _ = services.delete(&service_name, &dp).await;
 
-        // Delete the associated ConfigMap
-        let configmap_name = format!("{}-tor-config", pod_name);
-        let _ = configmaps.delete(&configmap_name, &dp).await;
 
-        info!(pod_name = %pod_name, namespace = %namespace, "Deleted pod, service, and configmap");
+        info!(pod_name = %pod_name, namespace = %namespace, "Deleted pod and service");
         Ok(())
     }
 }
@@ -398,9 +311,12 @@ impl SidecarState {
     // Calculate duration based on payment amount (configurable pricing)
     pub fn calculate_duration_from_payment(&self, payment_sats: u64) -> u64 {
         let sats_per_hour = self.config.payment_rate_sats_per_hour.max(1);
-        // minutes = (payment_sats / sats_per_hour) * 60
-        // Do integer math carefully to avoid overflow and preserve proportionality
-        (payment_sats.saturating_mul(60)) / sats_per_hour
+        
+        // Fixed point calculation: (payment_sats * 60) / sats_per_hour
+        // This preserves precision by multiplying by 60 first
+        let duration_minutes = (payment_sats * 60) / sats_per_hour;
+        
+        duration_minutes
     }
 
     // Generate secure random password
@@ -418,10 +334,8 @@ impl SidecarState {
 
     // Generate unique SSH port for each pod
     pub fn generate_ssh_port(&self) -> u16 {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
-        // Generate port in range 22000-22999 to avoid conflicts
-        rng.gen_range(22000..23000)
+        // Always use the configured SSH port (2222) since that's what the SSH server runs on
+        self.config.ssh_port
     }
 }
 
@@ -618,8 +532,6 @@ async fn spawn_pod_handler(
         &username,
         &password,
         duration_minutes,
-        state.config.enable_tor_sidecar,
-        &state.config.tor_image,
     ).await {
         Ok(node_port) => {
             let pod_info = PodInfo {
@@ -703,30 +615,37 @@ async fn get_port_forward_command(
 
     match pods.get(&pod_name) {
         Some(pod_info) => {
+            let direct_ssh_command = format!(
+                "ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no {}@$(minikube ip) -p {}",
+                pod_info.ssh_username, pod_info.node_port.unwrap_or(2222)
+            );
+
             let port_forward_command = format!(
-                "kubectl -n {} port-forward svc/{}-ssh {}:{}",
+                "kubectl -n {} port-forward svc/{}-ssh 2222:2222",
                 state.config.pod_namespace,
-                pod_name,
-                pod_info.ssh_port,
-                pod_info.ssh_port
+                pod_name
             );
 
             let ssh_command = format!(
-                "ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no {}@localhost -p {}",
-                pod_info.ssh_username,
-                pod_info.ssh_port
+                "ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no {}@localhost -p 2222",
+                pod_info.ssh_username
             );
 
             let response = serde_json::json!({
                 "pod_name": pod_name,
-                "ssh_port": pod_info.ssh_port,
+                "ssh_port": 2222,
+                "node_port": pod_info.node_port,
+                "direct_ssh_command": direct_ssh_command,
                 "port_forward_command": port_forward_command,
                 "ssh_command": ssh_command,
                 "instructions": [
-                    format!("Run: {}", port_forward_command),
-                    "In another terminal, run: ".to_string() + &ssh_command,
+                    "🚀 Direct SSH access (no kubectl needed):".to_string(),
+                    direct_ssh_command,
                     format!("Password: {}", pod_info.ssh_password),
-                    "Keep port-forward running for SSH access".to_string()
+                    "".to_string(),
+                    "⚠️  Alternative (requires kubectl):".to_string(),
+                    format!("Run: {}", port_forward_command),
+                    "In another terminal, run: ".to_string() + &ssh_command
                 ]
             });
 
