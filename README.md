@@ -87,6 +87,7 @@ WHITELISTED_MINTS=https://nofees.testnut.cashu.space,https://testnut.cashu.space
 # SSH Pod Configuration
 SSH_BASE_IMAGE=linuxserver/openssh-server:latest
 SSH_PORT=2222
+SSH_HOST=localhost
 
 EOF
 ```

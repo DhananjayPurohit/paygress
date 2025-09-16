@@ -39,6 +39,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_else(|_| "2222".to_string())
             .parse()
             .unwrap_or(2222),
+        ssh_host: env::var("SSH_HOST")
+            .unwrap_or_else(|_| "localhost".to_string()),
         enable_cleanup_task: env::var("ENABLE_CLEANUP_TASK")
             .unwrap_or_else(|_| "true".to_string())
             .parse()
@@ -191,6 +193,7 @@ async fn handle_spawn_pod_request(
     let expires_at = now + chrono::Duration::minutes(duration_minutes as i64);
 
     match state_clone.k8s_client.create_ssh_pod(
+        &state_clone.config,
         &state_clone.config.pod_namespace,
         &pod_name,
         &image,

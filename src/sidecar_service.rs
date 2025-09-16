@@ -27,6 +27,7 @@ pub struct SidecarConfig {
     pub default_pod_duration_minutes: u64, // Default duration if not specified
     pub ssh_base_image: String, // Base image with SSH server
     pub ssh_port: u16,
+    pub ssh_host: String, // SSH host for connections
     pub enable_cleanup_task: bool,
     pub whitelisted_mints: Vec<String>, // Allowed Cashu mint URLs
 }
@@ -40,6 +41,7 @@ impl Default for SidecarConfig {
             default_pod_duration_minutes: 60, // 1 hour default
             ssh_base_image: "linuxserver/openssh-server:latest".to_string(),
             ssh_port: 2222,
+            ssh_host: "localhost".to_string(),
             enable_cleanup_task: true,
             whitelisted_mints: vec![
                 "https://mint.cashu.space".to_string(),
@@ -127,6 +129,7 @@ impl PodManager {
 
     pub async fn create_ssh_pod(
         &self,
+        config: &SidecarConfig,
         namespace: &str,
         pod_name: &str,
         image: &str,
@@ -283,8 +286,8 @@ impl PodManager {
                     ("pod-name".to_string(), pod_name.to_string()),
                 ])),
                 ports: Some(vec![ServicePort {
-                    port: 2222, // Always use port 2222 for the service
-                    target_port: Some(IntOrString::Int(2222)), // Always target port 2222 (SSH server port)
+                    port: config.ssh_port as i32, // Use configured SSH port for the service
+                    target_port: Some(IntOrString::Int(config.ssh_port as i32)), // Use configured SSH port (SSH server port)
                     name: Some("ssh".to_string()),
                     protocol: Some("TCP".to_string()),
                     ..Default::default()
@@ -303,7 +306,7 @@ impl PodManager {
             .and_then(|spec| spec.ports)
             .and_then(|ports| ports.first().cloned())
             .and_then(|port| port.node_port)
-            .unwrap_or(2222) as u16;
+            .unwrap_or(config.ssh_port as i32) as u16;
 
         info!(
             pod_name = %pod_name, 
@@ -316,6 +319,7 @@ impl PodManager {
 
         // Send access event from the pod itself
         let _ = Self::send_pod_access_event(
+            &config,
             &pod_npub,
             &pod_nsec,
             user_pubkey,
@@ -331,6 +335,7 @@ impl PodManager {
 
     // Function to send access event from the pod itself
     async fn send_pod_access_event(
+        config: &SidecarConfig,
         _pod_npub: &str,
         pod_nsec: &str,
         user_pubkey: &str,
@@ -346,7 +351,7 @@ impl PodManager {
             "pod_name": pod_name,
             "ssh_username": username,
             "ssh_password": password,
-            "ssh_port": 2222,
+            "ssh_port": config.ssh_port,
             "node_port": node_port,
             "expires_at": (Utc::now() + chrono::Duration::minutes(duration_minutes as i64)).to_rfc3339(),
             "instructions": vec![
@@ -357,11 +362,9 @@ impl PodManager {
                 format!("   Password: {}", password),
                 "".to_string(),
                 "2. Alternative (requires kubectl):".to_string(),
-                format!("   kubectl -n user-workloads port-forward svc/{}-ssh 2222:2222", pod_name),
-                format!("   ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no {}@localhost -p 2222", username),
-                "".to_string(),
-                "🔐 Access details sent from pod itself via encrypted Nostr!".to_string(),
-                "💡 Ready for Iroh integration!".to_string()
+                format!("   kubectl -n user-workloads port-forward svc/{}-ssh {}:{}", pod_name, config.ssh_port, config.ssh_port),
+                format!("   ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no {}@{} -p {}", username, config.ssh_host, config.ssh_port),
+                "".to_string()
             ]
         });
 
@@ -733,6 +736,7 @@ async fn spawn_pod_handler(
 
     // Create the pod
     match state.k8s_client.create_ssh_pod(
+        &state.config,
         &state.config.pod_namespace,
         &pod_name,
         &image,
@@ -938,23 +942,25 @@ async fn get_port_forward_command(
         Some(pod_info) => {
             let direct_ssh_command = format!(
                 "ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no {}@$(minikube ip) -p {}",
-                pod_info.ssh_username, pod_info.node_port.unwrap_or(2222)
+                pod_info.ssh_username, pod_info.node_port.unwrap_or(state.config.ssh_port)
             );
 
             let port_forward_command = format!(
-                "kubectl -n {} port-forward svc/{}-ssh 2222:2222",
+                "kubectl -n {} port-forward svc/{}-ssh {}:{}",
                 state.config.pod_namespace,
-                pod_name
+                pod_name,
+                state.config.ssh_port,
+                state.config.ssh_port
             );
 
             let ssh_command = format!(
-                "ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no {}@localhost -p 2222",
-                pod_info.ssh_username
+                "ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no {}@{} -p {}",
+                pod_info.ssh_username, state.config.ssh_host, state.config.ssh_port
             );
 
             let response = serde_json::json!({
                 "pod_name": pod_name,
-                "ssh_port": 2222,
+                "ssh_port": state.config.ssh_port,
                 "node_port": pod_info.node_port,
                 "direct_ssh_command": direct_ssh_command,
                 "port_forward_command": port_forward_command,
