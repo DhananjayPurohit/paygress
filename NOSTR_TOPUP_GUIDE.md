@@ -68,7 +68,7 @@ import asyncio
 from nostr.key import PrivateKey
 from nostr.relay import Relay
 from nostr.event import Event
-from nostr.nip04 import encrypt
+from nostr.nip44 import encrypt
 
 async def create_pod():
     # Your keys
@@ -125,7 +125,7 @@ asyncio.run(topup_pod())
 ### **3. Using JavaScript/TypeScript**
 ```javascript
 import { Relay } from 'nostr-tools'
-import { nip04 } from 'nostr-tools'
+import { nip44 } from 'nostr-tools'
 
 async function createPod() {
   const userPrivateKey = 'your_nsec_key'
@@ -138,7 +138,7 @@ async function createPod() {
   }
   
   // Encrypt the request
-  const encryptedContent = await nip04.encrypt(userPrivateKey, servicePublicKey, JSON.stringify(request))
+  const encryptedContent = await nip44.encrypt(userPrivateKey, servicePublicKey, JSON.stringify(request))
   
   // Create and send event
   const event = {
@@ -163,7 +163,7 @@ async function topupPod() {
   }
   
   // Similar to above but kind=1002
-  const encryptedContent = await nip04.encrypt(userPrivateKey, servicePublicKey, JSON.stringify(request))
+  const encryptedContent = await nip44.encrypt(userPrivateKey, servicePublicKey, JSON.stringify(request))
   
   const event = {
     kind: 1002,
@@ -215,7 +215,7 @@ User                    Service
 ## 🎯 **Key Features**
 
 ### **✅ Encrypted Communication**
-- All requests are encrypted using NIP-04
+- All requests are encrypted using NIP-44
 - Only the service can decrypt your requests
 - Your private keys stay secure
 

@@ -6,7 +6,7 @@
 
 **Encrypted Nostr-Driven Pod Provisioning:**
 - Service listens for **encrypted** Nostr events (kind 1000) with Cashu tokens
-- All sensitive data encrypted using NIP-04 (Cashu tokens, SSH credentials)
+- All sensitive data encrypted using NIP-44 (Cashu tokens, SSH credentials)
 - Automatically provisions SSH pods in Kubernetes with `activeDeadlineSeconds`
 - Replies with **encrypted** access details via Nostr events (kind 1001)
 - **Top-up Support**: Extend pod duration via Nostr (kind 1002) or HTTP
@@ -429,6 +429,65 @@ ENABLE_CLEANUP_TASK=false
 - **Top-up 60 sats** → Extends existing pod by 60 minutes
 
 **Note**: Kubernetes `activeDeadlineSeconds` ensures pods are terminated exactly when their paid duration expires. No external cleanup processes needed!
+
+## 🚀 **Docker Hub Deployment with GitHub Actions**
+
+This repository includes GitHub Actions workflows to automatically build and push Docker images to Docker Hub.
+
+### **Setup GitHub Secrets**
+
+1. Go to your GitHub repository settings
+2. Navigate to **Secrets and variables** → **Actions**
+3. Add the following secrets:
+
+```bash
+DOCKERHUB_USERNAME=your_dockerhub_username
+DOCKERHUB_TOKEN=your_dockerhub_access_token
+```
+
+### **Docker Hub Access Token**
+
+1. Go to [Docker Hub](https://hub.docker.com/)
+2. Navigate to **Account Settings** → **Security**
+3. Click **New Access Token**
+4. Give it a name (e.g., "github-actions")
+5. Set permissions to **Read, Write, Delete**
+6. Copy the token and add it as `DOCKERHUB_TOKEN` secret
+
+### **Automatic Builds**
+
+The workflow will automatically:
+- **Build** on every push to `main`/`master` branch
+- **Build** on every pull request to `main`/`master` branch  
+- **Build and push** on version tags (e.g., `v1.0.0`)
+- **Build** for both `linux/amd64` and `linux/arm64` platforms
+
+### **Image Tags**
+
+Images will be tagged as:
+- `latest` - Latest commit on default branch
+- `main`/`master` - Branch name
+- `v1.0.0` - Version tags
+- `v1.0` - Major.minor version
+- `v1` - Major version
+
+### **Using the Images**
+
+```bash
+# Pull the latest image
+docker pull yourusername/paygress-sidecar:latest
+
+# Pull a specific version
+docker pull yourusername/paygress-sidecar:v1.0.0
+
+# Run the container
+docker run -d \
+  --name paygress-sidecar \
+  -p 8080:8080 \
+  -e NOSTR_PRIVATE_KEY=your_nsec_key \
+  -e NOSTR_RELAYS=wss://relay.damus.io,wss://nos.lol \
+  yourusername/paygress-sidecar:latest
+```
 
 ## 🔧 Configuration Examples
 

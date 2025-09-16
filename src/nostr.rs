@@ -128,7 +128,7 @@ impl NostrRelaySubscriber {
         // Serialize the access details
         let details_json = serde_json::to_string(&details)?;
         
-        // Encrypt the content using NIP-04
+        // Encrypt the content using NIP-44
         let request_pubkey_parsed = nostr_sdk::PublicKey::parse(request_pubkey)?;
         let encrypted_content = nip44::encrypt(
             self.keys.secret_key()?,
