@@ -18,6 +18,18 @@ const MSAT_PER_SAT: u64 = 1000;
 // Database singleton
 static CASHU_DB: OnceLock<Arc<cdk_redb::wallet::WalletRedbDatabase>> = OnceLock::new();
 
+// Function to validate if a mint URL is whitelisted
+pub fn is_mint_whitelisted(mint_url: &str, whitelisted_mints: &[String]) -> bool {
+    // Normalize the mint URL for comparison
+    let normalized_mint = mint_url.trim_end_matches('/').to_lowercase();
+    
+    whitelisted_mints.iter().any(|whitelisted| {
+        let normalized_whitelisted = whitelisted.trim_end_matches('/').to_lowercase();
+        normalized_mint == normalized_whitelisted || 
+        normalized_mint.starts_with(&normalized_whitelisted)
+    })
+}
+
 pub async fn initialize_cashu(db_path: &str) -> Result<(), String> {
     // Initialize PROCESSED_TOKENS with empty HashSet
     PROCESSED_TOKENS.with(|tokens| {
@@ -39,7 +51,7 @@ pub async fn initialize_cashu(db_path: &str) -> Result<(), String> {
     }
 }
 
-pub async fn verify_cashu_token(token: &str, amount_msat: i64) -> Result<bool, String> {
+pub async fn verify_cashu_token(token: &str, amount_msat: i64, whitelisted_mints: &[String]) -> Result<bool, String> {
     // Check if token was already processed
     let token_already_processed = PROCESSED_TOKENS.with(|tokens| {
         if let Some(set) = tokens.borrow().as_ref() {
@@ -97,6 +109,14 @@ pub async fn verify_cashu_token(token: &str, amount_msat: i64) -> Result<bool, S
     // Extract mint URL from the token
     let mint_url = token_decoded.mint_url()
         .map_err(|e| format!("Failed to get mint URL: {}", e))?;
+
+    // Validate mint URL against whitelist
+    if !is_mint_whitelisted(&mint_url.to_string(), whitelisted_mints) {
+        eprintln!("Mint URL not whitelisted: {}", mint_url);
+        return Err(format!("Mint URL not whitelisted: {}", mint_url));
+    }
+
+    println!("Mint URL validated: {}", mint_url);
 
     let unit = token_decoded.unit().unwrap();
     

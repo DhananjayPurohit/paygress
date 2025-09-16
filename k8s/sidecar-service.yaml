@@ -1,0 +1,226 @@
+# Paygress Sidecar Service with SSH Pod Provisioning
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: paygress-sidecar
+  namespace: ingress-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: paygress-sidecar
+rules:
+# Pod management permissions
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["create", "get", "list", "watch", "delete"]
+- apiGroups: [""]
+  resources: ["pods/status"]
+  verbs: ["get"]
+- apiGroups: [""]
+  resources: ["pods/log"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create"]
+# Service management for SSH access
+- apiGroups: [""]
+  resources: ["services"]
+  verbs: ["create", "get", "list", "watch", "delete"]
+# ConfigMap access for SSH keys
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["create", "get", "list", "watch", "delete"]
+# Secret access for SSH credentials
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["create", "get", "list", "watch", "delete"]
+# Namespace access
+- apiGroups: [""]
+  resources: ["namespaces"]
+  verbs: ["get", "list", "watch"]
+# Events for logging
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: paygress-sidecar
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: paygress-sidecar
+subjects:
+- kind: ServiceAccount
+  name: paygress-sidecar
+  namespace: ingress-system
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: paygress-sidecar-config
+  namespace: ingress-system
+data:
+  RUN_MODE: "nostr"
+  BIND_ADDR: "0.0.0.0:8080"
+  CASHU_DB_PATH: "/app/data/cashu.db"
+  POD_NAMESPACE: "user-workloads"
+  PAYMENT_RATE_SATS_PER_HOUR: "100"
+  DEFAULT_POD_DURATION_MINUTES: "60"
+  SSH_BASE_IMAGE: "linuxserver/openssh-server:latest"
+  SSH_PORT: "2222"
+  ENABLE_CLEANUP_TASK: "true"
+  NOSTR_RELAYS: "wss://relay.damus.io,wss://nos.lol,wss://relay.nostr.band"
+  WHITELISTED_MINTS: "https://nofees.testnut.cashu.space"
+  RUST_LOG: "info"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: paygress-sidecar
+  namespace: ingress-system
+  labels:
+    app: paygress-sidecar
+    component: payment-sidecar
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: paygress-sidecar
+  template:
+    metadata:
+      labels:
+        app: paygress-sidecar
+        component: payment-sidecar
+    spec:
+      serviceAccountName: paygress-sidecar
+      containers:
+      - name: paygress-sidecar
+        image: paygress:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8080
+          name: http
+        envFrom:
+        - configMapRef:
+            name: paygress-sidecar-config
+        volumeMounts:
+        - name: data
+          mountPath: /app/data
+        # No health checks for Nostr mode - no HTTP endpoints
+        resources:
+          requests:
+            cpu: 200m
+            memory: 256Mi
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+      volumes:
+      - name: data
+        emptyDir: {}
+      securityContext:
+        fsGroup: 1000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: paygress-sidecar
+  namespace: ingress-system
+  labels:
+    app: paygress-sidecar
+spec:
+  selector:
+    app: paygress-sidecar
+  ports:
+  - port: 8080
+    targetPort: 8080
+    name: http
+  type: ClusterIP
+---
+# User workloads namespace for SSH pods
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: user-workloads
+  labels:
+    managed-by: paygress-sidecar
+    pod-type: ssh-workloads
+---
+# Example Ingress using the sidecar service
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: example-paid-service
+  namespace: default
+  annotations:
+    # Use Paygress sidecar for auth
+    nginx.ingress.kubernetes.io/auth-url: "http://paygress-sidecar.ingress-system.svc.cluster.local:8080/auth"
+    nginx.ingress.kubernetes.io/auth-method: "GET"
+    nginx.ingress.kubernetes.io/auth-response-headers: "X-Payment-Verified,X-Pod-Name,X-SSH-Info"
+    
+    # Custom error pages for payment required
+    nginx.ingress.kubernetes.io/custom-http-errors: "401,402"
+    
+    # Pass original URI for payment verification
+    nginx.ingress.kubernetes.io/auth-snippet: |
+      proxy_set_header X-Original-URI $request_uri;
+      proxy_set_header X-Original-Method $request_method;
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: ssh.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: default-backend  # Fallback service
+            port:
+              number: 80
+---
+# Default backend service for demonstration
+apiVersion: v1
+kind: Service
+metadata:
+  name: default-backend
+  namespace: default
+spec:
+  selector:
+    app: default-backend
+  ports:
+  - port: 80
+    targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: default-backend
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: default-backend
+  template:
+    metadata:
+      labels:
+        app: default-backend
+    spec:
+      containers:
+      - name: backend
+        image: nginx:alpine
+        ports:
+        - containerPort: 8080
+        command: ["/bin/sh"]
+        args: ["-c", "echo 'Payment required. Please use POST /spawn-pod endpoint.' > /usr/share/nginx/html/index.html && nginx -g 'daemon off;'"]
