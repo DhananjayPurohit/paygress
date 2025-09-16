@@ -1,6 +1,7 @@
-// Nostr client for receiving pod provisioning events
+// Nostr client for receiving pod provisioning events with NIP-44 encryption
 use anyhow::{Context, Result};
 use nostr_sdk::{Client, Keys, Filter, Kind, RelayPoolNotification, Url, EventBuilder, Tag};
+use nostr_sdk::nips::nip44;
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 use std::future::Future;
@@ -34,11 +35,18 @@ impl NostrRelaySubscriber {
     pub async fn new(config: RelayConfig) -> Result<Self> {
         let keys = match &config.private_key {
             Some(private_key_hex) if !private_key_hex.is_empty() => {
-                Keys::parse(private_key_hex)
-                    .context("Invalid private key format")?
+                // Parse as nsec format (nostr private key)
+                if private_key_hex.starts_with("nsec1") {
+                    Keys::parse(private_key_hex)
+                        .context("Invalid nsec private key format")?
+                } else {
+                    // Assume hex format for backward compatibility
+                    Keys::parse(private_key_hex)
+                        .context("Invalid private key format")?
+                }
             }
             _ => {
-                // Always generate a new key for security
+                // Generate a new key if none provided
                 Keys::generate()
             }
         };
@@ -54,6 +62,8 @@ impl NostrRelaySubscriber {
 
         client.connect().await;
         info!("Connected to {} relays", config.relays.len());
+        info!("Service public key (npub): {}", keys.public_key().to_hex());
+        // Note: Private key (nsec) is not logged for security
 
         Ok(Self { client, keys, config })
     }
@@ -62,13 +72,17 @@ impl NostrRelaySubscriber {
     where
         F: Fn(NostrEvent) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> + Send + Sync + 'static,
     {
-        // Subscribe to pod provisioning events (kind 1000)
+        // Subscribe to pod provisioning events (kind 1000) and top-up events (kind 1002)
         let filter = Filter::new()
             .kind(Kind::Custom(1000))
             .limit(0);
+        
+        let topup_filter = Filter::new()
+            .kind(Kind::Custom(1002))
+            .limit(0);
 
-        self.client.subscribe(vec![filter], None).await;
-        info!("Subscribed to pod provisioning events (kind 1000)");
+        let _ = self.client.subscribe(vec![filter, topup_filter], None).await;
+        info!("Subscribed to encrypted pod provisioning events (kind 1000) and top-up events (kind 1002)");
 
         // Handle incoming events
         self.client.handle_notifications(|notification| async {
@@ -77,10 +91,10 @@ impl NostrRelaySubscriber {
                 
                 match handler(nostr_event).await {
                     Ok(()) => {
-                        info!("Successfully processed event: {}", event.id);
+                        info!("Successfully processed encrypted event: {}", event.id);
                     }
                     Err(e) => {
-                        error!("Failed to process event {}: {}", event.id, e);
+                        error!("Failed to process encrypted event {}: {}", event.id, e);
                     }
                 }
             }
@@ -104,19 +118,63 @@ impl NostrRelaySubscriber {
         Ok(event_id)
     }
 
-    pub async fn publish_access_details(&self, request_event_id: &str, details: AccessDetailsContent) -> Result<String> {
-        let content = serde_json::to_string(&details)?;
+    // NEW: Encrypted access details publishing
+    pub async fn publish_encrypted_access_details(
+        &self, 
+        request_event_id: &str, 
+        request_pubkey: &str,
+        details: AccessDetailsContent
+    ) -> Result<String> {
+        // Serialize the access details
+        let details_json = serde_json::to_string(&details)?;
+        
+        // Encrypt the content using NIP-04
+        let request_pubkey_parsed = nostr_sdk::PublicKey::parse(request_pubkey)?;
+        let encrypted_content = nip44::encrypt(
+            self.keys.secret_key()?,
+            &request_pubkey_parsed,
+            &details_json,
+            nip44::Version::V2
+        )?;
+
         let tags = vec![
             Tag::event(request_event_id.parse()?),
             Tag::hashtag("paygress"),
             Tag::hashtag("response"),
+            Tag::hashtag("encrypted"),
         ];
-        let builder = EventBuilder::new(Kind::Custom(1001), content, tags);
+        
+        let builder = EventBuilder::new(Kind::Custom(1001), encrypted_content, tags);
         let event = builder.to_event(&self.keys)?;
         let event_id = event.id.to_hex();
         self.client.send_event(event).await?;
-        info!("Published access details event in reply to {}: {}", request_event_id, event_id);
+        info!("Published encrypted access details event in reply to {}: {}", request_event_id, event_id);
         Ok(event_id)
+    }
+
+    // NEW: Decrypt incoming encrypted events
+    pub fn decrypt_event_content(&self, event: &NostrEvent) -> Result<String> {
+        // Decrypt the content using NIP-44
+        let sender_pubkey = nostr_sdk::PublicKey::parse(&event.pubkey)?;
+        let decrypted = nip44::decrypt(
+            self.keys.secret_key()?,
+            &sender_pubkey,
+            &event.content
+        )?;
+        Ok(decrypted)
+    }
+
+    // NEW: Check if event is encrypted
+    pub fn is_encrypted_event(&self, event: &NostrEvent) -> bool {
+        // Check if the event has encryption tags or if content looks encrypted
+        event.tags.iter().any(|tag| {
+            tag.len() >= 2 && tag[0] == "encrypted"
+        }) || event.content.starts_with("nip44:")
+    }
+
+    // NEW: Get service public key for users
+    pub fn get_service_public_key(&self) -> String {
+        self.keys.public_key().to_hex()
     }
 
     fn convert_event(&self, event: &nostr_sdk::Event) -> NostrEvent {
@@ -170,4 +228,57 @@ pub struct AccessDetailsContent {
     pub node_port: Option<u16>,
     pub expires_at: String,
     pub instructions: Vec<String>,
+}
+
+// NEW: Encrypted request structure
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EncryptedSpawnPodRequest {
+    pub cashu_token: String,
+    pub ssh_username: Option<String>,
+    pub pod_image: Option<String>,
+    pub duration_minutes: Option<u64>, // Optional custom duration
+}
+
+// NEW: Encrypted top-up request structure
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EncryptedTopUpPodRequest {
+    pub pod_name: String,
+    pub cashu_token: String,
+}
+
+// NEW: Helper function to create encrypted provisioning request
+pub fn create_encrypted_provisioning_request(
+    service_pubkey: &str,
+    user_keys: &Keys,
+    request: EncryptedSpawnPodRequest,
+) -> Result<String> {
+    let request_json = serde_json::to_string(&request)?;
+    
+    // Encrypt the request content
+    let service_pubkey_parsed = nostr_sdk::PublicKey::parse(service_pubkey)?;
+    let encrypted_content = nip44::encrypt(
+        user_keys.secret_key()?,
+        &service_pubkey_parsed,
+        &request_json,
+        nip44::Version::V2
+    )?;
+
+    Ok(encrypted_content)
+}
+
+// NEW: Helper function to decrypt provisioning request
+pub fn decrypt_provisioning_request(
+    service_keys: &Keys,
+    sender_pubkey: &str,
+    encrypted_content: &str,
+) -> Result<EncryptedSpawnPodRequest> {
+    let sender_pubkey = nostr_sdk::PublicKey::parse(sender_pubkey)?;
+    let decrypted = nip44::decrypt(
+        service_keys.secret_key()?,
+        &sender_pubkey,
+        encrypted_content
+    )?;
+    
+    let request: EncryptedSpawnPodRequest = serde_json::from_str(&decrypted)?;
+    Ok(request)
 }
