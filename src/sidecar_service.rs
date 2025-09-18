@@ -10,11 +10,10 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{info, warn, error};
 use std::collections::{HashMap, BTreeMap, HashSet};
-use tokio::time::{sleep, Duration};
 use uuid::Uuid;
 use chrono::{DateTime, Utc};
-use nostr_sdk::{Keys, Client, EventBuilder, Kind, Tag, Url};
-use nostr_sdk::nips::nip44;
+use nostr_sdk::{Keys, Client, Url};
+// Using NIP-17 private direct messages - no manual encryption needed
 use std::sync::Mutex;
 
 use crate::{cashu, initialize_cashu};
@@ -24,9 +23,9 @@ use crate::{cashu, initialize_cashu};
 pub struct SidecarConfig {
     pub cashu_db_path: String,
     pub pod_namespace: String,
-    pub payment_rate_sats_per_hour: u64, // Legacy field - now using 1 sat = 1 minute
-    pub default_pod_duration_minutes: u64, // Default duration if not specified
-    pub ssh_base_image: String, // Base image with SSH server
+    pub payment_rate_msats_per_sec: u64, // Payment rate in msats per second
+    pub minimum_pod_duration_seconds: u64, // Minimum pod duration in seconds
+    pub base_image: String, // Base image for pods
     pub ssh_host: String, // SSH host for connections
     pub ssh_port_range_start: u16, // Start of port range for pod allocation
     pub ssh_port_range_end: u16, // End of port range for pod allocation
@@ -39,9 +38,9 @@ impl Default for SidecarConfig {
         Self {
             cashu_db_path: "./cashu.db".to_string(),
             pod_namespace: "user-workloads".to_string(),
-            payment_rate_sats_per_hour: 100, // 100 sats per hour
-            default_pod_duration_minutes: 60, // 1 hour default
-            ssh_base_image: "linuxserver/openssh-server:latest".to_string(),
+            payment_rate_msats_per_sec: 100, // 100 msats per second
+            minimum_pod_duration_seconds: 60, // 1 minute minimum
+            base_image: "linuxserver/openssh-server:latest".to_string(),
             ssh_host: "localhost".to_string(),
             ssh_port_range_start: 30000,
             ssh_port_range_end: 31000,
@@ -127,8 +126,8 @@ pub struct PodInfo {
     pub allocated_port: u16, // Port allocated from the port pool (this is the SSH port)
     pub ssh_username: String,
     pub ssh_password: String,
-    pub payment_amount_sats: u64,
-    pub duration_minutes: u64,
+    pub payment_amount_msats: u64,
+    pub duration_seconds: u64,
     pub node_port: Option<u16>,
     pub nostr_public_key: String,  // Pod's npub
     pub nostr_private_key: String, // Pod's nsec
@@ -138,8 +137,9 @@ pub struct PodInfo {
 #[derive(Debug, Deserialize)]
 pub struct SpawnPodRequest {
     pub cashu_token: String,
-    pub pod_image: Option<String>, // Optional custom image
+    pub pod_image: Option<String>, // Optional: Uses base image if not specified
     pub ssh_username: Option<String>, // Optional custom username
+    pub ssh_password: Option<String>, // Optional custom password
 }
 
 // Request to top up/extend a pod
@@ -163,7 +163,7 @@ pub struct TopUpPodResponse {
     pub success: bool,
     pub message: String,
     pub pod_info: Option<PodInfo>,
-    pub extended_duration_minutes: Option<u64>,
+    pub extended_duration_seconds: Option<u64>,
 }
 
 // Auth query for ingress
@@ -192,19 +192,19 @@ impl PodManager {
         ssh_port: u16,
         username: &str,
         password: &str,
-        duration_minutes: u64,
+        duration_seconds: u64,
+        memory_mb: u64,
+        cpu_millicores: u64,
         user_pubkey: &str, // User's public key for sending access events
     ) -> Result<(u16, String, String), String> { // Return (node_port, pod_npub, pod_nsec)
         use k8s_openapi::api::core::v1::{
-            Container, Pod, PodSpec, EnvVar, ContainerPort, Service, ServiceSpec, ServicePort,
-            Volume,
+            Container, Pod, PodSpec, EnvVar, ContainerPort, Service, Volume,
         };
-        use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
         use kube::api::PostParams;
         use kube::Api;
 
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
-        let services: Api<Service> = Api::namespaced(self.client.clone(), namespace);
+        let _services: Api<Service> = Api::namespaced(self.client.clone(), namespace);
         let _configmaps: Api<k8s_openapi::api::core::v1::ConfigMap> = Api::namespaced(self.client.clone(), namespace);
 
         // Generate Nostr keys for this pod
@@ -282,8 +282,8 @@ impl PodManager {
         let mut annotations = BTreeMap::new();
         annotations.insert("paygress.io/created-at".to_string(), Utc::now().to_rfc3339());
         annotations.insert("paygress.io/expires-at".to_string(), 
-            (Utc::now() + chrono::Duration::minutes(duration_minutes as i64)).to_rfc3339());
-        annotations.insert("paygress.io/duration-minutes".to_string(), duration_minutes.to_string());
+            (Utc::now() + chrono::Duration::seconds(duration_seconds as i64)).to_rfc3339());
+        annotations.insert("paygress.io/duration-seconds".to_string(), duration_seconds.to_string());
         annotations.insert("paygress.io/ssh-username".to_string(), username.to_string());
         // Note: No TTL annotations needed - activeDeadlineSeconds handles pod termination
 
@@ -303,6 +303,21 @@ impl PodManager {
             }]),
             env: Some(env_vars),
             image_pull_policy: Some("IfNotPresent".to_string()),
+            resources: Some(k8s_openapi::api::core::v1::ResourceRequirements {
+                limits: Some({
+                    let mut limits = std::collections::BTreeMap::new();
+                    limits.insert("memory".to_string(), k8s_openapi::apimachinery::pkg::api::resource::Quantity(format!("{}Mi", memory_mb)));
+                    limits.insert("cpu".to_string(), k8s_openapi::apimachinery::pkg::api::resource::Quantity(format!("{}m", cpu_millicores)));
+                    limits
+                }),
+                requests: Some({
+                    let mut requests = std::collections::BTreeMap::new();
+                    requests.insert("memory".to_string(), k8s_openapi::apimachinery::pkg::api::resource::Quantity(format!("{}Mi", memory_mb)));
+                    requests.insert("cpu".to_string(), k8s_openapi::apimachinery::pkg::api::resource::Quantity(format!("{}m", cpu_millicores)));
+                    requests
+                }),
+                claims: None,
+            }),
             ..Default::default()
         }];
 
@@ -319,7 +334,7 @@ impl PodManager {
                 containers,
                 volumes: None,
                 restart_policy: Some("Never".to_string()),
-                active_deadline_seconds: Some((duration_minutes * 60) as i64), // Kubernetes will auto-terminate after this time
+                active_deadline_seconds: Some(duration_seconds as i64), // Kubernetes will auto-terminate after this time
                 host_network: Some(true), // Use host networking for direct port access
                 ..Default::default()
             }),
@@ -337,7 +352,7 @@ impl PodManager {
         info!(
             pod_name = %pod_name, 
             namespace = %namespace, 
-            duration_minutes = %duration_minutes,
+            duration_seconds = %duration_seconds,
             ssh_port = %ssh_port,
             username = %username,
             "Created SSH pod with service"
@@ -353,7 +368,7 @@ impl PodManager {
             username,
             password,
             node_port,
-            duration_minutes,
+            duration_seconds,
         ).await;
 
         Ok((node_port, pod_npub, pod_nsec))
@@ -369,16 +384,14 @@ impl PodManager {
         username: &str,
         password: &str,
         node_port: u16,
-        duration_minutes: u64,
+        duration_seconds: u64,
     ) -> Result<(), String> {
         // Create access details
         let access_details = serde_json::json!({
-            "kind": "access_details",
-            "pod_name": pod_name,
             "ssh_username": username,
             "ssh_password": password,
             "node_port": node_port,
-            "expires_at": (Utc::now() + chrono::Duration::minutes(duration_minutes as i64)).to_rfc3339(),
+            "expires_at": (Utc::now() + chrono::Duration::seconds(duration_seconds as i64)).to_rfc3339(),
             "instructions": vec![
                 "🚀 SSH access available:".to_string(),
                 "".to_string(),
@@ -392,23 +405,7 @@ impl PodManager {
             ]
         });
 
-        // Encrypt the access details
-        let pod_keys = Keys::parse(pod_nsec).map_err(|e| format!("Invalid pod nsec: {}", e))?;
-        let user_pubkey_parsed = nostr_sdk::PublicKey::parse(user_pubkey).map_err(|e| format!("Invalid user pubkey: {}", e))?;
-        let encrypted_content = match nip44::encrypt(
-            pod_keys.secret_key().map_err(|e| format!("Invalid pod secret key: {}", e))?,
-            &user_pubkey_parsed,
-            &access_details.to_string(),
-            nip44::Version::V2
-        ) {
-            Ok(content) => content,
-            Err(e) => {
-                error!("Failed to encrypt access details: {}", e);
-                return Err(format!("Encryption failed: {}", e));
-            }
-        };
-
-        // Send the encrypted event
+        // Send access details via private message
         let pod_keys = Keys::parse(pod_nsec).map_err(|e| format!("Invalid pod nsec: {}", e))?;
         let client = Client::new(&pod_keys);
 
@@ -427,26 +424,15 @@ impl PodManager {
 
         client.connect().await;
 
-        // Create and send the event
-        let tags = vec![
-            Tag::hashtag("paygress"),
-            Tag::hashtag("access"),
-            Tag::hashtag("encrypted"),
-        ];
-
-        let builder = EventBuilder::new(Kind::Custom(1001), encrypted_content, tags);
-        match builder.to_event(&pod_keys) {
-            Ok(event) => {
-                let event_id = event.id;
-                if let Err(e) = client.send_event(event).await {
-                    error!("Failed to send access event: {}", e);
-                    return Err(format!("Failed to send event: {}", e));
-                }
-                info!("Pod {} sent encrypted access event with ID: {}", pod_name, event_id);
+        // Send as NIP-17 private direct message (kind 14)
+        let user_pubkey_parsed = nostr_sdk::PublicKey::parse(user_pubkey).map_err(|e| format!("Invalid user pubkey: {}", e))?;
+        match client.send_private_msg(user_pubkey_parsed, access_details.to_string(), None).await {
+            Ok(event_id) => {
+                info!("Pod {} sent access details via private message with ID: {:?}", pod_name, event_id);
             }
             Err(e) => {
-                error!("Failed to create access event: {}", e);
-                return Err(format!("Failed to create event: {}", e));
+                error!("Failed to send private message: {}", e);
+                return Err(format!("Failed to send private message: {}", e));
             }
         }
 
@@ -475,7 +461,7 @@ impl PodManager {
         Ok(())
     }
 
-    pub async fn extend_pod_deadline(&self, namespace: &str, pod_name: &str, additional_duration_minutes: u64) -> Result<(), String> {
+    pub async fn extend_pod_deadline(&self, namespace: &str, pod_name: &str, additional_duration_seconds: u64) -> Result<(), String> {
         use kube::api::{Patch, PatchParams};
         use kube::Api;
         use k8s_openapi::api::core::v1::Pod;
@@ -493,8 +479,8 @@ impl PodManager {
             .and_then(|spec| spec.active_deadline_seconds)
             .unwrap_or(0);
         
-        let new_deadline_seconds = current_deadline_seconds + (additional_duration_minutes * 60) as i64;
-        let new_expires_at = Utc::now() + chrono::Duration::minutes(additional_duration_minutes as i64);
+        let new_deadline_seconds = current_deadline_seconds + additional_duration_seconds as i64;
+        let new_expires_at = Utc::now() + chrono::Duration::seconds(additional_duration_seconds as i64);
 
         // Create patch to update activeDeadlineSeconds and annotations
         let patch = json!({
@@ -516,7 +502,7 @@ impl PodManager {
         info!(
             pod_name = %pod_name, 
             namespace = %namespace,
-            additional_minutes = %additional_duration_minutes,
+            additional_seconds = %additional_duration_seconds,
             new_deadline_seconds = %new_deadline_seconds,
             "Extended pod activeDeadlineSeconds"
         );
@@ -551,14 +537,17 @@ impl SidecarState {
     }
 
     // Calculate duration based on payment amount (configurable pricing)
-    pub fn calculate_duration_from_payment(&self, payment_sats: u64) -> u64 {
-        let sats_per_hour = self.config.payment_rate_sats_per_hour.max(1);
+    pub fn calculate_duration_from_payment(&self, payment_msats: u64) -> u64 {
+        let msats_per_sec = self.config.payment_rate_msats_per_sec.max(1);
         
-        // Fixed point calculation: (payment_sats * 60) / sats_per_hour
-        // This preserves precision by multiplying by 60 first
-        let duration_minutes = (payment_sats * 60) / sats_per_hour;
-        
-        duration_minutes
+        // Calculate duration in seconds: payment_msats / msats_per_sec
+        payment_msats / msats_per_sec
+    }
+
+    // Check if payment is sufficient for minimum duration
+    pub fn is_payment_sufficient(&self, payment_msats: u64) -> bool {
+        let calculated_duration = self.calculate_duration_from_payment(payment_msats);
+        calculated_duration >= self.config.minimum_pod_duration_seconds
     }
 
     // Generate secure random password
@@ -668,16 +657,16 @@ pub async fn extract_token_value(token: &str) -> Result<u64, String> {
         .map_err(|e| format!("Failed to get token value: {}", e))?;
 
     // Check if the token unit is in millisatoshis or satoshis
-    let total_amount_sats: u64 = match token_decoded.unit() {
+    let total_amount_msats: u64 = match token_decoded.unit() {
         Some(unit) => match unit {
-            cdk::nuts::CurrencyUnit::Sat => u64::from(total_amount),
-            cdk::nuts::CurrencyUnit::Msat => u64::from(total_amount) / 1000, // Convert msat to sat
+            cdk::nuts::CurrencyUnit::Sat => u64::from(total_amount) * 1000, // Convert sat to msat
+            cdk::nuts::CurrencyUnit::Msat => u64::from(total_amount), // Already in msat
             _ => return Err(format!("Unsupported token unit: {:?}", unit)),
         },
         None => return Err("Token has no unit specified".to_string()),
     };
     
-    Ok(total_amount_sats)
+    Ok(total_amount_msats)
 }
 
 // Create router for the sidecar service
@@ -726,26 +715,30 @@ async fn auth_check(
     };
 
     // Extract payment amount from token
-    let payment_amount_sats = match extract_token_value(&token).await {
-        Ok(sats) => sats,
+    let payment_amount_msats = match extract_token_value(&token).await {
+        Ok(msats) => msats,
         Err(e) => {
             warn!("Failed to decode token: {}", e);
             return StatusCode::BAD_REQUEST.into_response();
         }
     };
 
-    // Calculate duration based on payment
-    let duration_minutes = state.calculate_duration_from_payment(payment_amount_sats);
-    
-    if duration_minutes == 0 {
-        warn!("❌ Insufficient payment: {} sats", payment_amount_sats);
+    // Check if payment is sufficient for minimum duration
+    if !state.is_payment_sufficient(payment_amount_msats) {
+        warn!("❌ Insufficient payment: {} msats (minimum required: {} msats for {} seconds)", 
+            payment_amount_msats, 
+            state.config.minimum_pod_duration_seconds * state.config.payment_rate_msats_per_sec,
+            state.config.minimum_pod_duration_seconds);
         return StatusCode::PAYMENT_REQUIRED.into_response();
     }
+
+    // Calculate duration based on payment
+    let duration_seconds = state.calculate_duration_from_payment(payment_amount_msats);
 
     // Verify Cashu token validity (not amount, just validity)
     match cashu::verify_cashu_token(&token, 1, &state.config.whitelisted_mints).await {
         Ok(true) => {
-            info!("✅ Payment verified: {} sats → {} minutes", payment_amount_sats, duration_minutes);
+            info!("✅ Payment verified: {} msats → {} seconds", payment_amount_msats, duration_seconds);
             StatusCode::OK.into_response()
         },
         Ok(false) => {
@@ -779,8 +772,8 @@ async fn spawn_pod_handler(
     info!("Pod spawn request received");
 
     // First, decode the token to get the payment amount
-    let payment_amount_sats = match extract_token_value(&request.cashu_token).await {
-        Ok(sats) => sats,
+    let payment_amount_msats = match extract_token_value(&request.cashu_token).await {
+        Ok(msats) => msats,
         Err(e) => {
             return (StatusCode::BAD_REQUEST, Json(SpawnPodResponse {
                 success: false,
@@ -790,18 +783,21 @@ async fn spawn_pod_handler(
         }
     };
 
-    // Calculate duration based on payment amount
-    let duration_minutes = state.calculate_duration_from_payment(payment_amount_sats);
-    
-    if duration_minutes == 0 {
+    // Check if payment is sufficient for minimum duration
+    if !state.is_payment_sufficient(payment_amount_msats) {
+        let minimum_required = state.config.minimum_pod_duration_seconds * state.config.payment_rate_msats_per_sec;
         return (StatusCode::PAYMENT_REQUIRED, Json(SpawnPodResponse {
             success: false,
-            message: "Insufficient payment. Minimum required: 1 sat for 1 minute".to_string(),
+            message: format!("Insufficient payment: {} msats. Minimum required: {} msats for {} seconds", 
+                payment_amount_msats, minimum_required, state.config.minimum_pod_duration_seconds),
             pod_info: None,
         })).into_response();
     }
 
-    info!("💰 Payment: {} sats → ⏱️ Duration: {} minutes", payment_amount_sats, duration_minutes);
+    // Calculate duration based on payment amount
+    let duration_seconds = state.calculate_duration_from_payment(payment_amount_msats);
+
+    info!("💰 Payment: {} msats → ⏱️ Duration: {} seconds", payment_amount_msats, duration_seconds);
 
     // Verify payment (now we just need to verify the token is valid, not check amount)
     match cashu::verify_cashu_token(&request.cashu_token, 1, &state.config.whitelisted_mints).await { // Just verify with 1 msat to check validity
@@ -820,19 +816,28 @@ async fn spawn_pod_handler(
             })).into_response();
         },
         Ok(true) => {
-            info!("✅ Payment verified: {} sats for {} minutes", payment_amount_sats, duration_minutes);
+            info!("✅ Payment verified: {} msats for {} seconds", payment_amount_msats, duration_seconds);
         }
     }
 
     // Generate pod details
     let pod_name = format!("ssh-pod-{}", Uuid::new_v4().to_string()[..8].to_string());
     let username = request.ssh_username.unwrap_or_else(|| format!("user-{}", &pod_name[8..16]));
-    let password = SidecarState::generate_password();
-    let image = request.pod_image.unwrap_or_else(|| state.config.ssh_base_image.clone());
-    let allocated_port = state.generate_ssh_port()?; // Generate unique port for this pod
+    let password = request.ssh_password.unwrap_or_else(|| SidecarState::generate_password());
+    let image = request.pod_image.unwrap_or_else(|| state.config.base_image.clone());
+    let allocated_port = match state.generate_ssh_port() {
+        Ok(port) => port,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(SpawnPodResponse {
+                success: false,
+                message: format!("Failed to allocate port: {}", e),
+                pod_info: None,
+            })).into_response();
+        }
+    };
 
     let now = Utc::now();
-    let expires_at = now + chrono::Duration::minutes(duration_minutes as i64);
+    let expires_at = now + chrono::Duration::seconds(duration_seconds as i64);
 
     // Create the pod
     match state.k8s_client.create_ssh_pod(
@@ -843,7 +848,9 @@ async fn spawn_pod_handler(
         allocated_port,
         &username,
         &password,
-        duration_minutes,
+        duration_seconds,
+        1024, // 1GB memory
+        1000, // 1 CPU core
         "http-mode-user", // Dummy user pubkey for HTTP mode
     ).await {
         Ok((node_port, pod_npub, pod_nsec)) => {
@@ -855,8 +862,8 @@ async fn spawn_pod_handler(
                 allocated_port,
                 ssh_username: username.clone(),
                 ssh_password: password.clone(),
-                payment_amount_sats: payment_amount_sats,
-                duration_minutes,
+                payment_amount_msats: payment_amount_msats,
+                duration_seconds,
                 node_port: Some(node_port),
                 nostr_public_key: pod_npub,
                 nostr_private_key: pod_nsec,
@@ -871,8 +878,8 @@ async fn spawn_pod_handler(
             (StatusCode::CREATED, Json(SpawnPodResponse {
                 success: true,
                 message: format!(
-                    "Pod created successfully. SSH access available for {} minutes. External port: {}",
-                    duration_minutes, node_port
+                    "Pod created successfully. SSH access available for {} seconds. External port: {}",
+                    duration_seconds, node_port
                 ),
                 pod_info: Some(pod_info),
             })).into_response()
@@ -907,7 +914,7 @@ async fn top_up_pod_handler(
                 success: false,
                 message: format!("Pod '{}' not found or already expired", request.pod_name),
                 pod_info: None,
-                extended_duration_minutes: None,
+                extended_duration_seconds: None,
             })).into_response();
         }
     };
@@ -925,36 +932,37 @@ async fn top_up_pod_handler(
             success: false,
             message: format!("Pod '{}' has already expired and cannot be extended", request.pod_name),
             pod_info: None,
-            extended_duration_minutes: None,
+            extended_duration_seconds: None,
         })).into_response();
     }
 
     // Extract payment amount from token
-    let payment_amount_sats = match extract_token_value(&request.cashu_token).await {
-        Ok(sats) => sats,
+    let payment_amount_msats = match extract_token_value(&request.cashu_token).await {
+        Ok(msats) => msats,
         Err(e) => {
             return (StatusCode::BAD_REQUEST, Json(TopUpPodResponse {
                 success: false,
                 message: format!("Failed to decode Cashu token: {}", e),
                 pod_info: None,
-                extended_duration_minutes: None,
+                extended_duration_seconds: None,
             })).into_response();
         }
     };
 
     // Calculate additional duration from payment
-    let additional_duration_minutes = state.calculate_duration_from_payment(payment_amount_sats);
+    let additional_duration_seconds = state.calculate_duration_from_payment(payment_amount_msats);
     
-    if additional_duration_minutes == 0 {
+    if additional_duration_seconds == 0 {
         return (StatusCode::PAYMENT_REQUIRED, Json(TopUpPodResponse {
             success: false,
-            message: "Insufficient payment. Minimum required: 1 sat for 1 minute extension".to_string(),
+            message: format!("Insufficient payment: {} msats. Minimum required: {} msats for 1 second extension", 
+                payment_amount_msats, state.config.payment_rate_msats_per_sec),
             pod_info: None,
-            extended_duration_minutes: None,
+            extended_duration_seconds: None,
         })).into_response();
     }
 
-    info!("💰 Top-up payment: {} sats → ⏱️ Additional duration: {} minutes", payment_amount_sats, additional_duration_minutes);
+    info!("💰 Top-up payment: {} msats → ⏱️ Additional duration: {} seconds", payment_amount_msats, additional_duration_seconds);
 
     // Verify payment token validity
     match cashu::verify_cashu_token(&request.cashu_token, 1, &state.config.whitelisted_mints).await {
@@ -963,7 +971,7 @@ async fn top_up_pod_handler(
                 success: false,
                 message: "Cashu token verification failed - invalid token".to_string(),
                 pod_info: None,
-                extended_duration_minutes: None,
+                extended_duration_seconds: None,
             })).into_response();
         },
         Err(e) => {
@@ -971,52 +979,52 @@ async fn top_up_pod_handler(
                 success: false,
                 message: format!("Payment verification error: {}", e),
                 pod_info: None,
-                extended_duration_minutes: None,
+                extended_duration_seconds: None,
             })).into_response();
         },
         Ok(true) => {
-            info!("✅ Top-up payment verified: {} sats for {} additional minutes", payment_amount_sats, additional_duration_minutes);
+            info!("✅ Top-up payment verified: {} msats for {} additional seconds", payment_amount_msats, additional_duration_seconds);
         }
     }
 
     // Extend the pod's expiration time in memory
     let old_expires_at = pod_info.expires_at;
-    pod_info.expires_at = pod_info.expires_at + chrono::Duration::minutes(additional_duration_minutes as i64);
-    pod_info.payment_amount_sats += payment_amount_sats;
-    pod_info.duration_minutes += additional_duration_minutes;
+    pod_info.expires_at = pod_info.expires_at + chrono::Duration::seconds(additional_duration_seconds as i64);
+    pod_info.payment_amount_msats += payment_amount_msats;
+    pod_info.duration_seconds += additional_duration_seconds;
 
     let updated_pod_info = pod_info.clone();
     drop(pods); // Release the write lock
 
     // Update the pod's activeDeadlineSeconds in Kubernetes
-    if let Err(e) = state.k8s_client.extend_pod_deadline(&state.config.pod_namespace, &request.pod_name, additional_duration_minutes).await {
+    if let Err(e) = state.k8s_client.extend_pod_deadline(&state.config.pod_namespace, &request.pod_name, additional_duration_seconds).await {
         error!("Failed to extend pod deadline in Kubernetes: {}", e);
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(TopUpPodResponse {
             success: false,
             message: format!("Failed to extend pod deadline: {}", e),
             pod_info: None,
-            extended_duration_minutes: None,
+            extended_duration_seconds: None,
         })).into_response();
     }
 
     info!(
-        "🔄 Pod '{}' extended: {} → {} (added {} minutes)",
+        "🔄 Pod '{}' extended: {} → {} (added {} seconds)",
         request.pod_name,
         old_expires_at.format("%H:%M:%S UTC"),
         updated_pod_info.expires_at.format("%H:%M:%S UTC"),
-        additional_duration_minutes
+        additional_duration_seconds
     );
 
     (StatusCode::OK, Json(TopUpPodResponse {
         success: true,
         message: format!(
-            "Pod '{}' successfully extended by {} minutes. New expiration: {}",
+            "Pod '{}' successfully extended by {} seconds. New expiration: {}",
             request.pod_name,
-            additional_duration_minutes,
+            additional_duration_seconds,
             updated_pod_info.expires_at.format("%Y-%m-%d %H:%M:%S UTC")
         ),
         pod_info: Some(updated_pod_info),
-        extended_duration_minutes: Some(additional_duration_minutes),
+        extended_duration_seconds: Some(additional_duration_seconds),
     })).into_response()
 }
 
@@ -1091,8 +1099,8 @@ pub async fn start_sidecar_service(bind_addr: &str, config: SidecarConfig) -> Re
     
     println!("🚀 Starting Paygress Sidecar Service");
     println!("📍 Listening on: {}", bind_addr);
-    println!("💰 Payment rate: {} sats/hour", config.payment_rate_sats_per_hour);
-    println!("⏱️  Default duration: {} minutes", config.default_pod_duration_minutes);
+    println!("💰 Payment rate: {} msats/second", config.payment_rate_msats_per_sec);
+    println!("⏱️  Minimum duration: {} seconds", config.minimum_pod_duration_seconds);
     println!("🔐 SSH port range: {}-{}", config.ssh_port_range_start, config.ssh_port_range_end);
     println!("📋 Endpoints:");
     println!("   GET  /healthz      - Health check");

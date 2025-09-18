@@ -1,7 +1,6 @@
-// Nostr client for receiving pod provisioning events with NIP-44 encryption
+// Nostr client for receiving pod provisioning events with private messaging
 use anyhow::{Context, Result};
 use nostr_sdk::{Client, Keys, Filter, Kind, RelayPoolNotification, Url, EventBuilder, Tag};
-use nostr_sdk::nips::nip44;
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 use std::future::Future;
@@ -28,7 +27,7 @@ pub struct NostrEvent {
 pub struct NostrRelaySubscriber {
     client: Client,
     keys: Keys,
-    config: RelayConfig,
+    // config field removed - not used in current implementation
 }
 
 impl NostrRelaySubscriber {
@@ -55,34 +54,36 @@ impl NostrRelaySubscriber {
 
         // Add relays
         for relay_url in &config.relays {
+            info!("Adding relay: {}", relay_url);
             let url = Url::parse(relay_url)
                 .with_context(|| format!("Invalid relay URL: {}", relay_url))?;
             client.add_relay(url).await?;
         }
 
+        info!("Connecting to {} relays...", config.relays.len());
         client.connect().await;
+        
+        // Wait a moment for connections to establish
+        tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+        
         info!("Connected to {} relays", config.relays.len());
         info!("Service public key (npub): {}", keys.public_key().to_hex());
         // Note: Private key (nsec) is not logged for security
 
-        Ok(Self { client, keys, config })
+        Ok(Self { client, keys })
     }
 
     pub async fn subscribe_to_pod_events<F>(&self, handler: F) -> Result<()>
     where
         F: Fn(NostrEvent) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> + Send + Sync + 'static,
     {
-        // Subscribe to pod provisioning events (kind 1000) and top-up events (kind 1002)
+        // Subscribe to NIP-17 private direct messages (kind 14) for private pod provisioning and top-up requests
         let filter = Filter::new()
-            .kind(Kind::Custom(1000))
-            .limit(0);
-        
-        let topup_filter = Filter::new()
-            .kind(Kind::Custom(1002))
+            .kind(Kind::Custom(14))
             .limit(0);
 
-        let _ = self.client.subscribe(vec![filter, topup_filter], None).await;
-        info!("Subscribed to encrypted pod provisioning events (kind 1000) and top-up events (kind 1002)");
+        let _ = self.client.subscribe(vec![filter], None).await;
+        info!("Subscribed to NIP-17 private direct messages for pod provisioning and top-up requests");
 
         // Handle incoming events
         self.client.handle_notifications(|notification| async {
@@ -91,10 +92,10 @@ impl NostrRelaySubscriber {
                 
                 match handler(nostr_event).await {
                     Ok(()) => {
-                        info!("Successfully processed encrypted event: {}", event.id);
+                        info!("Successfully processed private message: {}", event.id);
                     }
                     Err(e) => {
-                        error!("Failed to process encrypted event {}: {}", event.id, e);
+                        error!("Failed to process private message {}: {}", event.id, e);
                     }
                 }
             }
@@ -106,70 +107,59 @@ impl NostrRelaySubscriber {
 
     pub async fn publish_offer(&self, offer: OfferEventContent) -> Result<String> {
         let content = serde_json::to_string(&offer)?;
+        info!("Publishing offer event with content: {}", content);
+        
         let tags = vec![
             Tag::hashtag("paygress"),
             Tag::hashtag("offer"),
         ];
+        
+        info!("Creating event with kind 999 and {} tags", tags.len());
         let builder = EventBuilder::new(Kind::Custom(999), content, tags);
         let event = builder.to_event(&self.keys)?;
         let event_id = event.id.to_hex();
-        self.client.send_event(event).await?;
-        info!("Published offer event: {}", event_id);
-        Ok(event_id)
+        
+        info!("Event created with ID: {}", event_id);
+        info!("Sending offer event to relays: {}", event_id);
+        
+        match self.client.send_event(event).await {
+            Ok(res) => {
+                info!("✅ Successfully published offer event: {} and {:?}", event_id, res);
+                Ok(event_id)
+            }
+            Err(e) => {
+                error!("❌ Failed to send offer event: {}", e);
+                Err(e.into())
+            }
+        }
     }
 
-    // NEW: Encrypted access details publishing
-    pub async fn publish_encrypted_access_details(
+    // NEW: Send access details via private message
+    pub async fn send_access_details_private_message(
         &self, 
-        request_event_id: &str, 
         request_pubkey: &str,
         details: AccessDetailsContent
     ) -> Result<String> {
         // Serialize the access details
         let details_json = serde_json::to_string(&details)?;
         
-        // Encrypt the content using NIP-04
+        // Send as NIP-17 private direct message (kind 14)
         let request_pubkey_parsed = nostr_sdk::PublicKey::parse(request_pubkey)?;
-        let encrypted_content = nip44::encrypt(
-            self.keys.secret_key()?,
-            &request_pubkey_parsed,
-            &details_json,
-            nip44::Version::V2
-        )?;
-
-        let tags = vec![
-            Tag::event(request_event_id.parse()?),
-            Tag::hashtag("paygress"),
-            Tag::hashtag("response"),
-            Tag::hashtag("encrypted"),
-        ];
+        let event_id = self.client.send_private_msg(request_pubkey_parsed, details_json, None).await?;
         
-        let builder = EventBuilder::new(Kind::Custom(1001), encrypted_content, tags);
-        let event = builder.to_event(&self.keys)?;
-        let event_id = event.id.to_hex();
-        self.client.send_event(event).await?;
-        info!("Published encrypted access details event in reply to {}: {}", request_event_id, event_id);
-        Ok(event_id)
+        info!("Sent access details via private message to {}: {:?}", request_pubkey, event_id);
+        Ok(event_id.to_hex())
     }
 
-    // NEW: Decrypt incoming encrypted events
-    pub fn decrypt_event_content(&self, event: &NostrEvent) -> Result<String> {
-        // Decrypt the content using NIP-44
-        let sender_pubkey = nostr_sdk::PublicKey::parse(&event.pubkey)?;
-        let decrypted = nip44::decrypt(
-            self.keys.secret_key()?,
-            &sender_pubkey,
-            &event.content
-        )?;
-        Ok(decrypted)
+    // NEW: Get content from private messages (already decrypted by client)
+    pub fn get_private_message_content(&self, event: &NostrEvent) -> Result<String> {
+        // For direct messages, the content is already decrypted by the client
+        Ok(event.content.clone())
     }
 
-    // NEW: Check if event is encrypted
-    pub fn is_encrypted_event(&self, event: &NostrEvent) -> bool {
-        // Check if the event has encryption tags or if content looks encrypted
-        event.tags.iter().any(|tag| {
-            tag.len() >= 2 && tag[0] == "encrypted"
-        }) || event.content.starts_with("nip44:")
+    // NEW: Check if event is a NIP-17 private direct message
+    pub fn is_private_message(&self, event: &NostrEvent) -> bool {
+        event.kind == 14 // Kind 14 is NIP-17 Private Direct Message
     }
 
     // NEW: Get service public key for users
@@ -209,11 +199,11 @@ pub fn custom_relay_config(relays: Vec<String>, private_key: Option<String>) -> 
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OfferEventContent {
-    pub kind: String, // "offer"
-    pub rate_sats_per_hour: u64,
-    pub default_duration_minutes: u64,
-    pub pod_namespace: String,
-    pub image: String,
+    pub rate_msats_per_sec: u64,
+    pub minimum_duration_seconds: u64,
+    pub memory_mb: u64, // Memory in MB
+    pub cpu_millicores: u64, // CPU in millicores (1000 millicores = 1 CPU core)
+    pub whitelisted_mints: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -232,8 +222,9 @@ pub struct AccessDetailsContent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EncryptedSpawnPodRequest {
     pub cashu_token: String,
+    pub pod_image: Option<String>, // Optional: Uses base image if not specified
     pub ssh_username: Option<String>,
-    pub pod_image: Option<String>,
+    pub ssh_password: Option<String>,
 }
 
 // NEW: Encrypted top-up request structure
@@ -243,39 +234,23 @@ pub struct EncryptedTopUpPodRequest {
     pub cashu_token: String,
 }
 
-// NEW: Helper function to create encrypted provisioning request
-pub fn create_encrypted_provisioning_request(
+// NEW: Helper function to send private message provisioning request
+pub async fn send_provisioning_request_private_message(
+    client: &Client,
     service_pubkey: &str,
-    user_keys: &Keys,
     request: EncryptedSpawnPodRequest,
 ) -> Result<String> {
     let request_json = serde_json::to_string(&request)?;
     
-    // Encrypt the request content
+    // Send as private message
     let service_pubkey_parsed = nostr_sdk::PublicKey::parse(service_pubkey)?;
-    let encrypted_content = nip44::encrypt(
-        user_keys.secret_key()?,
-        &service_pubkey_parsed,
-        &request_json,
-        nip44::Version::V2
-    )?;
+    let event_id = client.send_private_msg(service_pubkey_parsed, request_json, None).await?;
 
-    Ok(encrypted_content)
+    Ok(event_id.to_hex())
 }
 
-// NEW: Helper function to decrypt provisioning request
-pub fn decrypt_provisioning_request(
-    service_keys: &Keys,
-    sender_pubkey: &str,
-    encrypted_content: &str,
-) -> Result<EncryptedSpawnPodRequest> {
-    let sender_pubkey = nostr_sdk::PublicKey::parse(sender_pubkey)?;
-    let decrypted = nip44::decrypt(
-        service_keys.secret_key()?,
-        &sender_pubkey,
-        encrypted_content
-    )?;
-    
-    let request: EncryptedSpawnPodRequest = serde_json::from_str(&decrypted)?;
+// NEW: Helper function to parse private message content
+pub fn parse_private_message_content(content: &str) -> Result<EncryptedSpawnPodRequest> {
+    let request: EncryptedSpawnPodRequest = serde_json::from_str(content)?;
     Ok(request)
 }

@@ -1,18 +1,19 @@
-# Paygress - Nostr-Based Pod Provisioning
+# Paygress - NIP-17 Private Direct Message Pod Provisioning
 
-🔧 **Nostr Events → Kubernetes Pod Provisioning with Cashu Payments**
+🔧 **NIP-17 Private Direct Messages → Kubernetes Pod Provisioning with Cashu Payments**
 
 ## Architecture
 
-**Encrypted Nostr-Driven Pod Provisioning:**
-- Service listens for **encrypted** Nostr events (kind 1000) with Cashu tokens
-- All sensitive data encrypted using NIP-04 (Cashu tokens, SSH credentials)
+**NIP-17 Private Direct Message-Driven Pod Provisioning:**
+- Service listens for **private direct messages** (kind 14) with Cashu tokens
+- All sensitive data sent via NIP-17 private direct messages (Cashu tokens, SSH credentials)
+- **Automatic encryption/decryption** - NIP-17 handles all encryption internally
 - Automatically provisions SSH pods in Kubernetes with `activeDeadlineSeconds`
-- Replies with **encrypted** access details via Nostr events (kind 1001)
-- **Top-up Support**: Extend pod duration via Nostr (kind 1002) or HTTP
+- Replies with access details via **NIP-17 private direct messages** (kind 14)
+- **Top-up Support**: Extend pod duration via private direct messages or HTTP
 - **Kubernetes Native**: Uses `activeDeadlineSeconds` for automatic pod termination
 - Fully decentralized - no HTTP endpoints needed
-- **End-to-end encryption** - only you and the service can decrypt data
+- **Enhanced privacy** - NIP-17 protects both message content and metadata with multi-layered encryption
 
 ## 🚀 Complete Setup Guide
 
@@ -102,8 +103,8 @@ cd paygress
 # Build Docker image from Dockerfile
 docker build -t paygress:latest .
 
-# Import image into K3s (K3s uses containerd, not Docker)
-sudo k3s ctr images import <(docker save paygress:latest)
+# Import image into Minikube
+minikube image load paygress:latest
 
 # Deploy to Kubernetes (creates namespace and all resources)
 kubectl apply -f k8s/sidecar-service.yaml
@@ -131,41 +132,40 @@ Paygress uses a configurable port range with **direct port exposure**:
 - ✅ **Better performance** - No service layer overhead
 - ✅ **Easier debugging** - Direct port access
 
-### **K3s-Specific Notes**
+### **Minikube-Specific Notes**
 
-K3s uses containerd instead of Docker, so image handling is slightly different:
+Minikube image handling:
 
 ```bash
-# Alternative: Build directly with K3s (if you have K3s with Docker support)
-# This requires K3s to be configured with Docker runtime
-docker build -t paygress:latest .
-sudo k3s ctr images import <(docker save paygress:latest)
 
-# Or use K3s with Docker runtime (if configured)
-# docker build -t paygress:latest .
-# sudo k3s ctr images import <(docker save paygress:latest)
+IMAGE_TAG=$(date +%s)   # or use: $(git rev-parse --short HEAD)
+docker build -t paygress:$IMAGE_TAG .
 
-# Check if image is available in K3s
-sudo k3s ctr images list | grep paygress
+# 2. Load into Minikube
+minikube image load paygress:$IMAGE_TAG
 
-# If you need to remove an old image
-sudo k3s ctr images rm docker.io/library/paygress:latest
-```
+# 3. Verify it's available
+minikube image ls | grep paygress
 
-# Create ConfigMap from your .env file (after deployment)
+# 4. Update deployment to use the new image
+kubectl set image deployment/paygress-sidecar \
+    paygress-sidecar=paygress:$IMAGE_TAG \
+    -n ingress-system
+
+# 5. Update ConfigMap from .env file
 kubectl create configmap paygress-sidecar-config \
     --from-env-file=paygress.env \
     --namespace=ingress-system \
     --dry-run=client -o yaml | kubectl apply -f -
 
-# Restart deployment to pick up new configuration
+# 6. Restart deployment to pick up new configuration
 kubectl rollout restart deployment/paygress-sidecar -n ingress-system
 
-# Wait for deployment to be ready
+# 7. Wait for rollout to finish
 kubectl wait --for=condition=available --timeout=300s \
     deployment/paygress-sidecar -n ingress-system
 
-# Get the service's public key (you'll need this for encryption)
+# 8. Check logs (to get public key or debug)
 kubectl logs -n ingress-system -l app=paygress-sidecar
 ```
 
@@ -318,58 +318,46 @@ echo "Private key: $NSEC"
 echo "Public key: $NPUB"
 ```
 
-### Create Encrypted Request
+### Create NIP-17 Private Direct Message Request
 ```bash
 # Create your request JSON
-REQUEST_JSON='{"cashu_token":"<YOUR_CASHU_TOKEN>","ssh_username":"alice","pod_image":"linuxserver/openssh-server:latest","duration_minutes":120}'
+REQUEST_JSON='{"cashu_token":"<YOUR_CASHU_TOKEN>","ssh_username":"alice",ssh_password":"my_ssh_password","pod_image":"linuxserver/openssh-server:latest"}'
 
-# Get the service's public key from logs (you'll need this for encryption)
+# Get the service's public key from logs (you'll need this for NIP-17 private direct messages)
 # Check service logs to find the service public key:
 kubectl logs -n ingress-system -l app=paygress-sidecar | grep "Service public key"
 # Look for output like: "Service public key: npub1abc123..."
 
 SERVICE_NPUB="npub1abc123..."  # Replace with actual service public key from logs
 
-# Convert npub to hex format (nak encrypt requires 64-char hex, not npub)
+# Convert npub to hex format (nak requires 64-char hex, not npub)
 SERVICE_PUBKEY_HEX=$(nak pubkey --hex "$SERVICE_NPUB")
 
-# Encrypt the request using nak with NIP-44 (default encryption)
-# Note: The service now uses NIP-44 encryption for better security
-ENCRYPTED_CONTENT=$(nak encrypt --sec "$NSEC" --recipient-pubkey "$SERVICE_PUBKEY_HEX" "$REQUEST_JSON")
-
-# Send the encrypted event
+# Send the request as a NIP-17 private direct message using nak
+# Note: NIP-17 handles encryption automatically - no manual encryption needed
+# Send as NIP-17 private direct message (kind 14)
 nak event \
-  --kind 1000 \
-  --content "$ENCRYPTED_CONTENT" \
+  --kind 14 \
+  --content "$REQUEST_JSON" \
   --sec "$NSEC" \
-  --tag "paygress" \
-  --tag "encrypted" \
-  --tag "provisioning" \
+  --tag "p" "$SERVICE_PUBKEY_HEX" \
   wss://relay.damus.io wss://nos.lol wss://relay.nostr.band
 ```
 
-## 🎯 Step 8: Listen for Encrypted Response
+## 🎯 Step 8: Listen for NIP-17 Private Direct Message Response
 
 ```bash
-# Listen for encrypted response (kind 1001) - use the event ID from above
-REQ_ID="<event_id_from_above>"
-nak req -k 1001 -e $REQ_ID --stream wss://relay.damus.io wss://nos.lol wss://relay.nostr.band
+# Listen for NIP-17 private direct message response (kind 14)
+nak req -k 14 --stream wss://relay.damus.io wss://nos.lol wss://relay.nostr.band
 
-# The response will be encrypted! You'll need to decrypt it using your private key.
-# To decrypt the response:
-ENCRYPTED_RESPONSE="<encrypted_content_from_response>"
-SERVICE_NPUB="npub1abc123..."  # Service public key from logs
-
-# Decrypt using nak (works with bech32 keys)
-DECRYPTED_RESPONSE=$(nak decrypt --sec "$NSEC" --sender-pubkey "$SERVICE_NPUB" "$ENCRYPTED_RESPONSE")
-echo "$DECRYPTED_RESPONSE"
-
-# The decrypted response contains:
+# The response will be a NIP-17 private direct message! NIP-17 handles decryption automatically.
+# Your Nostr client will automatically decrypt and display the content.
+# The response contains your SSH access details in JSON format:
 # - pod_name: ssh-pod-xxxxx
 # - ssh_username: alice
 # - ssh_password: xxxxxxxx
 # - node_port: 3xxxx
-# - All other sensitive data
+# - expires_at: 2024-01-01T12:00:00Z
 # - **Sent directly from the pod itself!**
 ```
 
@@ -417,17 +405,13 @@ TOPUP_JSON='{"pod_name":"ssh-pod-abc12345","cashu_token":"<YOUR_TOPUP_TOKEN>"}'
 # Get the service's public key from logs
 SERVICE_NPUB="npub1abc123..."  # Replace with actual service public key from logs
 
-# Encrypt the top-up request (works with bech32 keys)
-ENCRYPTED_TOPUP=$(nak encrypt --sec "$NSEC" --recipient-pubkey "$SERVICE_NPUB" "$TOPUP_JSON")
-
-# Send encrypted top-up event (kind 1002)
+# Send top-up as NIP-17 private direct message (kind 14)
+# NIP-17 handles encryption automatically - no manual encryption needed
 nak event \
-  --kind 1002 \
-  --content "$ENCRYPTED_TOPUP" \
+  --kind 14 \
+  --content "$TOPUP_JSON" \
   --sec "$NSEC" \
-  --tag "paygress" \
-  --tag "encrypted" \
-  --tag "topup" \
+  --tag "p" "$SERVICE_PUBKEY_HEX" \
   wss://relay.damus.io wss://nos.lol wss://relay.nostr.band
 ```
 
@@ -474,8 +458,6 @@ ENABLE_CLEANUP_TASK=false
 
 **Note**: Kubernetes `activeDeadlineSeconds` ensures pods are terminated exactly when their paid duration expires. No external cleanup processes needed!
 
-<<<<<<< Updated upstream
-=======
 ## 🚀 **Optional: Docker Hub Deployment with GitHub Actions**
 
 > **Note**: This section is optional. The default deployment uses local Docker images built from the Dockerfile.
@@ -551,7 +533,6 @@ If you want to use Docker Hub instead of local images:
      yourusername/paygress-sidecar:latest
    ```
 
->>>>>>> Stashed changes
 ## 🔧 Configuration Examples
 
 ### Common Configuration Changes
@@ -642,14 +623,16 @@ minikube stop
 ## How it works
 
 1. **Service starts** → Connects to Nostr relays, publishes offer event
-2. **User sends encrypted Nostr event** → Kind 1000 with encrypted Cashu token and pod requirements
+2. **User sends NIP-17 private direct message** → Kind 14 with Cashu token and pod requirements (automatic encryption)
 3. **Service processes** → Verifies payment, creates SSH pod in Kubernetes with `activeDeadlineSeconds`
-4. **Pod sends encrypted response** → Kind 1001 event with SSH access details (sent by the pod itself!)
+4. **Pod sends NIP-17 private direct message response** → Kind 14 event with SSH access details (automatic encryption, sent by the pod itself!)
 5. **User accesses pod** → Uses provided SSH credentials via NodePort or port-forward
-6. **Optional: Extend duration** → Send Kind 1002 top-up event or HTTP POST to extend pod lifetime
+6. **Optional: Extend duration** → Send NIP-17 private direct message or HTTP POST to extend pod lifetime
 7. **Automatic termination** → Kubernetes terminates pod when `activeDeadlineSeconds` expires
 
-**Complete encrypted Nostr-based workflow - no HTTP endpoints needed!**
+**Complete NIP-17 private direct message-based workflow - no HTTP endpoints needed!**
+
+> **Note**: This implementation uses [NIP-17: Private Direct Messages](https://github.com/nostr-protocol/nips/blob/master/17.md) for enhanced privacy and security. NIP-17 handles all encryption/decryption automatically - no manual encryption required.
 
 ## 🌐 HTTP Mode (Alternative)
 
@@ -711,30 +694,30 @@ kubectl logs -n ingress-system -l app=paygress-sidecar
 kubectl describe pod -n ingress-system -l app=paygress-sidecar
 ```
 
-### **K3s Image Issues**
+### **Minikube Image Issues**
 ```bash
-# Check if image exists in K3s
-sudo k3s ctr images list | grep paygress
+# Check if image exists in Minikube
+minikube image ls | grep paygress
 
-# If image is missing, re-import it
+# If image is missing, re-load it
 docker build -t paygress:latest .
-sudo k3s ctr images import <(docker save paygress:latest)
+minikube image load paygress:latest
 
-# Check K3s containerd logs
-sudo journalctl -u k3s -f
+# Check Minikube logs
+minikube logs
 
-# Restart K3s if needed
-sudo systemctl restart k3s
+# Restart Minikube if needed
+minikube stop && minikube start
 ```
 
 ### **ImagePullBackOff Error**
 ```bash
-# This usually means the image isn't available in K3s
-# Make sure you've imported the image:
-sudo k3s ctr images import <(docker save paygress:latest)
+# This usually means the image isn't available in Minikube
+# Make sure you've loaded the image:
+minikube image load paygress:latest
 
 # Verify the image is there:
-sudo k3s ctr images list | grep paygress
+minikube image ls | grep paygress
 ```
 
 ### **Port Allocation Issues**
@@ -802,28 +785,23 @@ cashu mint 1000 --url https://mint.cashu.space
 # Get service public key from logs
 SERVICE_NPUB="npub1abc123..."  # Replace with actual service public key
 
-# Create and encrypt request
-REQUEST_JSON='{"cashu_token":"YOUR_TOKEN","ssh_username":"alice","duration_minutes":60}'
-ENCRYPTED_CONTENT=$(nak encrypt --sec "$NSEC" --pub "$SERVICE_NPUB" "$REQUEST_JSON")
-
-# Send encrypted request
+# Create request
+REQUEST_JSON='{"cashu_token":"YOUR_TOKEN","ssh_username":"alice","ssh_password":"my_secure_password"}'
+# Send as NIP-17 private direct message (NIP-17 handles encryption automatically)
 nak event \
-  --kind 1000 \
-  --content "$ENCRYPTED_CONTENT" \
+  --kind 14 \
+  --content "$REQUEST_JSON" \
   --sec "$NSEC" \
-  --tag "paygress" \
-  --tag "encrypted" \
+  --tag "p" "$SERVICE_PUBKEY_HEX" \
   wss://relay.damus.io wss://nos.lol wss://relay.nostr.band
 
-# Listen for encrypted response
-nak req -k 1001 -e $EVENT_ID --stream wss://relay.damus.io wss://nos.lol wss://relay.nostr.band
+# Listen for NIP-17 private direct message response
+nak req -k 14 --stream wss://relay.damus.io wss://nos.lol wss://relay.nostr.band
 
-# Decrypt response
-ENCRYPTED_RESPONSE="<encrypted_content_from_response>"
-DECRYPTED_RESPONSE=$(nak decrypt --sec "$NSEC" --pub "$SERVICE_NPUB" "$ENCRYPTED_RESPONSE")
-echo "$DECRYPTED_RESPONSE"
+# Your client should automatically handle the NIP-17 private direct message
+# NIP-17 handles decryption automatically - the response contains your SSH access details
 
-# Connect via SSH using decrypted credentials
+# Connect via SSH using provided credentials
 ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no alice@$(minikube ip) -p $NODE_PORT
 ```
 
