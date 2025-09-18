@@ -99,14 +99,58 @@ EOF
 git clone <your-repo-url>
 cd paygress
 
-# Build Docker image
+# Build Docker image from Dockerfile
 docker build -t paygress:latest .
 
-# Load image into Minikube
-minikube image load paygress:latest
+# Import image into K3s (K3s uses containerd, not Docker)
+sudo k3s ctr images import <(docker save paygress:latest)
 
 # Deploy to Kubernetes (creates namespace and all resources)
 kubectl apply -f k8s/sidecar-service.yaml
+```
+
+### **Port Range Configuration**
+
+Paygress uses a configurable port range with **direct port exposure**:
+
+- **SSH_PORT_RANGE_START**: Start of the port range (default: 30000)
+- **SSH_PORT_RANGE_END**: End of the port range (default: 31000)
+- **SSH_PORT**: Internal SSH server port (default: 2222)
+
+**Direct Port Access**:
+- Each pod gets a unique port from your range (e.g., 15001)
+- Pod uses **host networking** for direct port exposure
+- SSH server runs on port 22 inside the pod
+- Port is **directly accessible** on your public IP:15001
+- **No port-forwarding needed** - direct access from internet
+
+**Benefits**:
+- ✅ **No file persistence** - Kubernetes handles everything
+- ✅ **No port-forwarding** - Direct internet access
+- ✅ **Simpler architecture** - Uses Kubernetes host networking
+- ✅ **Better performance** - No service layer overhead
+- ✅ **Easier debugging** - Direct port access
+
+### **K3s-Specific Notes**
+
+K3s uses containerd instead of Docker, so image handling is slightly different:
+
+```bash
+# Alternative: Build directly with K3s (if you have K3s with Docker support)
+# This requires K3s to be configured with Docker runtime
+docker build -t paygress:latest .
+sudo k3s ctr images import <(docker save paygress:latest)
+
+# Or use K3s with Docker runtime (if configured)
+# docker build -t paygress:latest .
+# sudo k3s ctr images import <(docker save paygress:latest)
+
+# Check if image is available in K3s
+sudo k3s ctr images list | grep paygress
+
+# If you need to remove an old image
+sudo k3s ctr images rm docker.io/library/paygress:latest
+```
 
 # Create ConfigMap from your .env file (after deployment)
 kubectl create configmap paygress-sidecar-config \
@@ -216,7 +260,7 @@ npub=$(nak key public "$PRIVATE_HEX")
 echo "Public key (hex): $npub"
 
 # Convert to bech32 format
-npub_bech32=$(echo "$npub" | nak encode npub)
+npub_bech32=$(nak encode npub "$npub")
 echo "Public key (bech32): $npub_bech32"
 ```
 
@@ -227,7 +271,7 @@ hex=$(nak key generate)
 echo "hex: $hex"
 
 # Convert hex to bech32 format (nsec1...)
-nsec=$(echo "$hex" | nak encode nsec)
+nsec=$(nak encode nsec "$hex")
 echo "nsec: $nsec"
 
 # Get public key from private key (use hex, not bech32)
@@ -235,7 +279,7 @@ npub=$(nak key public "$hex")
 echo "npub: $npub"
 
 # Convert public key to bech32 format
-npub_bech32=$(echo "$npub" | nak encode npub)
+npub_bech32=$(nak encode npub "$npub")
 echo "npub (bech32): $npub_bech32"
 
 # Store your keys in bech32 format (user-friendly)
@@ -263,8 +307,8 @@ npub=$(nak key public "$EXISTING_PRIVATE_HEX")
 echo "Public key (hex): $npub"
 
 # Convert to bech32 format for user-friendly storage
-nsec=$(echo "$EXISTING_PRIVATE_HEX" | nak encode nsec)
-npub_bech32=$(echo "$npub" | nak encode npub)
+nsec=$(nak encode nsec "$EXISTING_PRIVATE_HEX")
+npub_bech32=$(nak encode npub "$npub")
 
 export NSEC="$nsec"
 export NPUB="$npub_bech32"
@@ -287,7 +331,7 @@ kubectl logs -n ingress-system -l app=paygress-sidecar | grep "Service public ke
 SERVICE_NPUB="npub1abc123..."  # Replace with actual service public key from logs
 
 # Convert npub to hex format (nak encrypt requires 64-char hex, not npub)
-SERVICE_PUBKEY_HEX=$(echo "$SERVICE_NPUB" | nak pubkey --hex)
+SERVICE_PUBKEY_HEX=$(nak pubkey --hex "$SERVICE_NPUB")
 
 # Encrypt the request using nak with NIP-44 (default encryption)
 # Note: The service now uses NIP-44 encryption for better security
@@ -374,7 +418,7 @@ TOPUP_JSON='{"pod_name":"ssh-pod-abc12345","cashu_token":"<YOUR_TOPUP_TOKEN>"}'
 SERVICE_NPUB="npub1abc123..."  # Replace with actual service public key from logs
 
 # Encrypt the top-up request (works with bech32 keys)
-ENCRYPTED_TOPUP=$(echo "$TOPUP_JSON" | nak encrypt --sec "$NSEC" --pub "$SERVICE_NPUB")
+ENCRYPTED_TOPUP=$(nak encrypt --sec "$NSEC" --recipient-pubkey "$SERVICE_NPUB" "$TOPUP_JSON")
 
 # Send encrypted top-up event (kind 1002)
 nak event \
@@ -430,6 +474,84 @@ ENABLE_CLEANUP_TASK=false
 
 **Note**: Kubernetes `activeDeadlineSeconds` ensures pods are terminated exactly when their paid duration expires. No external cleanup processes needed!
 
+<<<<<<< Updated upstream
+=======
+## 🚀 **Optional: Docker Hub Deployment with GitHub Actions**
+
+> **Note**: This section is optional. The default deployment uses local Docker images built from the Dockerfile.
+
+This repository includes GitHub Actions workflows to automatically build and push Docker images to Docker Hub if you prefer to use a container registry.
+
+### **Setup GitHub Secrets**
+
+1. Go to your GitHub repository settings
+2. Navigate to **Secrets and variables** → **Actions**
+3. Add the following secrets:
+
+```bash
+DOCKERHUB_USERNAME=your_dockerhub_username
+DOCKERHUB_TOKEN=your_dockerhub_access_token
+```
+
+### **Docker Hub Access Token**
+
+1. Go to [Docker Hub](https://hub.docker.com/)
+2. Navigate to **Account Settings** → **Security**
+3. Click **New Access Token**
+4. Give it a name (e.g., "github-actions")
+5. Set permissions to **Read, Write, Delete**
+6. Copy the token and add it as `DOCKERHUB_TOKEN` secret
+
+### **Automatic Builds**
+
+The workflow will automatically:
+- **Build** on every push to `main`/`master` branch
+- **Build** on every pull request to `main`/`master` branch  
+- **Build and push** on version tags (e.g., `v1.0.0`)
+- **Build** for both `linux/amd64` and `linux/arm64` platforms
+
+### **Image Tags**
+
+Images will be tagged as:
+- `latest` - Latest commit on default branch
+- `main`/`master` - Branch name
+- `v1.0.0` - Version tags
+- `v1.0` - Major.minor version
+- `v1` - Major version
+
+### **Using Docker Hub Images (Optional)**
+
+If you want to use Docker Hub instead of local images:
+
+1. **Update the Kubernetes YAML:**
+   ```yaml
+   # In k8s/sidecar-service.yaml, change:
+   image: paygress:latest
+   imagePullPolicy: Never
+   
+   # To:
+   image: yourusername/paygress-sidecar:latest
+   imagePullPolicy: IfNotPresent
+   ```
+
+2. **Pull and use the images:**
+   ```bash
+   # Pull the latest image
+   docker pull yourusername/paygress-sidecar:latest
+   
+   # Pull a specific version
+   docker pull yourusername/paygress-sidecar:v1.0.0
+   
+   # Run the container directly
+   docker run -d \
+     --name paygress-sidecar \
+     -p 8080:8080 \
+     -e NOSTR_PRIVATE_KEY=your_nsec_key \
+     -e NOSTR_RELAYS=wss://relay.damus.io,wss://nos.lol \
+     yourusername/paygress-sidecar:latest
+   ```
+
+>>>>>>> Stashed changes
 ## 🔧 Configuration Examples
 
 ### Common Configuration Changes
@@ -589,6 +711,46 @@ kubectl logs -n ingress-system -l app=paygress-sidecar
 kubectl describe pod -n ingress-system -l app=paygress-sidecar
 ```
 
+### **K3s Image Issues**
+```bash
+# Check if image exists in K3s
+sudo k3s ctr images list | grep paygress
+
+# If image is missing, re-import it
+docker build -t paygress:latest .
+sudo k3s ctr images import <(docker save paygress:latest)
+
+# Check K3s containerd logs
+sudo journalctl -u k3s -f
+
+# Restart K3s if needed
+sudo systemctl restart k3s
+```
+
+### **ImagePullBackOff Error**
+```bash
+# This usually means the image isn't available in K3s
+# Make sure you've imported the image:
+sudo k3s ctr images import <(docker save paygress:latest)
+
+# Verify the image is there:
+sudo k3s ctr images list | grep paygress
+```
+
+### **Port Allocation Issues**
+```bash
+# Check if all ports in range are allocated
+# Look for "No available ports in the configured range" in logs
+kubectl logs -n ingress-system -l app=paygress-sidecar | grep "No available ports"
+
+# Check current port usage
+kubectl logs -n ingress-system -l app=paygress-sidecar | grep "Allocated port"
+
+# If you run out of ports, increase the range in your environment:
+# SSH_PORT_RANGE_START=30000
+# SSH_PORT_RANGE_END=32000  # Increased from 31000
+```
+
 ### **SSH Connection Fails**
 ```bash
 # Check if pod is running
@@ -619,7 +781,7 @@ hex=$(nak key generate)
 echo "hex: $hex"
 
 # Convert hex to bech32 format
-nsec=$(echo "$hex" | nak encode nsec)
+nsec=$(nak encode nsec "$hex")
 echo "nsec: $nsec"
 
 # Get public key (use hex, not bech32)
@@ -627,7 +789,7 @@ npub=$(nak key public "$hex")
 echo "npub: $npub"
 
 # Convert public key to bech32 format
-npub_bech32=$(echo "$npub" | nak encode npub)
+npub_bech32=$(nak encode npub "$npub")
 echo "npub (bech32): $npub_bech32"
 
 # Store your keys
@@ -642,7 +804,7 @@ SERVICE_NPUB="npub1abc123..."  # Replace with actual service public key
 
 # Create and encrypt request
 REQUEST_JSON='{"cashu_token":"YOUR_TOKEN","ssh_username":"alice","duration_minutes":60}'
-ENCRYPTED_CONTENT=$(echo "$REQUEST_JSON" | nak encrypt --sec "$NSEC" --pub "$SERVICE_NPUB")
+ENCRYPTED_CONTENT=$(nak encrypt --sec "$NSEC" --pub "$SERVICE_NPUB" "$REQUEST_JSON")
 
 # Send encrypted request
 nak event \
@@ -658,7 +820,7 @@ nak req -k 1001 -e $EVENT_ID --stream wss://relay.damus.io wss://nos.lol wss://r
 
 # Decrypt response
 ENCRYPTED_RESPONSE="<encrypted_content_from_response>"
-DECRYPTED_RESPONSE=$(echo "$ENCRYPTED_RESPONSE" | nak decrypt --sec "$NSEC" --pub "$SERVICE_NPUB")
+DECRYPTED_RESPONSE=$(nak decrypt --sec "$NSEC" --pub "$SERVICE_NPUB" "$ENCRYPTED_RESPONSE")
 echo "$DECRYPTED_RESPONSE"
 
 # Connect via SSH using decrypted credentials
@@ -705,7 +867,7 @@ hex=$(nak key generate)
 echo "hex: $hex"
 
 # Convert hex to bech32 format (nsec1...)
-nsec=$(echo "$hex" | nak encode nsec)
+nsec=$(nak encode nsec "$hex")
 echo "nsec: $nsec"
 
 # Get public key from private key (use hex, not bech32)
@@ -713,7 +875,7 @@ npub=$(nak key public "$hex")
 echo "npub: $npub"
 
 # Convert public key to bech32 format
-npub_bech32=$(echo "$npub" | nak encode npub)
+npub_bech32=$(nak encode npub "$npub")
 echo "npub (bech32): $npub_bech32"
 
 # Set the private key in your deployment (use bech32 format)

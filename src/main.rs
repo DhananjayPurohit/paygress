@@ -35,12 +35,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or(60),
         ssh_base_image: env::var("SSH_BASE_IMAGE")
             .unwrap_or_else(|_| "linuxserver/openssh-server:latest".to_string()),
-        ssh_port: env::var("SSH_PORT")
-            .unwrap_or_else(|_| "2222".to_string())
-            .parse()
-            .unwrap_or(2222),
         ssh_host: env::var("SSH_HOST")
             .unwrap_or_else(|_| "localhost".to_string()),
+        ssh_port_range_start: env::var("SSH_PORT_RANGE_START")
+            .unwrap_or_else(|_| "30000".to_string())
+            .parse()
+            .unwrap_or(30000),
+        ssh_port_range_end: env::var("SSH_PORT_RANGE_END")
+            .unwrap_or_else(|_| "31000".to_string())
+            .parse()
+            .unwrap_or(31000),
         enable_cleanup_task: env::var("ENABLE_CLEANUP_TASK")
             .unwrap_or_else(|_| "true".to_string())
             .parse()
@@ -84,7 +88,6 @@ async fn run_encrypted_nostr_mode(config: SidecarConfig) -> Result<(), Box<dyn s
         kind: "offer".into(),
         rate_sats_per_hour: config.payment_rate_sats_per_hour,
         default_duration_minutes: config.default_pod_duration_minutes,
-        ssh_port: config.ssh_port,
         pod_namespace: config.pod_namespace.clone(),
         image: config.ssh_base_image.clone(),
     };
@@ -164,12 +167,8 @@ async fn handle_spawn_pod_request(
             return Ok(());
         }
     };
-    // Use custom duration if provided, otherwise calculate from payment
-    let duration_minutes = if let Some(custom_duration) = request.duration_minutes {
-        custom_duration
-    } else {
-        state_clone.calculate_duration_from_payment(payment_amount_sats)
-    };
+    // Calculate duration based on payment only
+    let duration_minutes = state_clone.calculate_duration_from_payment(payment_amount_sats);
 
     if duration_minutes == 0 { 
         tracing::warn!("Invalid duration: 0 minutes");
@@ -209,7 +208,7 @@ async fn handle_spawn_pod_request(
                 namespace: state_clone.config.pod_namespace.clone(),
                 created_at: now,
                 expires_at,
-                ssh_port,
+                allocated_port: ssh_port, // The allocated port from port pool (this is the SSH port)
                 ssh_username: username.clone(),
                 ssh_password: password.clone(),
                 payment_amount_sats,

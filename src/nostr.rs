@@ -110,7 +110,7 @@ impl NostrRelaySubscriber {
             Tag::hashtag("paygress"),
             Tag::hashtag("offer"),
         ];
-        let builder = EventBuilder::new(Kind::Custom(20000), content, tags);
+        let builder = EventBuilder::new(Kind::Custom(999), content, tags);
         let event = builder.to_event(&self.keys)?;
         let event_id = event.id.to_hex();
         self.client.send_event(event).await?;
@@ -212,7 +212,6 @@ pub struct OfferEventContent {
     pub kind: String, // "offer"
     pub rate_sats_per_hour: u64,
     pub default_duration_minutes: u64,
-    pub ssh_port: u16,
     pub pod_namespace: String,
     pub image: String,
 }
@@ -224,7 +223,6 @@ pub struct AccessDetailsContent {
     pub namespace: String,
     pub ssh_username: String,
     pub ssh_password: String,
-    pub ssh_port: u16,
     pub node_port: Option<u16>,
     pub expires_at: String,
     pub instructions: Vec<String>,
@@ -236,7 +234,6 @@ pub struct EncryptedSpawnPodRequest {
     pub cashu_token: String,
     pub ssh_username: Option<String>,
     pub pod_image: Option<String>,
-    pub duration_minutes: Option<u64>, // Optional custom duration
 }
 
 // NEW: Encrypted top-up request structure
