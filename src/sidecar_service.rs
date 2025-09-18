@@ -9,12 +9,13 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{info, warn, error};
-use std::collections::{HashMap, BTreeMap};
+use std::collections::{HashMap, BTreeMap, HashSet};
 use tokio::time::{sleep, Duration};
 use uuid::Uuid;
 use chrono::{DateTime, Utc};
 use nostr_sdk::{Keys, Client, EventBuilder, Kind, Tag, Url};
 use nostr_sdk::nips::nip44;
+use std::sync::Mutex;
 
 use crate::{cashu, initialize_cashu};
 
@@ -26,8 +27,9 @@ pub struct SidecarConfig {
     pub payment_rate_sats_per_hour: u64, // Legacy field - now using 1 sat = 1 minute
     pub default_pod_duration_minutes: u64, // Default duration if not specified
     pub ssh_base_image: String, // Base image with SSH server
-    pub ssh_port: u16,
     pub ssh_host: String, // SSH host for connections
+    pub ssh_port_range_start: u16, // Start of port range for pod allocation
+    pub ssh_port_range_end: u16, // End of port range for pod allocation
     pub enable_cleanup_task: bool,
     pub whitelisted_mints: Vec<String>, // Allowed Cashu mint URLs
 }
@@ -40,8 +42,9 @@ impl Default for SidecarConfig {
             payment_rate_sats_per_hour: 100, // 100 sats per hour
             default_pod_duration_minutes: 60, // 1 hour default
             ssh_base_image: "linuxserver/openssh-server:latest".to_string(),
-            ssh_port: 2222,
             ssh_host: "localhost".to_string(),
+            ssh_port_range_start: 30000,
+            ssh_port_range_end: 31000,
             enable_cleanup_task: true,
             whitelisted_mints: vec![
                 "https://mint.cashu.space".to_string(),
@@ -52,12 +55,66 @@ impl Default for SidecarConfig {
     }
 }
 
+// Port pool for managing SSH port allocation
+#[derive(Debug)]
+pub struct PortPool {
+    available_ports: HashSet<u16>,
+    allocated_ports: HashSet<u16>,
+    range_start: u16,
+    range_end: u16,
+}
+
+impl PortPool {
+    pub fn new(range_start: u16, range_end: u16) -> Self {
+        let mut available_ports = HashSet::new();
+        for port in range_start..=range_end {
+            available_ports.insert(port);
+        }
+        
+        Self {
+            available_ports,
+            allocated_ports: HashSet::new(),
+            range_start,
+            range_end,
+        }
+    }
+    
+    pub fn allocate_port(&mut self) -> Option<u16> {
+        if let Some(&port) = self.available_ports.iter().next() {
+            self.available_ports.remove(&port);
+            self.allocated_ports.insert(port);
+            Some(port)
+        } else {
+            None
+        }
+    }
+    
+    pub fn deallocate_port(&mut self, port: u16) {
+        if self.allocated_ports.remove(&port) {
+            self.available_ports.insert(port);
+        }
+    }
+    
+    pub fn is_allocated(&self, port: u16) -> bool {
+        self.allocated_ports.contains(&port)
+    }
+    
+    pub fn available_count(&self) -> usize {
+        self.available_ports.len()
+    }
+    
+    pub fn allocated_count(&self) -> usize {
+        self.allocated_ports.len()
+    }
+}
+
 // Sidecar service state
 #[derive(Clone)]
 pub struct SidecarState {
     pub config: SidecarConfig,
     pub k8s_client: Arc<PodManager>,
     pub active_pods: Arc<tokio::sync::RwLock<HashMap<String, PodInfo>>>,
+    pub port_pool: Arc<Mutex<PortPool>>,
 }
 
 // Information about active pods
@@ -67,7 +124,7 @@ pub struct PodInfo {
     pub namespace: String,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
-    pub ssh_port: u16,
+    pub allocated_port: u16, // Port allocated from the port pool (this is the SSH port)
     pub ssh_username: String,
     pub ssh_password: String,
     pub payment_amount_sats: u64,
@@ -83,7 +140,6 @@ pub struct SpawnPodRequest {
     pub cashu_token: String,
     pub pod_image: Option<String>, // Optional custom image
     pub ssh_username: Option<String>, // Optional custom username
-    pub duration_minutes: Option<u64>, // Optional custom duration override
 }
 
 // Request to top up/extend a pod
@@ -234,12 +290,13 @@ impl PodManager {
         // Create volumes
         let _volumes: Vec<Volume> = Vec::new();
 
-        // Create containers
+        // Create containers with host networking
         let containers = vec![Container {
             name: "ssh-server".to_string(),
             image: Some(image.to_string()),
             ports: Some(vec![ContainerPort {
-                container_port: ssh_port as i32,
+                container_port: 22, // Always use port 22 internally
+                host_port: Some(ssh_port as i32), // Direct port on host
                 name: Some("ssh".to_string()),
                 protocol: Some("TCP".to_string()),
                 ..Default::default()
@@ -263,6 +320,7 @@ impl PodManager {
                 volumes: None,
                 restart_policy: Some("Never".to_string()),
                 active_deadline_seconds: Some((duration_minutes * 60) as i64), // Kubernetes will auto-terminate after this time
+                host_network: Some(true), // Use host networking for direct port access
                 ..Default::default()
             }),
             ..Default::default()
@@ -272,41 +330,9 @@ impl PodManager {
         let pp = PostParams::default();
         pods.create(&pp, &pod).await.map_err(|e| format!("Failed to create pod: {}", e))?;
 
-        // With host network, we don't need a service - SSH is directly accessible
-        // But we'll create a simple service for compatibility
-        let service = Service {
-            metadata: kube::core::ObjectMeta {
-                name: Some(format!("{}-ssh", pod_name)),
-                labels: Some(labels),
-                ..Default::default()
-            },
-            spec: Some(ServiceSpec {
-                selector: Some(BTreeMap::from([
-                    ("app".to_string(), "paygress-ssh-pod".to_string()),
-                    ("pod-name".to_string(), pod_name.to_string()),
-                ])),
-                ports: Some(vec![ServicePort {
-                    port: config.ssh_port as i32, // Use configured SSH port for the service
-                    target_port: Some(IntOrString::Int(config.ssh_port as i32)), // Use configured SSH port (SSH server port)
-                    name: Some("ssh".to_string()),
-                    protocol: Some("TCP".to_string()),
-                    ..Default::default()
-                }]),
-                type_: Some("NodePort".to_string()), // Use NodePort for external access
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        let created_service = services.create(&pp, &service).await.map_err(|e| format!("Failed to create service: {}", e))?;
-
-        // Get the actual node port that Kubernetes assigned
-        let node_port = created_service
-            .spec
-            .and_then(|spec| spec.ports)
-            .and_then(|ports| ports.first().cloned())
-            .and_then(|port| port.node_port)
-            .unwrap_or(config.ssh_port as i32) as u16;
+        // With host networking, the port is directly accessible on the host
+        // No service needed - SSH is accessible at <host-ip>:<allocated-port>
+        let node_port = ssh_port; // The allocated port is directly accessible
 
         info!(
             pod_name = %pod_name, 
@@ -351,19 +377,17 @@ impl PodManager {
             "pod_name": pod_name,
             "ssh_username": username,
             "ssh_password": password,
-            "ssh_port": config.ssh_port,
             "node_port": node_port,
             "expires_at": (Utc::now() + chrono::Duration::minutes(duration_minutes as i64)).to_rfc3339(),
             "instructions": vec![
                 "🚀 SSH access available:".to_string(),
                 "".to_string(),
-                "1. Direct access (no kubectl needed):".to_string(),
-                format!("   ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no {}@$(minikube ip) -p {}", username, node_port),
+                "Direct access (no kubectl needed):".to_string(),
+                format!("   ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no {}@<your-public-ip> -p {}", username, node_port),
                 format!("   Password: {}", password),
                 "".to_string(),
-                "2. Alternative (requires kubectl):".to_string(),
-                format!("   kubectl -n user-workloads port-forward svc/{}-ssh {}:{}", pod_name, config.ssh_port, config.ssh_port),
-                format!("   ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no {}@{} -p {}", username, config.ssh_host, config.ssh_port),
+                "Note: Replace <your-public-ip> with your actual public IP address".to_string(),
+                format!("Port {} is directly accessible on your public IP", node_port),
                 "".to_string()
             ]
         });
@@ -511,11 +535,18 @@ impl SidecarState {
         let k8s_client = Arc::new(PodManager::new().await?);
 
         let active_pods = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        
+        // Initialize port pool
+        let port_pool = Arc::new(Mutex::new(PortPool::new(
+            config.ssh_port_range_start,
+            config.ssh_port_range_end,
+        )));
 
         Ok(Self {
             config,
             k8s_client,
             active_pods,
+            port_pool,
         })
     }
 
@@ -543,10 +574,79 @@ impl SidecarState {
             .collect()
     }
 
-    // Generate unique SSH port for each pod
-    pub fn generate_ssh_port(&self) -> u16 {
-        // Always use the configured SSH port (2222) since that's what the SSH server runs on
-        self.config.ssh_port
+    // Validate port is actually available before allocation
+    pub fn validate_port_available(&self, port: u16) -> Result<(), String> {
+        use std::net::{TcpListener, SocketAddr};
+        
+        // Try to bind to the port to check if it's available
+        let addr = SocketAddr::from(([0, 0, 0, 0], port));
+        match TcpListener::bind(addr) {
+            Ok(_) => Ok(()), // Port is available
+            Err(_) => Err(format!("Port {} is already in use", port)),
+        }
+    }
+
+    // Generate unique SSH port for each pod from the port pool with validation
+    pub fn generate_ssh_port(&self) -> Result<u16, String> {
+        let mut port_pool = self.port_pool.lock().map_err(|e| format!("Failed to lock port pool: {}", e))?;
+        
+        // Try to find an available port that's actually free
+        let available_ports: Vec<u16> = port_pool.available_ports.iter().cloned().collect();
+        
+        for port in available_ports {
+            // Validate port is actually available on the system
+            if self.validate_port_available(port).is_ok() {
+                // Port is free, allocate it
+                port_pool.available_ports.remove(&port);
+                port_pool.allocated_ports.insert(port);
+                
+                info!("Allocated port {} from pool ({} available, {} allocated)", 
+                      port, port_pool.available_count(), port_pool.allocated_count());
+                return Ok(port);
+            } else {
+                // Port is in use, remove from available pool and add to allocated
+                port_pool.available_ports.remove(&port);
+                port_pool.allocated_ports.insert(port);
+                warn!("Port {} was marked available but is actually in use - removing from pool", port);
+            }
+        }
+        
+        Err("No available ports in the configured range".to_string())
+    }
+    
+    // Deallocate a port back to the pool
+    pub fn deallocate_ssh_port(&self, port: u16) -> Result<(), String> {
+        let mut port_pool = self.port_pool.lock().map_err(|e| format!("Failed to lock port pool: {}", e))?;
+        port_pool.deallocate_port(port);
+        info!("Deallocated port {} back to pool ({} available, {} allocated)", 
+              port, port_pool.available_count(), port_pool.allocated_count());
+        Ok(())
+    }
+    
+    // Clean up ports for expired pods
+    pub async fn cleanup_expired_pods(&self) -> Result<(), String> {
+        let mut pods = self.active_pods.write().await;
+        let now = Utc::now();
+        let mut expired_pods = Vec::new();
+        
+        // Find expired pods
+        for (pod_name, pod_info) in pods.iter() {
+            if now > pod_info.expires_at {
+                expired_pods.push((pod_name.clone(), pod_info.allocated_port));
+            }
+        }
+        
+        // Remove expired pods and deallocate their ports
+        for (pod_name, allocated_port) in expired_pods {
+            pods.remove(&pod_name);
+            if let Err(e) = self.deallocate_ssh_port(allocated_port) {
+                error!("Failed to deallocate port {} for expired pod {}: {}", allocated_port, pod_name, e);
+            } else {
+                info!("Cleaned up expired pod {} and deallocated port {}", pod_name, allocated_port);
+            }
+        }
+        
+        Ok(())
     }
 }
 
@@ -729,7 +829,7 @@ async fn spawn_pod_handler(
     let username = request.ssh_username.unwrap_or_else(|| format!("user-{}", &pod_name[8..16]));
     let password = SidecarState::generate_password();
     let image = request.pod_image.unwrap_or_else(|| state.config.ssh_base_image.clone());
-    let ssh_port = state.generate_ssh_port(); // Generate unique port for this pod
+    let allocated_port = state.generate_ssh_port()?; // Generate unique port for this pod
 
     let now = Utc::now();
     let expires_at = now + chrono::Duration::minutes(duration_minutes as i64);
@@ -740,7 +840,7 @@ async fn spawn_pod_handler(
         &state.config.pod_namespace,
         &pod_name,
         &image,
-        ssh_port,
+        allocated_port,
         &username,
         &password,
         duration_minutes,
@@ -752,7 +852,7 @@ async fn spawn_pod_handler(
                 namespace: state.config.pod_namespace.clone(),
                 created_at: now,
                 expires_at,
-                ssh_port: ssh_port,
+                allocated_port,
                 ssh_username: username.clone(),
                 ssh_password: password.clone(),
                 payment_amount_sats: payment_amount_sats,
@@ -771,13 +871,17 @@ async fn spawn_pod_handler(
             (StatusCode::CREATED, Json(SpawnPodResponse {
                 success: true,
                 message: format!(
-                    "Pod created successfully. SSH access available for {} minutes. SSH port: {}, NodePort: {} on any cluster node.",
-                    duration_minutes, ssh_port, node_port
+                    "Pod created successfully. SSH access available for {} minutes. External port: {}",
+                    duration_minutes, node_port
                 ),
                 pod_info: Some(pod_info),
             })).into_response()
         },
         Err(e) => {
+            // Deallocate the port if pod creation failed
+            if let Err(dealloc_err) = state.deallocate_ssh_port(allocated_port) {
+                error!("Failed to deallocate port {} after pod creation failure: {}", allocated_port, dealloc_err);
+            }
             (StatusCode::INTERNAL_SERVER_ERROR, Json(SpawnPodResponse {
                 success: false,
                 message: format!("Failed to create pod: {}", e),
@@ -811,8 +915,12 @@ async fn top_up_pod_handler(
     // Check if pod has already expired
     let now = Utc::now();
     if now > pod_info.expires_at {
-        // Remove expired pod from active pods
+        // Remove expired pod from active pods and deallocate its port
+        let allocated_port = pod_info.allocated_port;
         pods.remove(&request.pod_name);
+        if let Err(e) = state.deallocate_ssh_port(allocated_port) {
+            error!("Failed to deallocate port {} for expired pod {}: {}", allocated_port, request.pod_name, e);
+        }
         return (StatusCode::GONE, Json(TopUpPodResponse {
             success: false,
             message: format!("Pod '{}' has already expired and cannot be extended", request.pod_name),
@@ -941,38 +1049,28 @@ async fn get_port_forward_command(
     match pods.get(&pod_name) {
         Some(pod_info) => {
             let direct_ssh_command = format!(
-                "ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no {}@$(minikube ip) -p {}",
-                pod_info.ssh_username, pod_info.node_port.unwrap_or(state.config.ssh_port)
-            );
-
-            let port_forward_command = format!(
-                "kubectl -n {} port-forward svc/{}-ssh {}:{}",
-                state.config.pod_namespace,
-                pod_name,
-                state.config.ssh_port,
-                state.config.ssh_port
+                "ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no {}@<your-public-ip> -p {}",
+                pod_info.ssh_username, pod_info.node_port.unwrap_or(pod_info.allocated_port)
             );
 
             let ssh_command = format!(
-                "ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no {}@{} -p {}",
-                pod_info.ssh_username, state.config.ssh_host, state.config.ssh_port
+                "ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no {}@<your-public-ip> -p {}",
+                pod_info.ssh_username, pod_info.node_port.unwrap_or(pod_info.allocated_port)
             );
 
             let response = serde_json::json!({
                 "pod_name": pod_name,
-                "ssh_port": state.config.ssh_port,
+                "allocated_port": pod_info.allocated_port,
                 "node_port": pod_info.node_port,
                 "direct_ssh_command": direct_ssh_command,
-                "port_forward_command": port_forward_command,
                 "ssh_command": ssh_command,
                 "instructions": [
                     "🚀 Direct SSH access (no kubectl needed):".to_string(),
                     direct_ssh_command,
                     format!("Password: {}", pod_info.ssh_password),
                     "".to_string(),
-                    "⚠️  Alternative (requires kubectl):".to_string(),
-                    format!("Run: {}", port_forward_command),
-                    "In another terminal, run: ".to_string() + &ssh_command
+                    "Note: Replace <your-public-ip> with your actual public IP address".to_string(),
+                    format!("Port {} is directly accessible on your public IP", pod_info.node_port.unwrap_or(pod_info.allocated_port))
                 ]
             });
 
@@ -995,7 +1093,7 @@ pub async fn start_sidecar_service(bind_addr: &str, config: SidecarConfig) -> Re
     println!("📍 Listening on: {}", bind_addr);
     println!("💰 Payment rate: {} sats/hour", config.payment_rate_sats_per_hour);
     println!("⏱️  Default duration: {} minutes", config.default_pod_duration_minutes);
-    println!("🔐 SSH port: {}", config.ssh_port);
+    println!("🔐 SSH port range: {}-{}", config.ssh_port_range_start, config.ssh_port_range_end);
     println!("📋 Endpoints:");
     println!("   GET  /healthz      - Health check");
     println!("   GET  /auth         - Auth verification for ingress");

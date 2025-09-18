@@ -94,8 +94,11 @@ spec:
       serviceAccountName: paygress-sidecar
       containers:
       - name: paygress-sidecar
+        # Local Docker image built from Dockerfile
+        # Build with: docker build -t paygress:latest .
+        # Import into K3s with: sudo k3s ctr images import <(docker save paygress:latest)
         image: paygress:latest
-        imagePullPolicy: IfNotPresent
+        imagePullPolicy: Never  # Use local image only
         ports:
         - containerPort: 8080
           name: http
