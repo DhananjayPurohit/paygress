@@ -10,10 +10,12 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{info, warn, error};
 use std::collections::{HashMap, BTreeMap, HashSet};
-use uuid::Uuid;
 use chrono::{DateTime, Utc};
 use nostr_sdk::{Keys, Client, Url};
-// Using NIP-17 private direct messages - no manual encryption needed
+use crate::nostr::send_nip17_message_with_client;
+use kube::{Api, api::ListParams};
+use k8s_openapi::api::core::v1::Pod;
+// Using NIP-17 private direct messages with NIP-44 encryption and NIP-59 seals/gift wraps
 use std::sync::Mutex;
 
 use crate::{cashu, initialize_cashu};
@@ -119,7 +121,7 @@ pub struct SidecarState {
 // Information about active pods
 #[derive(Clone, Debug, Serialize)]
 pub struct PodInfo {
-    pub pod_name: String,
+    pub pod_npub: String,    // Use NPUB instead of pod_name
     pub namespace: String,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
@@ -145,7 +147,7 @@ pub struct SpawnPodRequest {
 // Request to top up/extend a pod
 #[derive(Debug, Deserialize)]
 pub struct TopUpPodRequest {
-    pub pod_name: String,
+    pub pod_npub: String,    // Changed from pod_name to pod_npub
     pub cashu_token: String,
 }
 
@@ -188,6 +190,8 @@ impl PodManager {
         config: &SidecarConfig,
         namespace: &str,
         pod_name: &str,
+        pod_npub: &str,        // Add NPUB parameter
+        pod_nsec: &str,        // Add NSEC parameter
         image: &str,
         ssh_port: u16,
         username: &str,
@@ -196,7 +200,7 @@ impl PodManager {
         memory_mb: u64,
         cpu_millicores: u64,
         user_pubkey: &str, // User's public key for sending access events
-    ) -> Result<(u16, String, String), String> { // Return (node_port, pod_npub, pod_nsec)
+    ) -> Result<u16, String> { // Return only node_port since we have NPUB
         use k8s_openapi::api::core::v1::{
             Container, Pod, PodSpec, EnvVar, ContainerPort, Service, Volume,
         };
@@ -206,11 +210,6 @@ impl PodManager {
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
         let _services: Api<Service> = Api::namespaced(self.client.clone(), namespace);
         let _configmaps: Api<k8s_openapi::api::core::v1::ConfigMap> = Api::namespaced(self.client.clone(), namespace);
-
-        // Generate Nostr keys for this pod
-        let pod_keys = Keys::generate();
-        let pod_npub = pod_keys.public_key().to_hex();
-        let pod_nsec = pod_keys.secret_key().unwrap().to_secret_hex();
 
         // Create SSH environment variables
         let env_vars = vec![
@@ -252,12 +251,12 @@ impl PodManager {
             // Nostr keys for the pod
             EnvVar {
                 name: "POD_NPUB".to_string(),
-                value: Some(pod_npub.clone()),
+                value: Some(pod_npub.to_string()),
                 value_from: None,
             },
             EnvVar {
                 name: "POD_NSEC".to_string(),
-                value: Some(pod_nsec.clone()),
+                value: Some(pod_nsec.to_string()),
                 value_from: None,
             },
             EnvVar {
@@ -270,6 +269,11 @@ impl PodManager {
                 value: Some("wss://relay.damus.io,wss://nos.lol,wss://relay.nostr.band".to_string()),
                 value_from: None,
             },
+            EnvVar {
+                name: "SSH_PORT".to_string(),
+                value: Some(ssh_port.to_string()),
+                value_from: None,
+            },
         ];
 
         // Create pod labels and annotations
@@ -278,6 +282,19 @@ impl PodManager {
         labels.insert("managed-by".to_string(), "paygress-sidecar".to_string());
         labels.insert("pod-type".to_string(), "ssh-access".to_string());
         labels.insert("pod-name".to_string(), pod_name.to_string());
+        // Extract hex part from NPUB and truncate to fit Kubernetes label limit (63 chars)
+        let npub_hex = if pod_npub.starts_with("npub1") {
+            &pod_npub[5..] // Remove "npub1" prefix
+        } else {
+            pod_npub // Already hex or different format
+        };
+        // Truncate to 63 characters max for Kubernetes labels
+        let truncated_hex = if npub_hex.len() > 63 {
+            &npub_hex[..63]
+        } else {
+            npub_hex
+        };
+        labels.insert("pod-npub".to_string(), truncated_hex.to_string()); // Add NPUB hex as label
 
         let mut annotations = BTreeMap::new();
         annotations.insert("paygress.io/created-at".to_string(), Utc::now().to_rfc3339());
@@ -295,8 +312,8 @@ impl PodManager {
             name: "ssh-server".to_string(),
             image: Some(image.to_string()),
             ports: Some(vec![ContainerPort {
-                container_port: 22, // Always use port 22 internally
-                host_port: Some(ssh_port as i32), // Direct port on host
+                container_port: ssh_port as i32, // SSH port inside container matches allocated port
+                host_port: Some(ssh_port as i32), // External port matches container port (required for host networking)
                 name: Some("ssh".to_string()),
                 protocol: Some("TCP".to_string()),
                 ..Default::default()
@@ -358,11 +375,9 @@ impl PodManager {
             "Created SSH pod with service"
         );
 
-        // Send access event from the pod itself
-        let _ = Self::send_pod_access_event(
-            &config,
+        // Send access event from the service (not the pod) for security
+        let _ = Self::send_pod_access_event_from_service(
             &pod_npub,
-            &pod_nsec,
             user_pubkey,
             &pod_name,
             username,
@@ -371,23 +386,26 @@ impl PodManager {
             duration_seconds,
         ).await;
 
-        Ok((node_port, pod_npub, pod_nsec))
+        Ok(node_port)
     }
 
-    // Function to send access event from the pod itself
-    async fn send_pod_access_event(
-        config: &SidecarConfig,
-        _pod_npub: &str,
-        pod_nsec: &str,
+    // Function to send access event from the service (secure)
+    async fn send_pod_access_event_from_service(
+        pod_npub: &str,
         user_pubkey: &str,
-        pod_name: &str,
+        _pod_name: &str,
         username: &str,
         password: &str,
         node_port: u16,
         duration_seconds: u64,
     ) -> Result<(), String> {
+        use nostr_sdk::prelude::*;
+        use std::env;
+        
         // Create access details
         let access_details = serde_json::json!({
+            "kind": "access_details",
+            "pod_npub": pod_npub,        // Use NPUB instead of pod_name
             "ssh_username": username,
             "ssh_password": password,
             "node_port": node_port,
@@ -397,47 +415,54 @@ impl PodManager {
                 "".to_string(),
                 "Direct access (no kubectl needed):".to_string(),
                 format!("   ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no {}@<your-public-ip> -p {}", username, node_port),
-                format!("   Password: {}", password),
                 "".to_string(),
-                "Note: Replace <your-public-ip> with your actual public IP address".to_string(),
-                format!("Port {} is directly accessible on your public IP", node_port),
-                "".to_string()
+                "⚠️  Pod expires at:".to_string(),
+                format!("   {}", (Utc::now() + chrono::Duration::seconds(duration_seconds as i64)).format("%Y-%m-%d %H:%M:%S UTC")),
+                "".to_string(),
+                "📋 Pod Details:".to_string(),
+                format!("   Pod NPUB: {}", pod_npub),
+                format!("   Duration: {} seconds", duration_seconds),
             ]
         });
 
-        // Send access details via private message
-        let pod_keys = Keys::parse(pod_nsec).map_err(|e| format!("Invalid pod nsec: {}", e))?;
-        let client = Client::new(&pod_keys);
-
-        // Connect to relays
-        let relays = vec![
-            "wss://relay.damus.io",
-            "wss://nos.lol",
-            "wss://relay.nostr.band",
-        ];
-
-        for relay in relays {
-            if let Ok(url) = relay.parse::<Url>() {
-                let _ = client.add_relay(url).await;
+        // Get service keys from environment
+        let service_nsec = env::var("NOSTR_PRIVATE_KEY")
+            .map_err(|_| "NOSTR_PRIVATE_KEY not found in environment")?;
+        let service_keys = Keys::parse(&service_nsec)
+            .map_err(|e| format!("Invalid service nsec: {}", e))?;
+        
+        let client = Client::new(&service_keys);
+        
+        // Add relays
+        let relay_urls = env::var("NOSTR_RELAYS")
+            .unwrap_or_else(|_| "wss://relay.damus.io,wss://nos.lol,wss://relay.nostr.band".to_string());
+        for relay_url in relay_urls.split(',') {
+            let relay = relay_url.trim();
+            if !relay.is_empty() {
+                let _ = client.add_relay(relay).await;
             }
         }
-
+        
         client.connect().await;
-
-        // Send as NIP-17 private direct message (kind 14)
-        let user_pubkey_parsed = nostr_sdk::PublicKey::parse(user_pubkey).map_err(|e| format!("Invalid user pubkey: {}", e))?;
-        match client.send_private_msg(user_pubkey_parsed, access_details.to_string(), None).await {
+        
+        // Parse user public key
+        let user_pubkey_parsed = nostr_sdk::PublicKey::parse(user_pubkey)
+            .map_err(|e| format!("Invalid user pubkey: {}", e))?;
+        
+        // Send NIP-17 message with NIP-44 encryption and NIP-59 seals/gift wraps
+        match send_nip17_message_with_client(&client, user_pubkey_parsed, access_details.to_string()).await {
             Ok(event_id) => {
-                info!("Pod {} sent access details via private message with ID: {:?}", pod_name, event_id);
+                info!("Service sent access details via private message with ID: {:?}", event_id);
             }
             Err(e) => {
-                error!("Failed to send private message: {}", e);
+                error!("Failed to send private message from service: {}", e);
                 return Err(format!("Failed to send private message: {}", e));
             }
         }
-
+        
         Ok(())
     }
+
 
     pub async fn delete_pod(&self, namespace: &str, pod_name: &str) -> Result<(), String> {
         use kube::api::DeleteParams;
@@ -820,9 +845,14 @@ async fn spawn_pod_handler(
         }
     }
 
-    // Generate pod details
-    let pod_name = format!("ssh-pod-{}", Uuid::new_v4().to_string()[..8].to_string());
-    let username = request.ssh_username.unwrap_or_else(|| format!("user-{}", &pod_name[8..16]));
+    // Generate NPUB first and use it as pod name
+    let pod_keys = nostr_sdk::Keys::generate();
+    let pod_npub = pod_keys.public_key().to_hex();
+    let pod_nsec = pod_keys.secret_key().unwrap().to_secret_hex();
+    
+    // Create Kubernetes-safe pod name from NPUB
+    let pod_name = format!("pod-{}", pod_npub.replace("npub1", "").chars().take(8).collect::<String>());
+    let username = request.ssh_username.unwrap_or_else(|| format!("user-{}", &pod_name[4..12]));
     let password = request.ssh_password.unwrap_or_else(|| SidecarState::generate_password());
     let image = request.pod_image.unwrap_or_else(|| state.config.base_image.clone());
     let allocated_port = match state.generate_ssh_port() {
@@ -844,6 +874,8 @@ async fn spawn_pod_handler(
         &state.config,
         &state.config.pod_namespace,
         &pod_name,
+        &pod_npub,
+        &pod_nsec,
         &image,
         allocated_port,
         &username,
@@ -853,9 +885,9 @@ async fn spawn_pod_handler(
         1000, // 1 CPU core
         "http-mode-user", // Dummy user pubkey for HTTP mode
     ).await {
-        Ok((node_port, pod_npub, pod_nsec)) => {
+        Ok(node_port) => {
             let pod_info = PodInfo {
-                pod_name: pod_name.clone(),
+                pod_npub: pod_npub.clone(),
                 namespace: state.config.pod_namespace.clone(),
                 created_at: now,
                 expires_at,
@@ -865,12 +897,12 @@ async fn spawn_pod_handler(
                 payment_amount_msats: payment_amount_msats,
                 duration_seconds,
                 node_port: Some(node_port),
-                nostr_public_key: pod_npub,
+                nostr_public_key: pod_npub.clone(),
                 nostr_private_key: pod_nsec,
             };
 
             // Store pod info
-            state.active_pods.write().await.insert(pod_name.clone(), pod_info.clone());
+            state.active_pods.write().await.insert(pod_npub.clone(), pod_info.clone());
 
             // Pod will be automatically deleted by Kubernetes based on TTL annotation
             // No need for manual scheduling - Kubernetes handles this natively
@@ -899,38 +931,133 @@ async fn spawn_pod_handler(
 }
 
 // Top up/extend a pod's duration - handler function
-async fn top_up_pod_handler(
+pub async fn top_up_pod_handler(
     state: SidecarState,
     request: TopUpPodRequest,
 ) -> Response {
-    info!("Pod top-up request received for pod: {}", request.pod_name);
+    info!("Pod top-up request received for NPUB: {}", request.pod_npub);
 
-    // Check if pod exists
-    let mut pods = state.active_pods.write().await;
-    let pod_info = match pods.get_mut(&request.pod_name) {
-        Some(pod) => pod,
-        None => {
-            return (StatusCode::NOT_FOUND, Json(TopUpPodResponse {
+    // Find pod by NPUB label in Kubernetes
+    let pods_api: Api<Pod> = Api::namespaced(state.k8s_client.client.clone(), &state.config.pod_namespace);
+    let pods = match pods_api.list(&ListParams::default()).await {
+        Ok(pods) => pods,
+        Err(e) => {
+            error!("Failed to list pods: {}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(TopUpPodResponse {
                 success: false,
-                message: format!("Pod '{}' not found or already expired", request.pod_name),
+                message: format!("Failed to list pods: {}", e),
                 pod_info: None,
                 extended_duration_seconds: None,
             })).into_response();
         }
     };
 
-    // Check if pod has already expired
+    // Find pod by NPUB label (compare truncated hex parts)
+    let target_pod = match pods.items.iter().find(|pod| {
+        pod.metadata.labels.as_ref()
+            .and_then(|labels| labels.get("pod-npub"))
+            .map(|stored_hex| {
+                // Extract hex from the requested NPUB
+                let requested_hex = if request.pod_npub.starts_with("npub1") {
+                    &request.pod_npub[5..] // Remove "npub1" prefix
+                } else {
+                    &request.pod_npub // Already hex or different format
+                };
+                // Truncate both to 63 chars for comparison
+                let stored_truncated = if stored_hex.len() > 63 {
+                    &stored_hex[..63]
+                } else {
+                    stored_hex
+                };
+                let requested_truncated = if requested_hex.len() > 63 {
+                    &requested_hex[..63]
+                } else {
+                    requested_hex
+                };
+                stored_truncated == requested_truncated
+            })
+            .unwrap_or(false)
+    }) {
+        Some(pod) => pod,
+        None => {
+            return (StatusCode::NOT_FOUND, Json(TopUpPodResponse {
+                success: false,
+                message: format!("Pod with NPUB '{}' not found or already expired", request.pod_npub),
+                pod_info: None,
+                extended_duration_seconds: None,
+            })).into_response();
+        }
+    };
+
+    // Get pod name from metadata
+    let pod_name = match &target_pod.metadata.name {
+        Some(name) => name.clone(),
+        None => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(TopUpPodResponse {
+                success: false,
+                message: "Pod has no name in metadata".to_string(),
+                pod_info: None,
+                extended_duration_seconds: None,
+            })).into_response();
+        }
+    };
+
+    // Check if pod has already expired by looking at activeDeadlineSeconds
     let now = Utc::now();
-    if now > pod_info.expires_at {
-        // Remove expired pod from active pods and deallocate its port
-        let allocated_port = pod_info.allocated_port;
-        pods.remove(&request.pod_name);
+    let pod_expires_at = match &target_pod.spec {
+        Some(spec) => match spec.active_deadline_seconds {
+            Some(deadline_secs) => {
+                // Calculate expiration time from pod creation time
+                match &target_pod.metadata.creation_timestamp {
+                    Some(creation_time) => {
+                        let creation_utc = creation_time.0;
+                        creation_utc + chrono::Duration::seconds(deadline_secs)
+                    }
+                    None => now + chrono::Duration::seconds(deadline_secs), // Fallback
+                }
+            }
+            None => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(TopUpPodResponse {
+                    success: false,
+                    message: "Pod has no active deadline set".to_string(),
+                    pod_info: None,
+                    extended_duration_seconds: None,
+                })).into_response();
+            }
+        }
+        None => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(TopUpPodResponse {
+                success: false,
+                message: "Pod has no spec".to_string(),
+                pod_info: None,
+                extended_duration_seconds: None,
+            })).into_response();
+        }
+    };
+
+    if now > pod_expires_at {
+        // Pod has expired, deallocate its port if we can find it
+        let allocated_port = match target_pod.spec.as_ref()
+            .and_then(|spec| spec.containers.first())
+            .and_then(|container| container.ports.as_ref())
+            .and_then(|ports| ports.first())
+            .and_then(|port| port.host_port) {
+            Some(port) => port as u16,
+            None => {
+                warn!("Could not determine port for expired pod {}", pod_name);
+                0
+            }
+        };
+        
+        if allocated_port > 0 {
+            state.port_pool.lock().unwrap().deallocate_port(allocated_port);
+        }
         if let Err(e) = state.deallocate_ssh_port(allocated_port) {
-            error!("Failed to deallocate port {} for expired pod {}: {}", allocated_port, request.pod_name, e);
+            error!("Failed to deallocate port {} for expired pod {}: {}", allocated_port, pod_name, e);
         }
         return (StatusCode::GONE, Json(TopUpPodResponse {
             success: false,
-            message: format!("Pod '{}' has already expired and cannot be extended", request.pod_name),
+            message: format!("Pod '{}' (NPUB: {}) has already expired and cannot be extended", pod_name, request.pod_npub),
             pod_info: None,
             extended_duration_seconds: None,
         })).into_response();
@@ -987,17 +1114,8 @@ async fn top_up_pod_handler(
         }
     }
 
-    // Extend the pod's expiration time in memory
-    let old_expires_at = pod_info.expires_at;
-    pod_info.expires_at = pod_info.expires_at + chrono::Duration::seconds(additional_duration_seconds as i64);
-    pod_info.payment_amount_msats += payment_amount_msats;
-    pod_info.duration_seconds += additional_duration_seconds;
-
-    let updated_pod_info = pod_info.clone();
-    drop(pods); // Release the write lock
-
     // Update the pod's activeDeadlineSeconds in Kubernetes
-    if let Err(e) = state.k8s_client.extend_pod_deadline(&state.config.pod_namespace, &request.pod_name, additional_duration_seconds).await {
+    if let Err(e) = state.k8s_client.extend_pod_deadline(&state.config.pod_namespace, &pod_name, additional_duration_seconds).await {
         error!("Failed to extend pod deadline in Kubernetes: {}", e);
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(TopUpPodResponse {
             success: false,
@@ -1007,23 +1125,31 @@ async fn top_up_pod_handler(
         })).into_response();
     }
 
+    // Calculate new expiration time
+    let new_expires_at = pod_expires_at + chrono::Duration::seconds(additional_duration_seconds as i64);
+    
     info!(
-        "🔄 Pod '{}' extended: {} → {} (added {} seconds)",
-        request.pod_name,
-        old_expires_at.format("%H:%M:%S UTC"),
-        updated_pod_info.expires_at.format("%H:%M:%S UTC"),
+        "🔄 Pod '{}' (NPUB: {}) extended: {} → {} (added {} seconds)",
+        pod_name,
+        request.pod_npub,
+        pod_expires_at.format("%H:%M:%S UTC"),
+        new_expires_at.format("%H:%M:%S UTC"),
         additional_duration_seconds
     );
 
+    // Calculate new expiration time
+    let new_expires_at = pod_expires_at + chrono::Duration::seconds(additional_duration_seconds as i64);
+    
     (StatusCode::OK, Json(TopUpPodResponse {
         success: true,
         message: format!(
-            "Pod '{}' successfully extended by {} seconds. New expiration: {}",
-            request.pod_name,
+            "Pod '{}' (NPUB: {}) successfully extended by {} seconds. New expiration: {}",
+            pod_name,
+            request.pod_npub,
             additional_duration_seconds,
-            updated_pod_info.expires_at.format("%Y-%m-%d %H:%M:%S UTC")
+            new_expires_at.format("%Y-%m-%d %H:%M:%S UTC")
         ),
-        pod_info: Some(updated_pod_info),
+        pod_info: None, // We don't maintain in-memory state anymore
         extended_duration_seconds: Some(additional_duration_seconds),
     })).into_response()
 }
@@ -1036,12 +1162,12 @@ async fn list_pods(State(state): State<SidecarState>) -> Json<Vec<PodInfo>> {
 
 // Get specific pod info
 async fn get_pod_info(
-    Path(pod_name): Path<String>,
+    Path(pod_npub): Path<String>,
     State(state): State<SidecarState>,
 ) -> Result<Json<PodInfo>, StatusCode> {
     let pods = state.active_pods.read().await;
 
-    match pods.get(&pod_name) {
+    match pods.get(&pod_npub) {
         Some(pod_info) => Ok(Json(pod_info.clone())),
         None => Err(StatusCode::NOT_FOUND),
     }

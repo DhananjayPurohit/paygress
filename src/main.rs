@@ -2,14 +2,15 @@ use paygress::sidecar_service::{start_sidecar_service, SidecarConfig};
 use paygress::nostr::{
     default_relay_config, custom_relay_config, NostrRelaySubscriber, 
     OfferEventContent, EncryptedSpawnPodRequest, EncryptedTopUpPodRequest,
-    send_provisioning_request_private_message, parse_private_message_content
+    parse_private_message_content
 };
 use paygress::sidecar_service::{SidecarState, PodInfo};
 use chrono::Utc;
 use std::env;
 use tracing_subscriber::fmt::init;
+use nostr_sdk;
+use axum::http::StatusCode;
 use tracing::info;
-use kube::Client;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -191,9 +192,14 @@ async fn handle_spawn_pod_request(
         _ => { return Ok(()); }
     }
 
-    // Prepare pod attributes
-    let pod_name = format!("ssh-pod-{}", uuid::Uuid::new_v4().to_string()[..8].to_string());
-    let username = request.ssh_username.unwrap_or_else(|| format!("user-{}", &pod_name[8..16]));
+    // Generate NPUB first and use it as pod name
+    let pod_keys = nostr_sdk::Keys::generate();
+    let pod_npub = pod_keys.public_key().to_hex();
+    let pod_nsec = pod_keys.secret_key().unwrap().to_secret_hex();
+    
+    // Create Kubernetes-safe pod name from NPUB
+    let pod_name = format!("pod-{}", pod_npub.replace("npub1", "").chars().take(8).collect::<String>());
+    let username = request.ssh_username.unwrap_or_else(|| format!("user-{}", &pod_name[4..12]));
     let password = request.ssh_password.unwrap_or_else(|| SidecarState::generate_password());
     let image = request.pod_image.unwrap_or_else(|| state_clone.config.base_image.clone());
     let ssh_port = match state_clone.generate_ssh_port() {
@@ -211,6 +217,8 @@ async fn handle_spawn_pod_request(
         &state_clone.config,
         &state_clone.config.pod_namespace,
         &pod_name,
+        &pod_npub,
+        &pod_nsec,
         &image,
         ssh_port,
         &username,
@@ -220,9 +228,9 @@ async fn handle_spawn_pod_request(
         1000, // 1 CPU core
         user_pubkey, // Pass user's public key
     ).await {
-        Ok((node_port, pod_npub, pod_nsec)) => {
+        Ok(node_port) => {
             let pod_info = PodInfo {
-                pod_name: pod_name.clone(),
+                pod_npub: pod_npub.clone(),
                 namespace: state_clone.config.pod_namespace.clone(),
                 created_at: now,
                 expires_at,
@@ -232,12 +240,12 @@ async fn handle_spawn_pod_request(
                 payment_amount_msats,
                 duration_seconds,
                 node_port: Some(node_port),
-                nostr_public_key: pod_npub,
+                nostr_public_key: pod_npub.clone(),
                 nostr_private_key: pod_nsec,
             };
-            state_clone.active_pods.write().await.insert(pod_name.clone(), pod_info.clone());
+            state_clone.active_pods.write().await.insert(pod_npub.clone(), pod_info.clone());
 
-            info!("Pod {} created and will send its own access event", pod_name);
+            info!("Pod with NPUB {} created and access event sent by service", pod_npub);
         }
         Err(e) => {
             tracing::error!("Failed to create pod: {}", e);
@@ -252,77 +260,29 @@ async fn handle_top_up_request(
     state_clone: SidecarState,
     request: EncryptedTopUpPodRequest,
 ) -> Result<(), anyhow::Error> {
-    info!("Pod top-up request received for pod: {}", request.pod_name);
+    info!("Pod top-up request received for NPUB: {}", request.pod_npub);
 
-    // Check if pod exists
-    let mut pods = state_clone.active_pods.write().await;
-    let pod_info = match pods.get_mut(&request.pod_name) {
-        Some(pod) => pod,
-        None => {
-            tracing::warn!("Pod '{}' not found or already expired", request.pod_name);
-            return Ok(());
-        }
-    };
-
-    // Check if pod has already expired
-    let now = Utc::now();
-    if now > pod_info.expires_at {
-        // Remove expired pod from active pods
-        pods.remove(&request.pod_name);
-        tracing::warn!("Pod '{}' has already expired and cannot be extended", request.pod_name);
-        return Ok(());
-    }
-
-    // Extract payment amount from token
-    let payment_amount_msats = match paygress::sidecar_service::extract_token_value(&request.cashu_token).await {
-        Ok(msats) => msats,
-        Err(e) => {
-            tracing::warn!("Failed to decode Cashu token: {}", e);
-            return Ok(());
-        }
-    };
-
-    // Calculate additional duration from payment
-    let additional_duration_seconds = state_clone.calculate_duration_from_payment(payment_amount_msats);
+    // Store NPUB for logging before moving it
+    let pod_npub = request.pod_npub.clone();
     
-    if additional_duration_seconds == 0 {
-        tracing::warn!("Insufficient payment for top-up: {} msats (minimum required: {} msats for 1 second)", 
-            payment_amount_msats, 
-            state_clone.config.payment_rate_msats_per_sec);
-        return Ok(());
+    // Convert to HTTP request format and delegate to HTTP handler
+    let top_up_request = paygress::sidecar_service::TopUpPodRequest {
+        pod_npub: request.pod_npub,
+        cashu_token: request.cashu_token,
+    };
+    
+    // Call the HTTP handler logic directly
+    let response = paygress::sidecar_service::top_up_pod_handler(state_clone, top_up_request).await;
+    
+    // Log the response for debugging
+    match response.status() {
+        StatusCode::OK => info!("✅ Top-up request processed successfully for NPUB: {}", pod_npub),
+        StatusCode::NOT_FOUND => tracing::warn!("❌ Pod with NPUB {} not found or expired", pod_npub),
+        StatusCode::PAYMENT_REQUIRED => tracing::warn!("❌ Payment verification failed for NPUB: {}", pod_npub),
+        StatusCode::INTERNAL_SERVER_ERROR => tracing::error!("❌ Internal error processing top-up for NPUB: {}", pod_npub),
+        _ => tracing::warn!("❌ Unexpected response for top-up request NPUB: {}", pod_npub),
     }
-
-    // Verify payment token validity
-    match paygress::cashu::verify_cashu_token(&request.cashu_token, 1, &state_clone.config.whitelisted_mints).await {
-        Ok(true) => {
-            info!("✅ Top-up payment verified: {} msats for {} additional seconds", payment_amount_msats, additional_duration_seconds);
-        }
-        _ => {
-            tracing::warn!("Top-up payment verification failed");
-            return Ok(());
-        }
-    }
-
-    // Extend the pod's expiration time in memory
-    let old_expires_at = pod_info.expires_at;
-    pod_info.expires_at = pod_info.expires_at + chrono::Duration::seconds(additional_duration_seconds as i64);
-    pod_info.payment_amount_msats += payment_amount_msats;
-    pod_info.duration_seconds += additional_duration_seconds;
-
-    // Update the pod's activeDeadlineSeconds in Kubernetes
-    if let Err(e) = state_clone.k8s_client.extend_pod_deadline(&state_clone.config.pod_namespace, &request.pod_name, additional_duration_seconds).await {
-        tracing::error!("Failed to extend pod deadline in Kubernetes: {}", e);
-        return Ok(());
-    }
-
-    info!(
-        "🔄 Pod '{}' extended: {} → {} (added {} seconds)",
-        request.pod_name,
-        old_expires_at.format("%H:%M:%S UTC"),
-        pod_info.expires_at.format("%H:%M:%S UTC"),
-        additional_duration_seconds
-    );
-
+    
     Ok(())
 }
 

@@ -1,19 +1,19 @@
-# Paygress - NIP-17 Private Direct Message Pod Provisioning
+# Paygress - NIP-17 Encrypted Private Message Pod Provisioning
 
-🔧 **NIP-17 Private Direct Messages → Kubernetes Pod Provisioning with Cashu Payments**
+🔧 **NIP-17 + NIP-44 + NIP-59 Encrypted Private Messages → Kubernetes Pod Provisioning with Cashu Payments**
 
 ## Architecture
 
-**NIP-17 Private Direct Message-Driven Pod Provisioning:**
-- Service listens for **private direct messages** (kind 14) with Cashu tokens
-- All sensitive data sent via NIP-17 private direct messages (Cashu tokens, SSH credentials)
-- **Automatic encryption/decryption** - NIP-17 handles all encryption internally
+**NIP-17 Encrypted Private Message-Driven Pod Provisioning:**
+- Service listens for **NIP-17 gift wraps** (kind 1059) with Cashu tokens
+- All sensitive data sent via NIP-17 encrypted private messages (Cashu tokens, SSH credentials)
+- **NIP-44 encryption + NIP-59 seals/gift wraps** - True end-to-end encryption
 - Automatically provisions SSH pods in Kubernetes with `activeDeadlineSeconds`
-- Replies with access details via **NIP-17 private direct messages** (kind 14)
-- **Top-up Support**: Extend pod duration via private direct messages or HTTP
+- Replies with access details via **NIP-17 encrypted private messages** (kind 1059)
+- **Top-up Support**: Extend pod duration via encrypted private messages or HTTP
 - **Kubernetes Native**: Uses `activeDeadlineSeconds` for automatic pod termination
 - Fully decentralized - no HTTP endpoints needed
-- **Enhanced privacy** - NIP-17 protects both message content and metadata with multi-layered encryption
+- **Maximum privacy** - NIP-44 + NIP-59 protects both message content and metadata with multi-layered encryption
 
 ## 🚀 Complete Setup Guide
 
@@ -333,15 +333,13 @@ SERVICE_NPUB="npub1abc123..."  # Replace with actual service public key from log
 # Convert npub to hex format (nak requires 64-char hex, not npub)
 SERVICE_PUBKEY_HEX=$(nak pubkey --hex "$SERVICE_NPUB")
 
-# Send the request as a NIP-17 private direct message using nak
-# Note: NIP-17 handles encryption automatically - no manual encryption needed
-# Send as NIP-17 private direct message (kind 14)
-nak event \
-  --kind 14 \
-  --content "$REQUEST_JSON" \
-  --sec "$NSEC" \
-  --tag "p" "$SERVICE_PUBKEY_HEX" \
-  wss://relay.damus.io wss://nos.lol wss://relay.nostr.band
+# Send the request as a NIP-17 encrypted private message
+# Note: NIP-17 with NIP-44 + NIP-59 requires complex encryption (seals + gift wraps)
+# This example shows the concept - actual implementation requires proper NIP-44 + NIP-59 encryption
+# For production use, use a proper NIP-17 client that handles NIP-44 + NIP-59 automatically
+
+# Example using a hypothetical NIP-17 client (not nak - nak doesn't support NIP-44 + NIP-59 yet)
+# nip17-send --recipient "$SERVICE_PUBKEY_HEX" --content "$REQUEST_JSON" --relays wss://relay.damus.io wss://nos.lol wss://relay.nostr.band
 ```
 
 ## 🎯 Step 8: Listen for NIP-17 Private Direct Message Response
@@ -405,14 +403,12 @@ TOPUP_JSON='{"pod_name":"ssh-pod-abc12345","cashu_token":"<YOUR_TOPUP_TOKEN>"}'
 # Get the service's public key from logs
 SERVICE_NPUB="npub1abc123..."  # Replace with actual service public key from logs
 
-# Send top-up as NIP-17 private direct message (kind 14)
-# NIP-17 handles encryption automatically - no manual encryption needed
-nak event \
-  --kind 14 \
-  --content "$TOPUP_JSON" \
-  --sec "$NSEC" \
-  --tag "p" "$SERVICE_PUBKEY_HEX" \
-  wss://relay.damus.io wss://nos.lol wss://relay.nostr.band
+# Send top-up as NIP-17 encrypted private message
+# NIP-17 with NIP-44 + NIP-59 requires proper encryption (seals + gift wraps)
+# Use a proper NIP-17 client that handles NIP-44 + NIP-59 automatically
+
+# Example using a hypothetical NIP-17 client
+# nip17-send --recipient "$SERVICE_PUBKEY_HEX" --content "$TOPUP_JSON" --relays wss://relay.damus.io wss://nos.lol wss://relay.nostr.band
 ```
 
 ### Top-up Features:
@@ -623,14 +619,40 @@ minikube stop
 ## How it works
 
 1. **Service starts** → Connects to Nostr relays, publishes offer event
-2. **User sends NIP-17 private direct message** → Kind 14 with Cashu token and pod requirements (automatic encryption)
+2. **User sends NIP-17 encrypted private message** → Kind 1059 gift wrap with Cashu token and pod requirements (NIP-44 encryption + NIP-59 seals)
 3. **Service processes** → Verifies payment, creates SSH pod in Kubernetes with `activeDeadlineSeconds`
-4. **Pod sends NIP-17 private direct message response** → Kind 14 event with SSH access details (automatic encryption, sent by the pod itself!)
+4. **Service sends NIP-17 encrypted private message response** → Kind 1059 gift wrap with SSH access details (NIP-44 encryption + NIP-59 seals, sent by the service for security)
 5. **User accesses pod** → Uses provided SSH credentials via NodePort or port-forward
-6. **Optional: Extend duration** → Send NIP-17 private direct message or HTTP POST to extend pod lifetime
+6. **Optional: Extend duration** → Send NIP-17 encrypted private message or HTTP POST to extend pod lifetime
 7. **Automatic termination** → Kubernetes terminates pod when `activeDeadlineSeconds` expires
 
-**Complete NIP-17 private direct message-based workflow - no HTTP endpoints needed!**
+**Complete NIP-17 encrypted private message-based workflow with NIP-44 + NIP-59 - no HTTP endpoints needed!**
+
+## 🔐 NIP-17 Encryption Implementation
+
+Paygress implements **NIP-17** with **NIP-44 encryption** and **NIP-59 seals/gift wraps** for maximum privacy:
+
+### Encryption Flow:
+1. **Kind 14 Message**: Unsigned chat message with content
+2. **NIP-44 Encryption**: Message encrypted with sender's private key and recipient's public key
+3. **Kind 13 Seal**: Encrypted message wrapped in a seal
+4. **NIP-59 Gift Wrap**: Seal wrapped in a gift wrap (kind 1059) for each recipient
+5. **Random Keys**: Gift wrap uses random keys to hide sender identity
+
+### Privacy Benefits:
+- ✅ **No Metadata Leak**: Participant identities, timestamps, and event kinds are hidden
+- ✅ **No Public Group Identifiers**: No central queue or channel to correlate messages
+- ✅ **No Shared Secrets**: No secrets that can leak or be shared
+- ✅ **Fully Recoverable**: Messages recoverable with user's private key
+- ✅ **Public Relay Compatible**: Works through public relays without privacy loss
+
+### Client Requirements:
+- Must support **NIP-44 encryption** (latest version)
+- Must support **NIP-59 seals and gift wraps**
+- Must handle **kind 1059 gift wraps** for receiving messages
+- Must create **kind 14 → 13 → 1059** chain for sending messages
+
+**Note**: Simple tools like `nak` don't yet support NIP-44 + NIP-59 encryption. Use proper NIP-17 clients.
 
 > **Note**: This implementation uses [NIP-17: Private Direct Messages](https://github.com/nostr-protocol/nips/blob/master/17.md) for enhanced privacy and security. NIP-17 handles all encryption/decryption automatically - no manual encryption required.
 
@@ -787,13 +809,11 @@ SERVICE_NPUB="npub1abc123..."  # Replace with actual service public key
 
 # Create request
 REQUEST_JSON='{"cashu_token":"YOUR_TOKEN","ssh_username":"alice","ssh_password":"my_secure_password"}'
-# Send as NIP-17 private direct message (NIP-17 handles encryption automatically)
-nak event \
-  --kind 14 \
-  --content "$REQUEST_JSON" \
-  --sec "$NSEC" \
-  --tag "p" "$SERVICE_PUBKEY_HEX" \
-  wss://relay.damus.io wss://nos.lol wss://relay.nostr.band
+# Send as NIP-17 encrypted private message (NIP-44 + NIP-59 encryption required)
+# Use a proper NIP-17 client that handles NIP-44 + NIP-59 automatically
+
+# Example using a hypothetical NIP-17 client
+# nip17-send --recipient "$SERVICE_PUBKEY_HEX" --content "$REQUEST_JSON" --relays wss://relay.damus.io wss://nos.lol wss://relay.nostr.band
 
 # Listen for NIP-17 private direct message response
 nak req -k 14 --stream wss://relay.damus.io wss://nos.lol wss://relay.nostr.band
