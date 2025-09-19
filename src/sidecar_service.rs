@@ -311,8 +311,8 @@ impl PodManager {
             name: "ssh-server".to_string(),
             image: Some(image.to_string()),
             ports: Some(vec![ContainerPort {
-                container_port: 2222, // SSH listens on port 2222 inside container (linuxserver default)
-                host_port: Some(ssh_port as i32), // Map to unique host port
+                container_port: 22, // SSH listens on port 22 inside container
+                host_port: Some(ssh_port as i32), // Map to unique host port (2222, 2223, 2224, etc.)
                 name: Some("ssh".to_string()),
                 protocol: Some("TCP".to_string()),
                 ..Default::default()
@@ -364,14 +364,8 @@ impl PodManager {
         // Wait for pod to be ready
         tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
 
-        // Create a NodePort service for reliable access
-        let _ = Self::create_ssh_service(
-            &self.client,
-            namespace,
-            &pod_name,
-            ssh_port,
-        ).await;
-
+        // With hostPort, SSH is directly accessible on the host at the allocated port
+        // No service needed - direct access via public IP + unique port
         let node_port = ssh_port; // The allocated port is directly accessible
 
         info!(
@@ -441,59 +435,6 @@ impl PodManager {
         Ok(())
     }
 
-    // Create a NodePort service for SSH access
-    async fn create_ssh_service(
-        client: &kube::Client,
-        namespace: &str,
-        pod_name: &str,
-        ssh_port: u16,
-    ) -> Result<(), String> {
-        use k8s_openapi::api::core::v1::Service;
-        use kube::api::PostParams;
-        use kube::Api;
-
-        let services: Api<Service> = Api::namespaced(client.clone(), namespace);
-        
-        let service_name = format!("{}-ssh", pod_name);
-        
-        let service = Service {
-            metadata: kube::core::ObjectMeta {
-                name: Some(service_name.clone()),
-                labels: Some({
-                    let mut labels = std::collections::BTreeMap::new();
-                    labels.insert("app".to_string(), "paygress-ssh-pod".to_string());
-                    labels.insert("pod-name".to_string(), pod_name.to_string());
-                    labels
-                }),
-                ..Default::default()
-            },
-            spec: Some(k8s_openapi::api::core::v1::ServiceSpec {
-                selector: Some({
-                    let mut selector = std::collections::BTreeMap::new();
-                    selector.insert("pod-name".to_string(), pod_name.to_string());
-                    selector
-                }),
-                ports: Some(vec![k8s_openapi::api::core::v1::ServicePort {
-                    name: Some("ssh".to_string()),
-                    port: 22,
-                    target_port: Some(k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(2222)),
-                    node_port: Some(ssh_port as i32),
-                    protocol: Some("TCP".to_string()),
-                    ..Default::default()
-                }]),
-                type_: Some("LoadBalancer".to_string()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        let pp = PostParams::default();
-        services.create(&pp, &service).await
-            .map_err(|e| format!("Failed to create service: {}", e))?;
-
-        info!("Created NodePort service {} on port {}", service_name, ssh_port);
-        Ok(())
-    }
 
     // Function to send access event from the service (secure)
     async fn send_pod_access_event_from_service(
