@@ -311,8 +311,8 @@ impl PodManager {
             name: "ssh-server".to_string(),
             image: Some(image.to_string()),
             ports: Some(vec![ContainerPort {
-                container_port: ssh_port as i32, // SSH port inside container matches allocated port
-                host_port: Some(ssh_port as i32), // External port matches container port (required for host networking)
+                container_port: 2222, // SSH listens on port 2222 inside container (linuxserver default)
+                host_port: Some(ssh_port as i32), // Map to unique host port
                 name: Some("ssh".to_string()),
                 protocol: Some("TCP".to_string()),
                 ..Default::default()
@@ -351,7 +351,7 @@ impl PodManager {
                 volumes: None,
                 restart_policy: Some("Never".to_string()),
                 active_deadline_seconds: Some(duration_seconds as i64), // Kubernetes will auto-terminate after this time
-                host_network: Some(true), // Use host networking for direct port access
+                host_network: Some(false), // Use hostPort instead of host networking
                 ..Default::default()
             }),
             ..Default::default()
@@ -361,8 +361,17 @@ impl PodManager {
         let pp = PostParams::default();
         pods.create(&pp, &pod).await.map_err(|e| format!("Failed to create pod: {}", e))?;
 
-        // With host networking, the port is directly accessible on the host
-        // No service needed - SSH is accessible at <host-ip>:<allocated-port>
+        // Wait for pod to be ready
+        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+
+        // Create a NodePort service for reliable access
+        let _ = Self::create_ssh_service(
+            &self.client,
+            namespace,
+            &pod_name,
+            ssh_port,
+        ).await;
+
         let node_port = ssh_port; // The allocated port is directly accessible
 
         info!(
@@ -387,6 +396,103 @@ impl PodManager {
         ).await;
 
         Ok(node_port)
+    }
+
+    // Set up port forwarding for SSH access
+    async fn setup_port_forward(
+        namespace: &str,
+        pod_name: &str,
+        ssh_port: u16,
+    ) -> Result<(), String> {
+        use std::process::Command;
+        use std::thread;
+        use std::time::Duration;
+
+        // Start port forwarding in a separate thread
+        let namespace = namespace.to_string();
+        let pod_name = pod_name.to_string();
+        
+        thread::spawn(move || {
+            let mut cmd = Command::new("kubectl");
+            cmd.args(&[
+                "port-forward",
+                &format!("pod/{}", pod_name),
+                &format!("0.0.0.0:{}:2222", ssh_port), // Bind to all interfaces
+                "-n", &namespace,
+            ]);
+            
+            info!("Starting port forward: 0.0.0.0:{}:2222 for pod {}", ssh_port, pod_name);
+            
+            // Run port forward command
+            match cmd.spawn() {
+                Ok(mut child) => {
+                    info!("Port forward started for pod {} on port {}", pod_name, ssh_port);
+                    let _ = child.wait();
+                }
+                Err(e) => {
+                    error!("Failed to start port forward for pod {}: {}", pod_name, e);
+                }
+            }
+        });
+
+        // Give port forward time to start
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        
+        Ok(())
+    }
+
+    // Create a NodePort service for SSH access
+    async fn create_ssh_service(
+        client: &kube::Client,
+        namespace: &str,
+        pod_name: &str,
+        ssh_port: u16,
+    ) -> Result<(), String> {
+        use k8s_openapi::api::core::v1::Service;
+        use kube::api::PostParams;
+        use kube::Api;
+
+        let services: Api<Service> = Api::namespaced(client.clone(), namespace);
+        
+        let service_name = format!("{}-ssh", pod_name);
+        
+        let service = Service {
+            metadata: kube::core::ObjectMeta {
+                name: Some(service_name.clone()),
+                labels: Some({
+                    let mut labels = std::collections::BTreeMap::new();
+                    labels.insert("app".to_string(), "paygress-ssh-pod".to_string());
+                    labels.insert("pod-name".to_string(), pod_name.to_string());
+                    labels
+                }),
+                ..Default::default()
+            },
+            spec: Some(k8s_openapi::api::core::v1::ServiceSpec {
+                selector: Some({
+                    let mut selector = std::collections::BTreeMap::new();
+                    selector.insert("pod-name".to_string(), pod_name.to_string());
+                    selector
+                }),
+                ports: Some(vec![k8s_openapi::api::core::v1::ServicePort {
+                    name: Some("ssh".to_string()),
+                    port: 22,
+                    target_port: Some(k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(2222)),
+                    node_port: Some(ssh_port as i32),
+                    protocol: Some("TCP".to_string()),
+                    ..Default::default()
+                }]),
+                type_: Some("LoadBalancer".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let pp = PostParams::default();
+        services.create(&pp, &service).await
+            .map_err(|e| format!("Failed to create service: {}", e))?;
+
+        info!("Created NodePort service {} on port {}", service_name, ssh_port);
+        Ok(())
     }
 
     // Function to send access event from the service (secure)
@@ -610,16 +716,79 @@ impl SidecarState {
         }
     }
 
+    // Check if port is in use by checking netstat or ss command
+    pub fn is_port_in_use(&self, port: u16) -> bool {
+        use std::process::Command;
+        
+        // Try netstat first
+        let netstat_result = Command::new("netstat")
+            .args(&["-tlnp"])
+            .output();
+            
+        if let Ok(output) = netstat_result {
+            let output_str = String::from_utf8_lossy(&output.stdout);
+            // Check for both :port and :port  patterns
+            if output_str.contains(&format!(":{} ", port)) || 
+               output_str.contains(&format!(":{}:", port)) ||
+               output_str.contains(&format!(":{}", port)) {
+                return true;
+            }
+        }
+        
+        // Fallback to ss command
+        let ss_result = Command::new("ss")
+            .args(&["-tlnp"])
+            .output();
+            
+        if let Ok(output) = ss_result {
+            let output_str = String::from_utf8_lossy(&output.stdout);
+            if output_str.contains(&format!(":{} ", port)) || 
+               output_str.contains(&format!(":{}:", port)) ||
+               output_str.contains(&format!(":{}", port)) {
+                return true;
+            }
+        }
+        
+        // Also check if port is in use by trying to bind to it
+        use std::net::{TcpListener, SocketAddr};
+        let addr = SocketAddr::from(([0, 0, 0, 0], port));
+        match TcpListener::bind(addr) {
+            Ok(_) => false, // Port is available
+            Err(_) => true, // Port is in use
+        }
+    }
+
+    // Find next available port starting from a given port
+    pub fn find_next_available_port(&self, start_port: u16, max_attempts: u16) -> Result<u16, String> {
+        for port in start_port..start_port + max_attempts {
+            if !self.is_port_in_use(port) {
+                return Ok(port);
+            }
+        }
+        Err(format!("No available ports found in range {}-{}", start_port, start_port + max_attempts - 1))
+    }
+
     // Generate unique SSH port for each pod from the port pool with validation
     pub fn generate_ssh_port(&self) -> Result<u16, String> {
         let mut port_pool = self.port_pool.lock().map_err(|e| format!("Failed to lock port pool: {}", e))?;
+        
+        // First, clean up any ports that are marked as allocated but are actually free
+        let allocated_ports: Vec<u16> = port_pool.allocated_ports.iter().cloned().collect();
+        for port in allocated_ports {
+            if !self.is_port_in_use(port) {
+                // Port is actually free, move it back to available
+                port_pool.allocated_ports.remove(&port);
+                port_pool.available_ports.insert(port);
+                info!("Port {} was marked allocated but is actually free - moving back to available", port);
+            }
+        }
         
         // Try to find an available port that's actually free
         let available_ports: Vec<u16> = port_pool.available_ports.iter().cloned().collect();
         
         for port in available_ports {
-            // Validate port is actually available on the system
-            if self.validate_port_available(port).is_ok() {
+            // Double-check if port is actually available on the system
+            if !self.is_port_in_use(port) {
                 // Port is free, allocate it
                 port_pool.available_ports.remove(&port);
                 port_pool.allocated_ports.insert(port);
@@ -632,6 +801,21 @@ impl SidecarState {
                 port_pool.available_ports.remove(&port);
                 port_pool.allocated_ports.insert(port);
                 warn!("Port {} was marked available but is actually in use - removing from pool", port);
+            }
+        }
+        
+        // If no ports in pool, try to find any available port in range
+        let start_port = self.config.ssh_port_range_start;
+        let end_port = self.config.ssh_port_range_end;
+        
+        for port in start_port..=end_port {
+            if !self.is_port_in_use(port) {
+                // Found an available port outside the pool
+                port_pool.allocated_ports.insert(port);
+                
+                info!("Allocated port {} outside pool ({} available, {} allocated)", 
+                      port, port_pool.available_count(), port_pool.allocated_count());
+                return Ok(port);
             }
         }
         
