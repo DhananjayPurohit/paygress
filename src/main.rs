@@ -2,14 +2,15 @@ use paygress::sidecar_service::{start_sidecar_service, SidecarConfig};
 use paygress::nostr::{
     default_relay_config, custom_relay_config, NostrRelaySubscriber, 
     OfferEventContent, EncryptedSpawnPodRequest, EncryptedTopUpPodRequest,
-    create_encrypted_provisioning_request, decrypt_provisioning_request
+    parse_private_message_content
 };
 use paygress::sidecar_service::{SidecarState, PodInfo};
 use chrono::Utc;
 use std::env;
 use tracing_subscriber::fmt::init;
+use nostr_sdk;
+use axum::http::StatusCode;
 use tracing::info;
-use kube::Client;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -25,15 +26,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cashu_db_path,
         pod_namespace: env::var("POD_NAMESPACE")
             .unwrap_or_else(|_| "user-workloads".to_string()),
-        payment_rate_sats_per_hour: env::var("PAYMENT_RATE_SATS_PER_HOUR")
+        payment_rate_msats_per_sec: env::var("PAYMENT_RATE_MSATS_PER_SEC")
             .unwrap_or_else(|_| "100".to_string())
             .parse()
             .unwrap_or(100),
-        default_pod_duration_minutes: env::var("DEFAULT_POD_DURATION_MINUTES")
+        minimum_pod_duration_seconds: env::var("MINIMUM_POD_DURATION_SECONDS")
             .unwrap_or_else(|_| "60".to_string())
             .parse()
             .unwrap_or(60),
-        ssh_base_image: env::var("SSH_BASE_IMAGE")
+        base_image: env::var("BASE_IMAGE")
             .unwrap_or_else(|_| "linuxserver/openssh-server:latest".to_string()),
         ssh_host: env::var("SSH_HOST")
             .unwrap_or_else(|_| "localhost".to_string()),
@@ -63,8 +64,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("🔧 RUN_MODE comparison: nostr == '{}' -> {}", run_mode, run_mode == "nostr");
 
     if run_mode.trim() == "nostr" {
-        println!("🚀 Starting in Nostr mode with encryption...");
-        run_encrypted_nostr_mode(config).await?;
+        println!("🚀 Starting in Nostr mode with private messaging...");
+        run_private_message_nostr_mode(config).await?;
     } else {
         println!("🌐 Starting in HTTP mode...");
         start_sidecar_service(&bind_addr, config).await?;
@@ -73,7 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn run_encrypted_nostr_mode(config: SidecarConfig) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_private_message_nostr_mode(config: SidecarConfig) -> Result<(), Box<dyn std::error::Error>> {
     let state = SidecarState::new(config.clone()).await?;
 
     // Pod cleanup is now handled by Kubernetes TTL annotations
@@ -85,64 +86,70 @@ async fn run_encrypted_nostr_mode(config: SidecarConfig) -> Result<(), Box<dyn s
 
     // Publish an initial offer
     let offer = OfferEventContent {
-        kind: "offer".into(),
-        rate_sats_per_hour: config.payment_rate_sats_per_hour,
-        default_duration_minutes: config.default_pod_duration_minutes,
-        pod_namespace: config.pod_namespace.clone(),
-        image: config.ssh_base_image.clone(),
+        rate_msats_per_sec: config.payment_rate_msats_per_sec,
+        minimum_duration_seconds: config.minimum_pod_duration_seconds,
+        memory_mb: 1024, // 1GB memory
+        cpu_millicores: 1000, // 1 CPU core
+        whitelisted_mints: config.whitelisted_mints.clone(),
     };
-    let _ = nostr.publish_offer(offer).await;
+    match nostr.publish_offer(offer).await {
+        Ok(event_id) => {
+            println!("✅ Published offer event: {}", event_id);
+        }
+        Err(e) => {
+            println!("❌ Failed to publish offer event: {}", e);
+        }
+    }
 
-    // Subscribe and handle encrypted provisioning requests (kind 1000)
+    // Subscribe and handle private messages for provisioning and top-up requests
     let nostr_clone = nostr.clone();
     let handler = move |event: paygress::nostr::NostrEvent| {
         let state_clone = state.clone();
         let nostr_clone = nostr_clone.clone();
         Box::pin(async move {
-            // Check if event is encrypted
-            // if !nostr_clone.is_encrypted_event(&event) {
-            //     tracing::warn!("Received unencrypted event, ignoring for security");
-            //     return Ok(());
-            // }
+            // Check if event is a private message
+            if !nostr_clone.is_private_message(&event) {
+                tracing::warn!("Received non-private message event, ignoring for security");
+                return Ok(());
+            }
 
-            // Decrypt the event content
-            let decrypted_content = match nostr_clone.decrypt_event_content(&event) {
+            // Get the content from private message (already decrypted by client)
+            let message_content = match nostr_clone.get_private_message_content(&event) {
                 Ok(content) => content,
                 Err(e) => {
-                    tracing::warn!("Failed to decrypt event content: {}", e);
+                    tracing::warn!("Failed to get private message content: {}", e);
                     return Ok(());
                 }
             };
 
-            // Parse the decrypted request based on event kind
-            if event.kind == 1000 {
-                // Pod creation request
-                let request: Result<EncryptedSpawnPodRequest, _> = serde_json::from_str(&decrypted_content);
-                let request = match request {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::warn!("Invalid decrypted spawn request content: {}", e);
-                        return Ok(());
-                    }
-                };
-                
-                handle_spawn_pod_request(state_clone, request, &event.pubkey).await?;
-            } else if event.kind == 1002 {
-                // Top-up request
-                let request: Result<EncryptedTopUpPodRequest, _> = serde_json::from_str(&decrypted_content);
-                let request = match request {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::warn!("Invalid decrypted top-up request content: {}", e);
-                        return Ok(());
-                    }
-                };
-                
-                handle_top_up_request(state_clone, request).await?;
-            } else {
-                tracing::warn!("Unsupported event kind: {}", event.kind);
-                return Ok(());
+            // Debug: Log the received message content
+            tracing::debug!("Received message content: {}", message_content);
+
+            // Try to parse as pod creation request first
+            match parse_private_message_content(&message_content) {
+                Ok(request) => {
+                    tracing::info!("Successfully parsed as pod creation request");
+                    handle_spawn_pod_request(state_clone, request, &event.pubkey).await?;
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::debug!("Failed to parse as pod creation request: {}", e);
+                }
             }
+
+            // Try to parse as top-up request
+            match serde_json::from_str::<EncryptedTopUpPodRequest>(&message_content) {
+                Ok(request) => {
+                    tracing::info!("Successfully parsed as top-up request");
+                    handle_top_up_request(state_clone, request).await?;
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::debug!("Failed to parse as top-up request: {}", e);
+                }
+            }
+
+            tracing::warn!("Could not parse private message content as valid request. Content: {}", message_content);
 
             Ok(())
         }) as std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>>
@@ -160,20 +167,24 @@ async fn handle_spawn_pod_request(
     user_pubkey: &str,
 ) -> Result<(), anyhow::Error> {
     // Decode token to get amount and duration
-    let payment_amount_sats = match paygress::sidecar_service::extract_token_value(&request.cashu_token).await {
-        Ok(s) => s,
+    let payment_amount_msats = match paygress::sidecar_service::extract_token_value(&request.cashu_token).await {
+        Ok(msats) => msats,
         Err(e) => {
             tracing::warn!("Failed token decode: {}", e);
             return Ok(());
         }
     };
-    // Calculate duration based on payment only
-    let duration_minutes = state_clone.calculate_duration_from_payment(payment_amount_sats);
-
-    if duration_minutes == 0 { 
-        tracing::warn!("Invalid duration: 0 minutes");
+    // Check if payment is sufficient for minimum duration
+    if !state_clone.is_payment_sufficient(payment_amount_msats) {
+        tracing::warn!("Insufficient payment: {} msats (minimum required: {} msats for {} seconds)", 
+            payment_amount_msats, 
+            state_clone.config.minimum_pod_duration_seconds * state_clone.config.payment_rate_msats_per_sec,
+            state_clone.config.minimum_pod_duration_seconds);
         return Ok(());
     }
+
+    // Calculate duration based on payment only
+    let duration_seconds = state_clone.calculate_duration_from_payment(payment_amount_msats);
 
     // Verify token validity (1 msat sanity)
     match paygress::cashu::verify_cashu_token(&request.cashu_token, 1, &state_clone.config.whitelisted_mints).await {
@@ -181,45 +192,60 @@ async fn handle_spawn_pod_request(
         _ => { return Ok(()); }
     }
 
-    // Prepare pod attributes
-    let pod_name = format!("ssh-pod-{}", uuid::Uuid::new_v4().to_string()[..8].to_string());
-    let username = request.ssh_username.unwrap_or_else(|| format!("user-{}", &pod_name[8..16]));
-    let password = SidecarState::generate_password();
-    let image = request.pod_image.unwrap_or_else(|| state_clone.config.ssh_base_image.clone());
-    let ssh_port = state_clone.generate_ssh_port();
+    // Generate NPUB first and use it as pod name
+    let pod_keys = nostr_sdk::Keys::generate();
+    let pod_npub = pod_keys.public_key().to_hex();
+    let pod_nsec = pod_keys.secret_key().unwrap().to_secret_hex();
+    
+    // Create Kubernetes-safe pod name from NPUB
+    let pod_name = format!("pod-{}", pod_npub.replace("npub1", "").chars().take(8).collect::<String>());
+    let username = request.ssh_username.unwrap_or_else(|| format!("user-{}", &pod_name[4..12]));
+    let password = request.ssh_password.unwrap_or_else(|| SidecarState::generate_password());
+    let image = request.pod_image.unwrap_or_else(|| state_clone.config.base_image.clone());
+    let ssh_port = match state_clone.generate_ssh_port() {
+        Ok(port) => port,
+        Err(e) => {
+            tracing::error!("Failed to allocate SSH port: {}", e);
+            return Ok(());
+        }
+    };
 
     let now = Utc::now();
-    let expires_at = now + chrono::Duration::minutes(duration_minutes as i64);
+    let expires_at = now + chrono::Duration::seconds(duration_seconds as i64);
 
     match state_clone.k8s_client.create_ssh_pod(
         &state_clone.config,
         &state_clone.config.pod_namespace,
         &pod_name,
+        &pod_npub,
+        &pod_nsec,
         &image,
         ssh_port,
         &username,
         &password,
-        duration_minutes,
+        duration_seconds,
+        1024, // 1GB memory
+        1000, // 1 CPU core
         user_pubkey, // Pass user's public key
     ).await {
-        Ok((node_port, pod_npub, pod_nsec)) => {
+        Ok(node_port) => {
             let pod_info = PodInfo {
-                pod_name: pod_name.clone(),
+                pod_npub: pod_npub.clone(),
                 namespace: state_clone.config.pod_namespace.clone(),
                 created_at: now,
                 expires_at,
                 allocated_port: ssh_port, // The allocated port from port pool (this is the SSH port)
                 ssh_username: username.clone(),
                 ssh_password: password.clone(),
-                payment_amount_sats,
-                duration_minutes,
+                payment_amount_msats,
+                duration_seconds,
                 node_port: Some(node_port),
-                nostr_public_key: pod_npub,
+                nostr_public_key: pod_npub.clone(),
                 nostr_private_key: pod_nsec,
             };
-            state_clone.active_pods.write().await.insert(pod_name.clone(), pod_info.clone());
+            state_clone.active_pods.write().await.insert(pod_npub.clone(), pod_info.clone());
 
-            info!("Pod {} created and will send its own access event", pod_name);
+            info!("Pod with NPUB {} created and access event sent by service", pod_npub);
         }
         Err(e) => {
             tracing::error!("Failed to create pod: {}", e);
@@ -234,75 +260,29 @@ async fn handle_top_up_request(
     state_clone: SidecarState,
     request: EncryptedTopUpPodRequest,
 ) -> Result<(), anyhow::Error> {
-    info!("Pod top-up request received for pod: {}", request.pod_name);
+    info!("Pod top-up request received for NPUB: {}", request.pod_npub);
 
-    // Check if pod exists
-    let mut pods = state_clone.active_pods.write().await;
-    let pod_info = match pods.get_mut(&request.pod_name) {
-        Some(pod) => pod,
-        None => {
-            tracing::warn!("Pod '{}' not found or already expired", request.pod_name);
-            return Ok(());
-        }
-    };
-
-    // Check if pod has already expired
-    let now = Utc::now();
-    if now > pod_info.expires_at {
-        // Remove expired pod from active pods
-        pods.remove(&request.pod_name);
-        tracing::warn!("Pod '{}' has already expired and cannot be extended", request.pod_name);
-        return Ok(());
-    }
-
-    // Extract payment amount from token
-    let payment_amount_sats = match paygress::sidecar_service::extract_token_value(&request.cashu_token).await {
-        Ok(sats) => sats,
-        Err(e) => {
-            tracing::warn!("Failed to decode Cashu token: {}", e);
-            return Ok(());
-        }
-    };
-
-    // Calculate additional duration from payment
-    let additional_duration_minutes = state_clone.calculate_duration_from_payment(payment_amount_sats);
+    // Store NPUB for logging before moving it
+    let pod_npub = request.pod_npub.clone();
     
-    if additional_duration_minutes == 0 {
-        tracing::warn!("Insufficient payment for top-up: {} sats", payment_amount_sats);
-        return Ok(());
+    // Convert to HTTP request format and delegate to HTTP handler
+    let top_up_request = paygress::sidecar_service::TopUpPodRequest {
+        pod_npub: request.pod_npub,
+        cashu_token: request.cashu_token,
+    };
+    
+    // Call the HTTP handler logic directly
+    let response = paygress::sidecar_service::top_up_pod_handler(state_clone, top_up_request).await;
+    
+    // Log the response for debugging
+    match response.status() {
+        StatusCode::OK => info!("✅ Top-up request processed successfully for NPUB: {}", pod_npub),
+        StatusCode::NOT_FOUND => tracing::warn!("❌ Pod with NPUB {} not found or expired", pod_npub),
+        StatusCode::PAYMENT_REQUIRED => tracing::warn!("❌ Payment verification failed for NPUB: {}", pod_npub),
+        StatusCode::INTERNAL_SERVER_ERROR => tracing::error!("❌ Internal error processing top-up for NPUB: {}", pod_npub),
+        _ => tracing::warn!("❌ Unexpected response for top-up request NPUB: {}", pod_npub),
     }
-
-    // Verify payment token validity
-    match paygress::cashu::verify_cashu_token(&request.cashu_token, 1, &state_clone.config.whitelisted_mints).await {
-        Ok(true) => {
-            info!("✅ Top-up payment verified: {} sats for {} additional minutes", payment_amount_sats, additional_duration_minutes);
-        }
-        _ => {
-            tracing::warn!("Top-up payment verification failed");
-            return Ok(());
-        }
-    }
-
-    // Extend the pod's expiration time in memory
-    let old_expires_at = pod_info.expires_at;
-    pod_info.expires_at = pod_info.expires_at + chrono::Duration::minutes(additional_duration_minutes as i64);
-    pod_info.payment_amount_sats += payment_amount_sats;
-    pod_info.duration_minutes += additional_duration_minutes;
-
-    // Update the pod's activeDeadlineSeconds in Kubernetes
-    if let Err(e) = state_clone.k8s_client.extend_pod_deadline(&state_clone.config.pod_namespace, &request.pod_name, additional_duration_minutes).await {
-        tracing::error!("Failed to extend pod deadline in Kubernetes: {}", e);
-        return Ok(());
-    }
-
-    info!(
-        "🔄 Pod '{}' extended: {} → {} (added {} minutes)",
-        request.pod_name,
-        old_expires_at.format("%H:%M:%S UTC"),
-        pod_info.expires_at.format("%H:%M:%S UTC"),
-        additional_duration_minutes
-    );
-
+    
     Ok(())
 }
 
