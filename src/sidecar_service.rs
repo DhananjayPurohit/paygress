@@ -450,23 +450,23 @@ impl PodManager {
         let user_pubkey_parsed = nostr_sdk::PublicKey::parse(user_pubkey)
             .map_err(|e| format!("Invalid user pubkey: {}", e))?;
         
-        // Send as kind 14 event
+        // Send as kind 15 event
         let tags = vec![
             Tag::hashtag("paygress"),
             Tag::hashtag("access_details"),
         ];
         
-        let builder = EventBuilder::new(Kind::Custom(14), access_details.to_string(), tags);
+        let builder = EventBuilder::new(Kind::Custom(15), access_details.to_string(), tags);
         let event = builder.to_event(&service_keys)
             .map_err(|e| format!("Failed to create event: {}", e))?;
         
         match client.send_event(event).await {
             Ok(event_id) => {
-                info!("Service sent access details via kind 14 event with ID: {:?}", event_id);
+                info!("Service sent access details via kind 15 event with ID: {:?}", event_id);
             }
             Err(e) => {
-                error!("Failed to send kind 14 event from service: {}", e);
-                return Err(format!("Failed to send kind 14 event: {}", e));
+                error!("Failed to send kind 15 event from service: {}", e);
+                return Err(format!("Failed to send kind 15 event: {}", e));
             }
         }
         
