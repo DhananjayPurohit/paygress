@@ -11,11 +11,10 @@ use std::sync::Arc;
 use tracing::{info, warn, error};
 use std::collections::{HashMap, BTreeMap, HashSet};
 use chrono::{DateTime, Utc};
-use nostr_sdk::{Keys, Client, Url};
-use crate::nostr::send_nip17_message_with_client;
+use nostr_sdk::{Keys, Client, Url, EventBuilder, Kind, Tag};
 use kube::{Api, api::ListParams};
 use k8s_openapi::api::core::v1::Pod;
-// Using NIP-17 private direct messages with NIP-44 encryption and NIP-59 seals/gift wraps
+// Using NIP-17 private direct messages - no manual encryption needed
 use std::sync::Mutex;
 
 use crate::{cashu, initialize_cashu};
@@ -384,6 +383,7 @@ impl PodManager {
             password,
             node_port,
             duration_seconds,
+            &config.ssh_host,
         ).await;
 
         Ok(node_port)
@@ -398,6 +398,7 @@ impl PodManager {
         password: &str,
         node_port: u16,
         duration_seconds: u64,
+        ssh_host: &str,
     ) -> Result<(), String> {
         use nostr_sdk::prelude::*;
         use std::env;
@@ -414,7 +415,7 @@ impl PodManager {
                 "🚀 SSH access available:".to_string(),
                 "".to_string(),
                 "Direct access (no kubectl needed):".to_string(),
-                format!("   ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no {}@<your-public-ip> -p {}", username, node_port),
+                format!("   ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no {}@{} -p {}", username, ssh_host, node_port),
                 "".to_string(),
                 "⚠️  Pod expires at:".to_string(),
                 format!("   {}", (Utc::now() + chrono::Duration::seconds(duration_seconds as i64)).format("%Y-%m-%d %H:%M:%S UTC")),
@@ -449,14 +450,23 @@ impl PodManager {
         let user_pubkey_parsed = nostr_sdk::PublicKey::parse(user_pubkey)
             .map_err(|e| format!("Invalid user pubkey: {}", e))?;
         
-        // Send NIP-17 message with NIP-44 encryption and NIP-59 seals/gift wraps
-        match send_nip17_message_with_client(&client, user_pubkey_parsed, access_details.to_string()).await {
+        // Send as kind 14 event
+        let tags = vec![
+            Tag::hashtag("paygress"),
+            Tag::hashtag("access_details"),
+        ];
+        
+        let builder = EventBuilder::new(Kind::Custom(14), access_details.to_string(), tags);
+        let event = builder.to_event(&service_keys)
+            .map_err(|e| format!("Failed to create event: {}", e))?;
+        
+        match client.send_event(event).await {
             Ok(event_id) => {
-                info!("Service sent access details via private message with ID: {:?}", event_id);
+                info!("Service sent access details via kind 14 event with ID: {:?}", event_id);
             }
             Err(e) => {
-                error!("Failed to send private message from service: {}", e);
-                return Err(format!("Failed to send private message: {}", e));
+                error!("Failed to send kind 14 event from service: {}", e);
+                return Err(format!("Failed to send kind 14 event: {}", e));
             }
         }
         
@@ -1183,13 +1193,13 @@ async fn get_port_forward_command(
     match pods.get(&pod_name) {
         Some(pod_info) => {
             let direct_ssh_command = format!(
-                "ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no {}@<your-public-ip> -p {}",
-                pod_info.ssh_username, pod_info.node_port.unwrap_or(pod_info.allocated_port)
+                "ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no {}@{} -p {}",
+                pod_info.ssh_username, state.config.ssh_host, pod_info.node_port.unwrap_or(pod_info.allocated_port)
             );
 
             let ssh_command = format!(
-                "ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no {}@<your-public-ip> -p {}",
-                pod_info.ssh_username, pod_info.node_port.unwrap_or(pod_info.allocated_port)
+                "ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no {}@{} -p {}",
+                pod_info.ssh_username, state.config.ssh_host, pod_info.node_port.unwrap_or(pod_info.allocated_port)
             );
 
             let response = serde_json::json!({
@@ -1203,8 +1213,7 @@ async fn get_port_forward_command(
                     direct_ssh_command,
                     format!("Password: {}", pod_info.ssh_password),
                     "".to_string(),
-                    "Note: Replace <your-public-ip> with your actual public IP address".to_string(),
-                    format!("Port {} is directly accessible on your public IP", pod_info.node_port.unwrap_or(pod_info.allocated_port))
+                    format!("Port {} is directly accessible on {}", pod_info.node_port.unwrap_or(pod_info.allocated_port), state.config.ssh_host)
                 ]
             });
 

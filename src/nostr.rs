@@ -1,6 +1,6 @@
-// Nostr client for receiving pod provisioning events with NIP-17 encrypted private messaging
+// Nostr client for receiving pod provisioning events with private messaging
 use anyhow::{Context, Result};
-use nostr_sdk::{Client, Keys, Filter, Kind, RelayPoolNotification, Url, EventBuilder, Tag, nip44};
+use nostr_sdk::{Client, Keys, Filter, Kind, RelayPoolNotification, Url, EventBuilder, Tag};
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 use std::future::Future;
@@ -77,13 +77,13 @@ impl NostrRelaySubscriber {
     where
         F: Fn(NostrEvent) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> + Send + Sync + 'static,
     {
-        // Subscribe to NIP-17 gift wraps (kind 1059) for private pod provisioning and top-up requests
+        // Subscribe to NIP-17 private direct messages (kind 14) for private pod provisioning and top-up requests
         let filter = Filter::new()
-            .kind(Kind::Custom(1059))
+            .kind(Kind::Custom(14))
             .limit(0);
 
         let _ = self.client.subscribe(vec![filter], None).await;
-        info!("Subscribed to NIP-17 gift wraps (kind 1059) for private pod provisioning and top-up requests");
+        info!("Subscribed to NIP-17 private direct messages for pod provisioning and top-up requests");
 
         // Handle incoming events
         self.client.handle_notifications(|notification| async {
@@ -143,89 +143,24 @@ impl NostrRelaySubscriber {
         // Serialize the access details
         let details_json = serde_json::to_string(&details)?;
         
-        // Send as NIP-17 private direct message with NIP-44 encryption and NIP-59 seals/gift wraps
+        // Send as NIP-17 private direct message (kind 14)
         let request_pubkey_parsed = nostr_sdk::PublicKey::parse(request_pubkey)?;
-        let event_id = self.send_nip17_message(request_pubkey_parsed, details_json).await?;
+        let event_id = self.client.send_private_msg(request_pubkey_parsed, details_json, None).await?;
         
         info!("Sent access details via private message to {}: {:?}", request_pubkey, event_id);
         Ok(event_id.to_hex())
     }
 
-    // Send NIP-17 message with NIP-44 encryption and NIP-59 seals/gift wraps
-    async fn send_nip17_message(&self, recipient: nostr_sdk::PublicKey, content: String) -> Result<nostr_sdk::EventId> {
-        use nostr_sdk::{EventBuilder, Kind, Tag};
-        
-        // Create the unsigned kind 14 message
-        let message_content = EventBuilder::new(Kind::Custom(14), content, [Tag::pubkey(recipient, None)])
-            .to_unsigned_event(self.client.keys().public_key());
-        
-        // Seal the message (kind 13) with NIP-44 encryption
-        let sealed_content = nip44::encrypt(
-            self.client.keys().secret_key(),
-            &recipient,
-            &serde_json::to_string(&message_content)?
-        )?;
-        
-        let seal = EventBuilder::new(Kind::Custom(13), sealed_content, [])
-            .to_signed_event(self.client.keys())?;
-        
-        // Gift wrap the sealed message (kind 1059)
-        let gift_wrap_keys = Keys::generate();
-        let gift_wrap_content = nip44::encrypt(
-            gift_wrap_keys.secret_key(),
-            &recipient,
-            &serde_json::to_string(&seal)?
-        )?;
-        
-        let gift_wrap = EventBuilder::new(Kind::Custom(1059), gift_wrap_content, [Tag::pubkey(recipient, None)])
-            .to_signed_event(&gift_wrap_keys)?;
-        
-        // Publish the gift wrap
-        let event_id = self.client.send_event(gift_wrap).await?;
-        
-        Ok(event_id)
-    }
 
-    // NEW: Get content from private messages (decrypt NIP-17 messages)
+    // NEW: Get content from private messages (already decrypted by client)
     pub fn get_private_message_content(&self, event: &NostrEvent) -> Result<String> {
-        // For NIP-17 messages, we need to decrypt the gift wrap content
-        if event.kind == 1059 {
-            // This is a gift wrap - decrypt it to get the sealed message
-            let decrypted_content = nip44::decrypt(
-                self.client.keys().secret_key(),
-                &event.pubkey,
-                &event.content
-            )?;
-            
-            let seal: nostr_sdk::Event = serde_json::from_str(&decrypted_content)?;
-            
-            if seal.kind == 13 {
-                // Decrypt the sealed message to get the original kind 14 message
-                let original_content = nip44::decrypt(
-                    self.client.keys().secret_key(),
-                    &seal.pubkey,
-                    &seal.content
-                )?;
-                
-                let original_message: nostr_sdk::Event = serde_json::from_str(&original_content)?;
-                
-                if original_message.kind == 14 {
-                    Ok(original_message.content)
-                } else {
-                    Err(anyhow::anyhow!("Expected kind 14 message, got kind {}", original_message.kind))
-                }
-            } else {
-                Err(anyhow::anyhow!("Expected sealed message (kind 13), got kind {}", seal.kind))
-            }
-        } else {
-            // Fallback for non-NIP-17 messages
-            Ok(event.content.clone())
-        }
+        // For direct messages, the content is already decrypted by the client
+        Ok(event.content.clone())
     }
 
-    // NEW: Check if event is a NIP-17 gift wrap
+    // NEW: Check if event is a NIP-17 private direct message
     pub fn is_private_message(&self, event: &NostrEvent) -> bool {
-        event.kind == 1059 // Kind 1059 is NIP-17 Gift Wrap
+        event.kind == 14 // Kind 14 is NIP-17 Private Direct Message
     }
 
     // NEW: Get service public key for users
@@ -308,46 +243,11 @@ pub async fn send_provisioning_request_private_message(
 ) -> Result<String> {
     let request_json = serde_json::to_string(&request)?;
     
-    // Send as NIP-17 private message with NIP-44 encryption and NIP-59 seals/gift wraps
+    // Send as private message
     let service_pubkey_parsed = nostr_sdk::PublicKey::parse(service_pubkey)?;
-    let event_id = send_nip17_message_with_client(&client, service_pubkey_parsed, request_json).await?;
+    let event_id = client.send_private_msg(service_pubkey_parsed, request_json, None).await?;
 
     Ok(event_id.to_hex())
-}
-
-// Helper function to send NIP-17 message with a client
-async fn send_nip17_message_with_client(client: &Client, recipient: nostr_sdk::PublicKey, content: String) -> Result<nostr_sdk::EventId> {
-    use nostr_sdk::{EventBuilder, Kind, Tag};
-    
-    // Create the unsigned kind 14 message
-    let message_content = EventBuilder::new(Kind::Custom(14), content, [Tag::pubkey(recipient, None)])
-        .to_unsigned_event(client.keys().public_key());
-    
-    // Seal the message (kind 13) with NIP-44 encryption
-    let sealed_content = nip44::encrypt(
-        client.keys().secret_key(),
-        &recipient,
-        &serde_json::to_string(&message_content)?
-    )?;
-    
-    let seal = EventBuilder::new(Kind::Custom(13), sealed_content, [])
-        .to_signed_event(client.keys())?;
-    
-    // Gift wrap the sealed message (kind 1059)
-    let gift_wrap_keys = Keys::generate();
-    let gift_wrap_content = nip44::encrypt(
-        gift_wrap_keys.secret_key(),
-        &recipient,
-        &serde_json::to_string(&seal)?
-    )?;
-    
-    let gift_wrap = EventBuilder::new(Kind::Custom(1059), gift_wrap_content, [Tag::pubkey(recipient, None)])
-        .to_signed_event(&gift_wrap_keys)?;
-    
-    // Publish the gift wrap
-    let event_id = client.send_event(gift_wrap).await?;
-    
-    Ok(event_id)
 }
 
 // NEW: Helper function to parse private message content
@@ -355,3 +255,4 @@ pub fn parse_private_message_content(content: &str) -> Result<EncryptedSpawnPodR
     let request: EncryptedSpawnPodRequest = serde_json::from_str(content)?;
     Ok(request)
 }
+
