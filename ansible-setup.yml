@@ -1,0 +1,378 @@
+---
+- name: Setup Ubuntu machine with Docker, Kubernetes, and Paygress
+  hosts: all
+  become: yes
+  vars:
+    kubernetes_version: "1.28"
+    containerd_version: "1.6.24"
+    paygress_user: "{{ ansible_user }}"
+    paygress_dir: "/home/{{ paygress_user }}/paygress"
+    
+  tasks:
+    # ===============================
+    # System Prerequisites
+    # ===============================
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install required packages
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+          - software-properties-common
+          - git
+          - build-essential
+          - pkg-config
+          - libssl-dev
+          - unzip
+        state: present
+
+    # ===============================
+    # Docker Installation
+    # ===============================
+    - name: Add Docker GPG key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Add Docker repository
+      apt_repository:
+        repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        state: present
+
+    - name: Install Docker
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+
+    - name: Add user to docker group
+      user:
+        name: "{{ paygress_user }}"
+        groups: docker
+        append: yes
+
+    - name: Start and enable Docker
+      systemd:
+        name: docker
+        state: started
+        enabled: yes
+
+    # ===============================
+    # Kubernetes Installation
+    # ===============================
+    - name: Add Kubernetes GPG key
+      apt_key:
+        url: https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/deb/Release.key
+        state: present
+
+    - name: Add Kubernetes repository
+      apt_repository:
+        repo: "deb https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/deb/ /"
+        state: present
+
+    - name: Install Kubernetes packages
+      apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+
+    - name: Hold Kubernetes packages
+      dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
+
+    # ===============================
+    # Configure containerd
+    # ===============================
+    - name: Create containerd config directory
+      file:
+        path: /etc/containerd
+        state: directory
+
+    - name: Generate containerd config
+      shell: containerd config default > /etc/containerd/config.toml
+
+    - name: Configure systemd cgroup driver
+      replace:
+        path: /etc/containerd/config.toml
+        regexp: 'SystemdCgroup = false'
+        replace: 'SystemdCgroup = true'
+
+    - name: Restart containerd
+      systemd:
+        name: containerd
+        state: restarted
+        enabled: yes
+
+    # ===============================
+    # Kubernetes Cluster Setup
+    # ===============================
+    - name: Disable swap
+      shell: swapoff -a
+
+    - name: Remove swap from fstab
+      replace:
+        path: /etc/fstab
+        regexp: '^([^#].*?\sswap\s+sw\s+.*)$'
+        replace: '# \1'
+
+    - name: Load kernel modules
+      modprobe:
+        name: "{{ item }}"
+      loop:
+        - overlay
+        - br_netfilter
+
+    - name: Create modules-load config
+      copy:
+        content: |
+          overlay
+          br_netfilter
+        dest: /etc/modules-load.d/k8s.conf
+
+    - name: Configure sysctl for Kubernetes
+      copy:
+        content: |
+          net.bridge.bridge-nf-call-iptables = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.ipv4.ip_forward = 1
+        dest: /etc/sysctl.d/k8s.conf
+
+    - name: Apply sysctl settings
+      shell: sysctl --system
+
+    - name: Initialize Kubernetes cluster
+      shell: |
+        kubeadm init --pod-network-cidr=10.244.0.0/16 --apiserver-advertise-address={{ ansible_default_ipv4.address }}
+      register: kubeadm_init
+      ignore_errors: yes
+
+    - name: Create .kube directory
+      file:
+        path: "/home/{{ paygress_user }}/.kube"
+        state: directory
+        owner: "{{ paygress_user }}"
+        group: "{{ paygress_user }}"
+
+    - name: Copy kubeconfig
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: "/home/{{ paygress_user }}/.kube/config"
+        owner: "{{ paygress_user }}"
+        group: "{{ paygress_user }}"
+        remote_src: yes
+
+    # ===============================
+    # Install CNI (Flannel)
+    # ===============================
+    - name: Install Flannel CNI
+      become_user: "{{ paygress_user }}"
+      shell: kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+
+    - name: Remove taint from control-plane (single node setup)
+      become_user: "{{ paygress_user }}"
+      shell: kubectl taint nodes --all node-role.kubernetes.io/control-plane-
+
+    # ===============================
+    # Install Rust
+    # ===============================
+    - name: Download Rust installer
+      get_url:
+        url: https://sh.rustup.rs
+        dest: /tmp/rust-installer.sh
+        mode: '0755'
+
+    - name: Install Rust
+      become_user: "{{ paygress_user }}"
+      shell: /tmp/rust-installer.sh -y
+
+    - name: Add Rust to PATH
+      lineinfile:
+        path: "/home/{{ paygress_user }}/.bashrc"
+        line: 'export PATH="$HOME/.cargo/bin:$PATH"'
+
+    # ===============================
+    # Clone and Setup Paygress
+    # ===============================
+    - name: Remove existing paygress directory
+      file:
+        path: "{{ paygress_dir }}"
+        state: absent
+
+    - name: Clone paygress repository
+      become_user: "{{ paygress_user }}"
+      git:
+        repo: https://github.com/your-username/paygress.git  # Update with actual repo URL
+        dest: "{{ paygress_dir }}"
+        version: main
+
+    - name: Create user-workloads namespace
+      become_user: "{{ paygress_user }}"
+      shell: |
+        source ~/.cargo/env
+        kubectl create namespace user-workloads || true
+      args:
+        chdir: "{{ paygress_dir }}"
+
+    # ===============================
+    # Configure Paygress Environment
+    # ===============================
+    - name: Update paygress.env with server IP
+      become_user: "{{ paygress_user }}"
+      replace:
+        path: "{{ paygress_dir }}/paygress.env"
+        regexp: 'SSH_HOST=.*'
+        replace: 'SSH_HOST={{ ansible_default_ipv4.address }}'
+
+    - name: Update port range for production
+      become_user: "{{ paygress_user }}"
+      replace:
+        path: "{{ paygress_dir }}/paygress.env"
+        regexp: 'SSH_PORT_RANGE_START=.*'
+        replace: 'SSH_PORT_RANGE_START=30000'
+
+    - name: Update port range end for production
+      become_user: "{{ paygress_user }}"
+      replace:
+        path: "{{ paygress_dir }}/paygress.env"
+        regexp: 'SSH_PORT_RANGE_END=.*'
+        replace: 'SSH_PORT_RANGE_END=32000'
+
+    # ===============================
+    # Build and Deploy Paygress
+    # ===============================
+    - name: Build paygress service
+      become_user: "{{ paygress_user }}"
+      shell: |
+        source ~/.cargo/env
+        cargo build --release
+      args:
+        chdir: "{{ paygress_dir }}"
+
+    # ===============================
+    # Create Systemd Service
+    # ===============================
+    - name: Create paygress systemd service
+      copy:
+        content: |
+          [Unit]
+          Description=Paygress Bitcoin Payment Service
+          After=network.target docker.service
+          Requires=docker.service
+
+          [Service]
+          Type=simple
+          User={{ paygress_user }}
+          WorkingDirectory={{ paygress_dir }}
+          ExecStart={{ paygress_dir }}/target/release/paygress
+          Restart=always
+          RestartSec=10
+          Environment=PATH=/home/{{ paygress_user }}/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+
+          # Load environment variables
+          EnvironmentFile={{ paygress_dir }}/paygress.env
+
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/paygress.service
+
+    - name: Reload systemd
+      systemd:
+        daemon_reload: yes
+
+    - name: Enable paygress service
+      systemd:
+        name: paygress
+        enabled: yes
+
+    # ===============================
+    # Configure Firewall
+    # ===============================
+    - name: Install ufw
+      apt:
+        name: ufw
+        state: present
+
+    - name: Configure firewall for SSH
+      ufw:
+        rule: allow
+        port: '22'
+        proto: tcp
+
+    - name: Configure firewall for Kubernetes API
+      ufw:
+        rule: allow
+        port: '6443'
+        proto: tcp
+
+    - name: Configure firewall for paygress service
+      ufw:
+        rule: allow
+        port: '8080'
+        proto: tcp
+
+    - name: Configure firewall for SSH pod range
+      ufw:
+        rule: allow
+        port: '30000:32000'
+        proto: tcp
+
+    - name: Enable firewall
+      ufw:
+        state: enabled
+
+    # ===============================
+    # Final Setup Instructions
+    # ===============================
+    - name: Create setup completion script
+      copy:
+        content: |
+          #!/bin/bash
+          echo "🎉 Paygress setup completed!"
+          echo ""
+          echo "📋 Next steps:"
+          echo "1. Update your Nostr private key in {{ paygress_dir }}/paygress.env"
+          echo "2. Start the service: sudo systemctl start paygress"
+          echo "3. Check service status: sudo systemctl status paygress"
+          echo "4. View logs: sudo journalctl -u paygress -f"
+          echo ""
+          echo "🌐 Service will be available at:"
+          echo "   http://{{ ansible_default_ipv4.address }}:8080"
+          echo ""
+          echo "🔐 SSH pods will be accessible at:"
+          echo "   ssh user@{{ ansible_default_ipv4.address }} -p <allocated-port>"
+          echo ""
+          echo "📁 Paygress directory: {{ paygress_dir }}"
+          echo "⚙️  Configuration file: {{ paygress_dir }}/paygress.env"
+        dest: "/home/{{ paygress_user }}/setup-complete.sh"
+        mode: '0755'
+        owner: "{{ paygress_user }}"
+        group: "{{ paygress_user }}"
+
+  handlers:
+    - name: restart docker
+      systemd:
+        name: docker
+        state: restarted
+
+    - name: restart kubelet
+      systemd:
+        name: kubelet
+        state: restarted

@@ -311,8 +311,8 @@ impl PodManager {
             name: "ssh-server".to_string(),
             image: Some(image.to_string()),
             ports: Some(vec![ContainerPort {
-                container_port: 22, // SSH listens on port 22 inside container
-                host_port: Some(ssh_port as i32), // Map to unique host port (2222, 2223, 2224, etc.)
+                container_port: 2222, // SSH listens on port 2222 inside container (linuxserver default)
+                host_port: Some(ssh_port as i32), // Map to unique host port (2447, 2448, 2449, etc.)
                 name: Some("ssh".to_string()),
                 protocol: Some("TCP".to_string()),
                 ..Default::default()
