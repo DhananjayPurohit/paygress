@@ -4,6 +4,7 @@ use paygress::nostr::{
     OfferEventContent, EncryptedSpawnPodRequest, EncryptedTopUpPodRequest,
     parse_private_message_content
 };
+use nostr_sdk::prelude::*; // Import nostr traits including ToBech32
 use paygress::sidecar_service::{SidecarState, PodInfo};
 use chrono::Utc;
 use std::env;
@@ -84,6 +85,10 @@ async fn run_private_message_nostr_mode(config: SidecarConfig) -> Result<(), Box
     let relay_cfg = get_relay_config();
     let nostr = NostrRelaySubscriber::new(relay_cfg).await?;
 
+    // Get server's public key for the offer
+    let server_keys = nostr_sdk::Keys::parse(&env::var("NOSTR_PRIVATE_KEY")?)?;
+    let server_pubkey = server_keys.public_key().to_bech32()?; // Use npub format for better compatibility
+    
     // Publish an initial offer
     let offer = OfferEventContent {
         rate_msats_per_sec: config.payment_rate_msats_per_sec,
@@ -91,6 +96,7 @@ async fn run_private_message_nostr_mode(config: SidecarConfig) -> Result<(), Box
         memory_mb: 1024, // 1GB memory
         cpu_millicores: 1000, // 1 CPU core
         whitelisted_mints: config.whitelisted_mints.clone(),
+        server_pubkey, // Include server's public key
     };
     match nostr.publish_offer(offer).await {
         Ok(event_id) => {

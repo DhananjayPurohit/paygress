@@ -1,10 +1,11 @@
 // Nostr client for receiving pod provisioning events with private messaging
 use anyhow::{Context, Result};
-use nostr_sdk::{Client, Keys, Filter, Kind, RelayPoolNotification, Url, EventBuilder, Tag};
+use nostr_sdk::{Client, Keys, Filter, Kind, RelayPoolNotification, Url, EventBuilder, Tag, EventId};
+use nostr_sdk::nips::nip59::UnwrappedGift;
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 use std::future::Future;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[derive(Clone, Debug)]
 pub struct RelayConfig {
@@ -77,25 +78,55 @@ impl NostrRelaySubscriber {
     where
         F: Fn(NostrEvent) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> + Send + Sync + 'static,
     {
-        // Subscribe to NIP-17 private direct messages (kind 14) for private pod provisioning and top-up requests
+        // Subscribe to Gift Wrap messages (NIP-17) for private pod provisioning and top-up requests
         let filter = Filter::new()
-            .kind(Kind::Custom(14))
-            .limit(0);
+            .kind(Kind::GiftWrap)
+            .pubkey(self.keys.public_key())
+            .limit(0); // Only new events
 
         let _ = self.client.subscribe(vec![filter], None).await;
-        info!("Subscribed to NIP-17 private direct messages for pod provisioning and top-up requests");
+        info!("Subscribed to Gift Wrap messages for pod provisioning and top-up requests");
 
         // Handle incoming events
+        let client = &self.client;
         self.client.handle_notifications(|notification| async {
             if let RelayPoolNotification::Event { relay_url: _, subscription_id: _, event } = notification {
-                let nostr_event = self.convert_event(&event);
-                
-                match handler(nostr_event).await {
-                    Ok(()) => {
-                        info!("Successfully processed private message: {}", event.id);
-                    }
-                    Err(e) => {
-                        error!("Failed to process private message {}: {}", event.id, e);
+                // Check if it's a Gift Wrap message
+                if event.kind == Kind::GiftWrap {
+                    info!("Received Gift Wrap message: {}", event.id);
+                    
+                    // Unwrap the gift wrap
+                    match client.unwrap_gift_wrap(&event).await {
+                        Ok(unwrapped) => {
+                            if unwrapped.rumor.kind == Kind::PrivateDirectMessage {
+                                info!("Unwrapped private message from {}: {}", unwrapped.sender, unwrapped.rumor.content);
+                                
+                                // Convert the rumor to our NostrEvent format
+                                let nostr_event = NostrEvent {
+                                    id: unwrapped.rumor.id.expect("Event should have ID").to_hex(),
+                                    pubkey: unwrapped.sender.to_hex(),
+                                    created_at: unwrapped.rumor.created_at.as_u64(),
+                                    kind: unwrapped.rumor.kind.as_u32(),
+                                    tags: unwrapped.rumor.tags.iter().map(|tag| {
+                                        tag.as_vec().iter().map(|s| s.to_string()).collect()
+                                    }).collect(),
+                                    content: unwrapped.rumor.content,
+                                    sig: String::new(), // Gift wrap doesn't preserve original signature
+                                };
+                                
+                                match handler(nostr_event).await {
+                                    Ok(()) => {
+                                        info!("Successfully processed private message: {}", event.id);
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to process private message {}: {}", event.id, e);
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Failed to unwrap gift wrap message: {}", e);
+                        }
                     }
                 }
             }
@@ -134,7 +165,7 @@ impl NostrRelaySubscriber {
         }
     }
 
-    // NEW: Send access details via private message
+    // NEW: Send access details via gift wrap private message
     pub async fn send_access_details_private_message(
         &self, 
         request_pubkey: &str,
@@ -143,7 +174,7 @@ impl NostrRelaySubscriber {
         // Serialize the access details
         let details_json = serde_json::to_string(&details)?;
         
-        // Send as NIP-17 private direct message (kind 14)
+        // Send as NIP-17 gift wrap private message
         let request_pubkey_parsed = nostr_sdk::PublicKey::parse(request_pubkey)?;
         let event_id = self.client.send_private_msg(request_pubkey_parsed, details_json, None).await?;
         
@@ -160,7 +191,7 @@ impl NostrRelaySubscriber {
 
     // NEW: Check if event is a NIP-17 private direct message
     pub fn is_private_message(&self, event: &NostrEvent) -> bool {
-        event.kind == 14 // Kind 14 is NIP-17 Private Direct Message
+        event.kind == 14 // Kind 14 is Private Direct Message (from unwrapped gift wrap)
     }
 
     // NEW: Get service public key for users
@@ -205,6 +236,7 @@ pub struct OfferEventContent {
     pub memory_mb: u64, // Memory in MB
     pub cpu_millicores: u64, // CPU in millicores (1000 millicores = 1 CPU core)
     pub whitelisted_mints: Vec<String>,
+    pub server_pubkey: String, // Server's public key (npub) for client encryption
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

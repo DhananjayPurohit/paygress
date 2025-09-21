@@ -11,7 +11,7 @@ use std::sync::Arc;
 use tracing::{info, warn, error};
 use std::collections::{HashMap, BTreeMap, HashSet};
 use chrono::{DateTime, Utc};
-use nostr_sdk::{Keys, Client, Url, EventBuilder, Kind, Tag};
+// Nostr imports removed - handled in main.rs and nostr.rs
 use kube::{Api, api::ListParams};
 use k8s_openapi::api::core::v1::Pod;
 // Using NIP-17 private direct messages - no manual encryption needed
