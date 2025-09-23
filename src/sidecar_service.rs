@@ -377,17 +377,8 @@ impl PodManager {
             "Created SSH pod with service"
         );
 
-        // Send access event from the service (not the pod) for security
-        let _ = Self::send_pod_access_event_from_service(
-            &pod_npub,
-            user_pubkey,
-            &pod_name,
-            username,
-            password,
-            node_port,
-            duration_seconds,
-            &config.ssh_host,
-        ).await;
+        // Access details are now sent via NIP-17 Gift Wrap private messages from main.rs
+        // No need to send public kind 15 events anymore
 
         Ok(node_port)
     }
@@ -436,89 +427,6 @@ impl PodManager {
     }
 
 
-    // Function to send access event from the service (secure)
-    async fn send_pod_access_event_from_service(
-        pod_npub: &str,
-        user_pubkey: &str,
-        _pod_name: &str,
-        username: &str,
-        password: &str,
-        node_port: u16,
-        duration_seconds: u64,
-        ssh_host: &str,
-    ) -> Result<(), String> {
-        use nostr_sdk::prelude::*;
-        use std::env;
-        
-        // Create access details
-        let access_details = serde_json::json!({
-            "kind": "access_details",
-            "pod_npub": pod_npub,        // Use NPUB instead of pod_name
-            "ssh_username": username,
-            "ssh_password": password,
-            "node_port": node_port,
-            "expires_at": (Utc::now() + chrono::Duration::seconds(duration_seconds as i64)).to_rfc3339(),
-            "instructions": vec![
-                "🚀 SSH access available:".to_string(),
-                "".to_string(),
-                "Direct access (no kubectl needed):".to_string(),
-                format!("   ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no {}@{} -p {}", username, ssh_host, node_port),
-                "".to_string(),
-                "⚠️  Pod expires at:".to_string(),
-                format!("   {}", (Utc::now() + chrono::Duration::seconds(duration_seconds as i64)).format("%Y-%m-%d %H:%M:%S UTC")),
-                "".to_string(),
-                "📋 Pod Details:".to_string(),
-                format!("   Pod NPUB: {}", pod_npub),
-                format!("   Duration: {} seconds", duration_seconds),
-            ]
-        });
-
-        // Get service keys from environment
-        let service_nsec = env::var("NOSTR_PRIVATE_KEY")
-            .map_err(|_| "NOSTR_PRIVATE_KEY not found in environment")?;
-        let service_keys = Keys::parse(&service_nsec)
-            .map_err(|e| format!("Invalid service nsec: {}", e))?;
-        
-        let client = Client::new(&service_keys);
-        
-        // Add relays
-        let relay_urls = env::var("NOSTR_RELAYS")
-            .unwrap_or_else(|_| "wss://relay.damus.io,wss://nos.lol,wss://relay.nostr.band".to_string());
-        for relay_url in relay_urls.split(',') {
-            let relay = relay_url.trim();
-            if !relay.is_empty() {
-                let _ = client.add_relay(relay).await;
-            }
-        }
-        
-        client.connect().await;
-        
-        // Parse user public key
-        let user_pubkey_parsed = nostr_sdk::PublicKey::parse(user_pubkey)
-            .map_err(|e| format!("Invalid user pubkey: {}", e))?;
-        
-        // Send as kind 15 event
-        let tags = vec![
-            Tag::hashtag("paygress"),
-            Tag::hashtag("access_details"),
-        ];
-        
-        let builder = EventBuilder::new(Kind::Custom(15), access_details.to_string(), tags);
-        let event = builder.to_event(&service_keys)
-            .map_err(|e| format!("Failed to create event: {}", e))?;
-        
-        match client.send_event(event).await {
-            Ok(event_id) => {
-                info!("Service sent access details via kind 15 event with ID: {:?}", event_id);
-            }
-            Err(e) => {
-                error!("Failed to send kind 15 event from service: {}", e);
-                return Err(format!("Failed to send kind 15 event: {}", e));
-            }
-        }
-        
-        Ok(())
-    }
 
 
     pub async fn delete_pod(&self, namespace: &str, pod_name: &str) -> Result<(), String> {

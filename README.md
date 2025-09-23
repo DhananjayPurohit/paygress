@@ -321,7 +321,7 @@ echo "Public key: $NPUB"
 ### Create NIP-17 Private Direct Message Request
 ```bash
 # Create your request JSON
-REQUEST_JSON='{"cashu_token":"<YOUR_CASHU_TOKEN>","ssh_username":"alice",ssh_password":"my_ssh_password","pod_image":"linuxserver/openssh-server:latest"}'
+REQUEST_JSON='{"cashu_token":"<YOUR_CASHU_TOKEN>","ssh_username":"alice","ssh_password":"my_ssh_password","pod_image":"linuxserver/openssh-server:latest"}'
 
 # Get the service's public key from logs (you'll need this for NIP-17 private direct messages)
 # Check service logs to find the service public key:

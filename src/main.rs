@@ -129,11 +129,11 @@ async fn run_private_message_nostr_mode(config: SidecarConfig) -> Result<(), Box
             match parse_private_message_content(&message_content) {
                 Ok(request) => {
                     tracing::info!("Successfully parsed as pod creation request");
-                    handle_spawn_pod_request(state_clone, request, &event.pubkey).await?;
+                    handle_spawn_pod_request(state_clone, request, &event.pubkey, nostr_clone.clone()).await?;
                     return Ok(());
                 }
                 Err(e) => {
-                    tracing::debug!("Failed to parse as pod creation request: {}", e);
+                    tracing::warn!("Failed to parse as pod creation request: {}", e);
                 }
             }
 
@@ -165,6 +165,7 @@ async fn handle_spawn_pod_request(
     state_clone: SidecarState,
     request: EncryptedSpawnPodRequest,
     user_pubkey: &str,
+    nostr_client: paygress::nostr::NostrRelaySubscriber,
 ) -> Result<(), anyhow::Error> {
     // Decode token to get amount and duration
     let payment_amount_msats = match paygress::sidecar_service::extract_token_value(&request.cashu_token).await {
@@ -194,13 +195,13 @@ async fn handle_spawn_pod_request(
 
     // Generate NPUB first and use it as pod name
     let pod_keys = nostr_sdk::Keys::generate();
-    let pod_npub = pod_keys.public_key().to_hex();
+    let pod_npub = pod_keys.public_key().to_bech32().unwrap();
     let pod_nsec = pod_keys.secret_key().unwrap().to_secret_hex();
     
-    // Create Kubernetes-safe pod name from NPUB
+    // Create Kubernetes-safe pod name from NPUB (take first 8 chars after npub1 prefix)
     let pod_name = format!("pod-{}", pod_npub.replace("npub1", "").chars().take(8).collect::<String>());
-    let username = request.ssh_username.unwrap_or_else(|| format!("user-{}", &pod_name[4..12]));
-    let password = request.ssh_password.unwrap_or_else(|| SidecarState::generate_password());
+    let username = request.ssh_username;
+    let password = request.ssh_password;
     let image = request.pod_image.unwrap_or_else(|| state_clone.config.base_image.clone());
     let ssh_port = match state_clone.generate_ssh_port() {
         Ok(port) => port,
@@ -245,7 +246,40 @@ async fn handle_spawn_pod_request(
             };
             state_clone.active_pods.write().await.insert(pod_npub.clone(), pod_info.clone());
 
-            info!("Pod with NPUB {} created and access event sent by service", pod_npub);
+            // Send access details via NIP-17 Gift Wrap private message
+            let access_details = paygress::nostr::AccessDetailsContent {
+                kind: "access_details".to_string(),
+                pod_name: pod_name.clone(),
+                namespace: state_clone.config.pod_namespace.clone(),
+                ssh_username: username.clone(),
+                ssh_password: password.clone(),
+                node_port: Some(node_port),
+                expires_at: expires_at.to_rfc3339(),
+                instructions: vec![
+                    "🚀 SSH access available:".to_string(),
+                    "".to_string(),
+                    "Direct access (no kubectl needed):".to_string(),
+                    format!("   ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no {}@{} -p {}", username, state_clone.config.ssh_host, node_port),
+                    "".to_string(),
+                    "⚠️  Pod expires at:".to_string(),
+                    format!("   {}", expires_at.format("%Y-%m-%d %H:%M:%S UTC")),
+                    "".to_string(),
+                    "📋 Pod Details:".to_string(),
+                    format!("   Pod NPUB: {}", pod_npub),
+                    format!("   Duration: {} seconds", duration_seconds),
+                ],
+            };
+
+            match nostr_client.send_access_details_private_message(user_pubkey, access_details).await {
+                Ok(event_id) => {
+                    info!("✅ Sent access details via NIP-17 Gift Wrap private message to {}: {}", user_pubkey, event_id);
+                }
+                Err(e) => {
+                    tracing::error!("❌ Failed to send access details via private message: {}", e);
+                }
+            }
+
+            info!("Pod with NPUB {} created and access details sent via NIP-17 Gift Wrap private message", pod_npub);
         }
         Err(e) => {
             tracing::error!("Failed to create pod: {}", e);

@@ -134,7 +134,11 @@ impl NostrRelaySubscriber {
         }
     }
 
+<<<<<<< Updated upstream
     // NEW: Send access details via private message
+=======
+    // NEW: Send access details via private encrypted message (NIP-17 Gift Wrap)
+>>>>>>> Stashed changes
     pub async fn send_access_details_private_message(
         &self, 
         request_pubkey: &str,
@@ -143,11 +147,15 @@ impl NostrRelaySubscriber {
         // Serialize the access details
         let details_json = serde_json::to_string(&details)?;
         
+<<<<<<< Updated upstream
         // Send as NIP-17 private direct message (kind 14)
+=======
+        // Send as NIP-17 Gift Wrap private message
+>>>>>>> Stashed changes
         let request_pubkey_parsed = nostr_sdk::PublicKey::parse(request_pubkey)?;
         let event_id = self.client.send_private_msg(request_pubkey_parsed, details_json, None).await?;
         
-        info!("Sent access details via private message to {}: {:?}", request_pubkey, event_id);
+        info!("Sent access details via NIP-17 Gift Wrap private message to {}: {:?}", request_pubkey, event_id);
         Ok(event_id.to_hex())
     }
 
@@ -224,14 +232,14 @@ pub struct AccessDetailsContent {
 pub struct EncryptedSpawnPodRequest {
     pub cashu_token: String,
     pub pod_image: Option<String>, // Optional: Uses base image if not specified
-    pub ssh_username: Option<String>,
-    pub ssh_password: Option<String>,
+    pub ssh_username: String,
+    pub ssh_password: String,
 }
 
 // NEW: Encrypted top-up request structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EncryptedTopUpPodRequest {
-    pub pod_npub: String,    // Changed from pod_name to pod_npub
+    pub pod_npub: String,    // Pod's NPUB identifier
     pub cashu_token: String,
 }
 
@@ -252,7 +260,12 @@ pub async fn send_provisioning_request_private_message(
 
 // NEW: Helper function to parse private message content
 pub fn parse_private_message_content(content: &str) -> Result<EncryptedSpawnPodRequest> {
-    let request: EncryptedSpawnPodRequest = serde_json::from_str(content)?;
-    Ok(request)
+    match serde_json::from_str::<EncryptedSpawnPodRequest>(content) {
+        Ok(request) => Ok(request),
+        Err(e) => {
+            // Provide detailed error information
+            Err(anyhow::anyhow!("JSON parsing failed: {}. Content: '{}'", e, content))
+        }
+    }
 }
 

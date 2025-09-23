@@ -215,7 +215,7 @@ User                    Service
 ## 🎯 **Key Features**
 
 ### **✅ Encrypted Communication**
-- All requests are encrypted using NIP-04
+- All requests are encrypted using NIP-17 Gift Wrap
 - Only the service can decrypt your requests
 - Your private keys stay secure
 
