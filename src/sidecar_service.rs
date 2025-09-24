@@ -11,20 +11,19 @@ use std::sync::Arc;
 use tracing::{info, warn, error};
 use std::collections::{HashMap, BTreeMap, HashSet};
 use chrono::{DateTime, Utc};
-use nostr_sdk::{Keys, Client, Url, EventBuilder, Kind, Tag};
+// Removed unused nostr_sdk imports
 use kube::{Api, api::ListParams};
 use k8s_openapi::api::core::v1::Pod;
 // Using NIP-17 private direct messages - no manual encryption needed
 use std::sync::Mutex;
 
-use crate::{cashu, initialize_cashu};
+use crate::{cashu, initialize_cashu, nostr};
 
 // Configuration for the sidecar service
 #[derive(Clone, Debug)]
 pub struct SidecarConfig {
     pub cashu_db_path: String,
     pub pod_namespace: String,
-    pub payment_rate_msats_per_sec: u64, // Payment rate in msats per second
     pub minimum_pod_duration_seconds: u64, // Minimum pod duration in seconds
     pub base_image: String, // Base image for pods
     pub ssh_host: String, // SSH host for connections
@@ -32,6 +31,7 @@ pub struct SidecarConfig {
     pub ssh_port_range_end: u16, // End of port range for pod allocation
     pub enable_cleanup_task: bool,
     pub whitelisted_mints: Vec<String>, // Allowed Cashu mint URLs
+    pub pod_specs: Vec<nostr::PodSpec>, // Available pod specifications
 }
 
 impl Default for SidecarConfig {
@@ -39,18 +39,14 @@ impl Default for SidecarConfig {
         Self {
             cashu_db_path: "./cashu.db".to_string(),
             pod_namespace: "user-workloads".to_string(),
-            payment_rate_msats_per_sec: 100, // 100 msats per second
             minimum_pod_duration_seconds: 60, // 1 minute minimum
             base_image: "linuxserver/openssh-server:latest".to_string(),
             ssh_host: "localhost".to_string(),
             ssh_port_range_start: 30000,
             ssh_port_range_end: 31000,
             enable_cleanup_task: true,
-            whitelisted_mints: vec![
-                "https://mint.cashu.space".to_string(),
-                "https://mint.f7z.io".to_string(),
-                "https://legend.lnbits.com/cashu/api/v1".to_string(),
-            ],
+            whitelisted_mints: vec![], // Will be populated from environment variables
+            pod_specs: vec![], // Will be populated from environment variables
         }
     }
 }
@@ -526,9 +522,12 @@ impl SidecarState {
         })
     }
 
-    // Calculate duration based on payment amount (configurable pricing)
+    // Calculate duration based on payment amount (using first available spec as default)
     pub fn calculate_duration_from_payment(&self, payment_msats: u64) -> u64 {
-        let msats_per_sec = self.config.payment_rate_msats_per_sec.max(1);
+        let msats_per_sec = self.config.pod_specs.first()
+            .map(|spec| spec.rate_msats_per_sec)
+            .unwrap_or(100) // Default rate if no specs available
+            .max(1);
         
         // Calculate duration in seconds: payment_msats / msats_per_sec
         payment_msats / msats_per_sec
@@ -795,7 +794,7 @@ async fn auth_check(
     if !state.is_payment_sufficient(payment_amount_msats) {
         warn!("❌ Insufficient payment: {} msats (minimum required: {} msats for {} seconds)", 
             payment_amount_msats, 
-            state.config.minimum_pod_duration_seconds * state.config.payment_rate_msats_per_sec,
+            state.config.minimum_pod_duration_seconds * state.config.pod_specs.first().map(|s| s.rate_msats_per_sec).unwrap_or(100),
             state.config.minimum_pod_duration_seconds);
         return StatusCode::PAYMENT_REQUIRED.into_response();
     }
@@ -853,7 +852,7 @@ async fn spawn_pod_handler(
 
     // Check if payment is sufficient for minimum duration
     if !state.is_payment_sufficient(payment_amount_msats) {
-        let minimum_required = state.config.minimum_pod_duration_seconds * state.config.payment_rate_msats_per_sec;
+        let minimum_required = state.config.minimum_pod_duration_seconds * state.config.pod_specs.first().map(|s| s.rate_msats_per_sec).unwrap_or(100);
         return (StatusCode::PAYMENT_REQUIRED, Json(SpawnPodResponse {
             success: false,
             message: format!("Insufficient payment: {} msats. Minimum required: {} msats for {} seconds", 
@@ -1126,7 +1125,7 @@ pub async fn top_up_pod_handler(
         return (StatusCode::PAYMENT_REQUIRED, Json(TopUpPodResponse {
             success: false,
             message: format!("Insufficient payment: {} msats. Minimum required: {} msats for 1 second extension", 
-                payment_amount_msats, state.config.payment_rate_msats_per_sec),
+                payment_amount_msats, state.config.pod_specs.first().map(|s| s.rate_msats_per_sec).unwrap_or(100)),
             pod_info: None,
             extended_duration_seconds: None,
         })).into_response();
@@ -1267,7 +1266,10 @@ pub async fn start_sidecar_service(bind_addr: &str, config: SidecarConfig) -> Re
     
     println!("🚀 Starting Paygress Sidecar Service");
     println!("📍 Listening on: {}", bind_addr);
-    println!("💰 Payment rate: {} msats/second", config.payment_rate_msats_per_sec);
+    println!("💰 Available pod specs: {}", config.pod_specs.len());
+    for spec in &config.pod_specs {
+        println!("   - {}: {} msats/sec ({} CPU, {} MB)", spec.name, spec.rate_msats_per_sec, spec.cpu_millicores, spec.memory_mb);
+    }
     println!("⏱️  Minimum duration: {} seconds", config.minimum_pod_duration_seconds);
     println!("🔐 SSH port range: {}-{}", config.ssh_port_range_start, config.ssh_port_range_end);
     println!("📋 Endpoints:");

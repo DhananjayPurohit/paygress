@@ -1,6 +1,7 @@
 // Nostr client for receiving pod provisioning events with private messaging
 use anyhow::{Context, Result};
-use nostr_sdk::{Client, Keys, Filter, Kind, RelayPoolNotification, Url, EventBuilder, Tag};
+use nostr_sdk::{Client, Keys, Filter, Kind, RelayPoolNotification, Url, EventBuilder, Tag, ToBech32, Event};
+use nostr_sdk::nips::nip59::UnwrappedGift;
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 use std::future::Future;
@@ -22,6 +23,7 @@ pub struct NostrEvent {
     pub content: String,
     pub sig: String,
 }
+
 
 #[derive(Clone)]
 pub struct NostrRelaySubscriber {
@@ -67,8 +69,7 @@ impl NostrRelaySubscriber {
         tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
         
         info!("Connected to {} relays", config.relays.len());
-        info!("Service public key (npub): {}", keys.public_key().to_hex());
-        // Note: Private key (nsec) is not logged for security
+        info!("Service public key (npub): {}", keys.public_key().to_bech32().unwrap());
 
         Ok(Self { client, keys })
     }
@@ -77,26 +78,62 @@ impl NostrRelaySubscriber {
     where
         F: Fn(NostrEvent) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> + Send + Sync + 'static,
     {
-        // Subscribe to NIP-17 private direct messages (kind 14) for private pod provisioning and top-up requests
+        // Subscribe to NIP-17 Gift Wrap messages for private pod provisioning and top-up requests
         let filter = Filter::new()
-            .kind(Kind::Custom(14))
+            .kind(Kind::GiftWrap)
+            .pubkey(self.keys.public_key())
             .limit(0);
 
         let _ = self.client.subscribe(vec![filter], None).await;
-        info!("Subscribed to NIP-17 private direct messages for pod provisioning and top-up requests");
+        info!("Subscribed to NIP-17 Gift Wrap messages for pod provisioning and top-up requests");
 
         // Handle incoming events
         self.client.handle_notifications(|notification| async {
             if let RelayPoolNotification::Event { relay_url: _, subscription_id: _, event } = notification {
-                let nostr_event = self.convert_event(&event);
-                
-                match handler(nostr_event).await {
-                    Ok(()) => {
-                        info!("Successfully processed private message: {}", event.id);
+                // Check if this is a Gift Wrap message
+                if event.kind == Kind::GiftWrap {
+                    info!("Received Gift Wrap message: {}", event.id);
+                    
+                    // Unwrap the Gift Wrap to get the inner message
+                    match self.client.unwrap_gift_wrap(&event).await {
+                        Ok(UnwrappedGift { rumor, sender }) => {
+                            info!("Unwrapped Gift Wrap from sender: {}, rumor kind: {}", sender, rumor.kind);
+                            
+                            // Check if the rumor is a private direct message
+                            if rumor.kind == Kind::PrivateDirectMessage {
+                                info!("Received private direct message content: {}", rumor.content);
+                                
+                                // Create a NostrEvent from the unwrapped rumor
+                                let nostr_event = NostrEvent {
+                                    id: rumor.id.map(|id| id.to_hex()).unwrap_or_else(|| "unknown".to_string()),
+                                    pubkey: rumor.pubkey.to_hex(),
+                                    created_at: rumor.created_at.as_u64(),
+                                    kind: rumor.kind.as_u32(),
+                                    tags: rumor.tags.iter().map(|tag| {
+                                        tag.as_vec().iter().map(|s| s.to_string()).collect()
+                                    }).collect(),
+                                    content: rumor.content,
+                                    sig: "unsigned".to_string(), // UnsignedEvent doesn't have a signature
+                                };
+                                
+                                match handler(nostr_event).await {
+                                    Ok(()) => {
+                                        info!("Successfully processed private message: {}", event.id);
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to process private message {}: {}", event.id, e);
+                                    }
+                                }
+                            } else {
+                                info!("Rumor is not a private direct message, kind: {}", rumor.kind);
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to unwrap Gift Wrap {}: {}", event.id, e);
+                        }
                     }
-                    Err(e) => {
-                        error!("Failed to process private message {}: {}", event.id, e);
-                    }
+                } else {
+                    info!("Received non-Gift Wrap message, ignoring: {}", event.id);
                 }
             }
             Ok(false) // Continue listening
@@ -134,11 +171,7 @@ impl NostrRelaySubscriber {
         }
     }
 
-<<<<<<< Updated upstream
-    // NEW: Send access details via private message
-=======
     // NEW: Send access details via private encrypted message (NIP-17 Gift Wrap)
->>>>>>> Stashed changes
     pub async fn send_access_details_private_message(
         &self, 
         request_pubkey: &str,
@@ -147,11 +180,7 @@ impl NostrRelaySubscriber {
         // Serialize the access details
         let details_json = serde_json::to_string(&details)?;
         
-<<<<<<< Updated upstream
-        // Send as NIP-17 private direct message (kind 14)
-=======
         // Send as NIP-17 Gift Wrap private message
->>>>>>> Stashed changes
         let request_pubkey_parsed = nostr_sdk::PublicKey::parse(request_pubkey)?;
         let event_id = self.client.send_private_msg(request_pubkey_parsed, details_json, None).await?;
         
@@ -159,17 +188,41 @@ impl NostrRelaySubscriber {
         Ok(event_id.to_hex())
     }
 
-
-    // NEW: Get content from private messages (already decrypted by client)
-    pub fn get_private_message_content(&self, event: &NostrEvent) -> Result<String> {
-        // For direct messages, the content is already decrypted by the client
-        Ok(event.content.clone())
+    // NEW: Send error response via private encrypted message (NIP-17 Gift Wrap)
+    pub async fn send_error_response_private_message(
+        &self, 
+        request_pubkey: &str,
+        error: ErrorResponseContent
+    ) -> Result<String> {
+        // Serialize the error response
+        let error_json = serde_json::to_string(&error)?;
+        
+        // Send as NIP-17 Gift Wrap private message
+        let request_pubkey_parsed = nostr_sdk::PublicKey::parse(request_pubkey)?;
+        let event_id = self.client.send_private_msg(request_pubkey_parsed, error_json, None).await?;
+        
+        info!("Sent error response via NIP-17 Gift Wrap private message to {}: {:?}", request_pubkey, event_id);
+        Ok(event_id.to_hex())
     }
 
-    // NEW: Check if event is a NIP-17 private direct message
-    pub fn is_private_message(&self, event: &NostrEvent) -> bool {
-        event.kind == 14 // Kind 14 is NIP-17 Private Direct Message
+    // NEW: Send top-up response via private encrypted message (NIP-17 Gift Wrap)
+    pub async fn send_topup_response_private_message(
+        &self, 
+        request_pubkey: &str,
+        response: TopUpResponseContent
+    ) -> Result<String> {
+        // Serialize the top-up response
+        let response_json = serde_json::to_string(&response)?;
+        
+        // Send as NIP-17 Gift Wrap private message
+        let request_pubkey_parsed = nostr_sdk::PublicKey::parse(request_pubkey)?;
+        let event_id = self.client.send_private_msg(request_pubkey_parsed, response_json, None).await?;
+        
+        info!("Sent top-up response via NIP-17 Gift Wrap private message to {}: {:?}", request_pubkey, event_id);
+        Ok(event_id.to_hex())
     }
+
+
 
     // NEW: Get service public key for users
     pub fn get_service_public_key(&self) -> String {
@@ -207,31 +260,56 @@ pub fn custom_relay_config(relays: Vec<String>, private_key: Option<String>) -> 
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OfferEventContent {
-    pub rate_msats_per_sec: u64,
-    pub minimum_duration_seconds: u64,
-    pub memory_mb: u64, // Memory in MB
+pub struct PodSpec {
+    pub id: String, // Unique identifier for this spec (e.g., "basic", "standard", "premium")
+    pub name: String, // Human-readable name (e.g., "Basic", "Standard", "Premium")
+    pub description: String, // Description of the spec
     pub cpu_millicores: u64, // CPU in millicores (1000 millicores = 1 CPU core)
+    pub memory_mb: u64, // Memory in MB
+    pub rate_msats_per_sec: u64, // Payment rate for this spec
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OfferEventContent {
+    pub minimum_duration_seconds: u64,
     pub whitelisted_mints: Vec<String>,
+    pub pod_specs: Vec<PodSpec>, // Multiple pod specifications offered
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccessDetailsContent {
-    pub kind: String, // "access_details"
-    pub pod_name: String,
-    pub namespace: String,
-    pub ssh_username: String,
-    pub ssh_password: String,
-    pub node_port: Option<u16>,
-    pub expires_at: String,
-    pub instructions: Vec<String>,
+    pub pod_npub: String, // Pod's NPUB identifier
+    pub node_port: u16, // SSH port for direct access
+    pub expires_at: String, // Pod expiration time
+    pub cpu_millicores: u64, // CPU allocation in millicores
+    pub memory_mb: u64, // Memory allocation in MB
+    pub pod_spec_name: String, // Human-readable spec name
+    pub pod_spec_description: String, // Spec description
+    pub instructions: Vec<String>, // SSH connection instructions
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErrorResponseContent {
+    pub error_type: String, // Type of error (e.g., "insufficient_payment", "invalid_spec", "image_not_found")
+    pub message: String, // Human-readable error message
+    pub details: Option<String>, // Additional error details
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopUpResponseContent {
+    pub success: bool,
+    pub pod_npub: String,
+    pub extended_duration_seconds: u64,
+    pub new_expires_at: String,
+    pub message: String,
 }
 
 // NEW: Encrypted request structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EncryptedSpawnPodRequest {
     pub cashu_token: String,
-    pub pod_image: Option<String>, // Optional: Uses base image if not specified
+    pub pod_spec_id: Option<String>, // Optional: Which pod spec to use (defaults to first available)
+    pub pod_image: String, // Required: Container image to use for the pod
     pub ssh_username: String,
     pub ssh_password: String,
 }

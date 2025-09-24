@@ -63,7 +63,7 @@ pub async fn verify_cashu_token(token: &str, amount_msat: i64, whitelisted_mints
 
     if token_already_processed {
         println!("Token already processed");
-        return Ok(true);
+        return Err("Token has already been used".to_string());
     }
 
     // Decode the token from string

@@ -1,885 +1,582 @@
 # Paygress - NIP-17 Encrypted Private Message Pod Provisioning
 
-🔧 **NIP-17 + NIP-44 + NIP-59 Encrypted Private Messages → Kubernetes Pod Provisioning with Cashu Payments**
+## 🚀 **Overview**
 
-## Architecture
+🔧 **NIP-17 + NIP-44 + NIP-59 Encrypted Private Messages → Kubernetes Pod Provisioning with Cashu Payments**
 
 **NIP-17 Encrypted Private Message-Driven Pod Provisioning:**
 - Service listens for **NIP-17 gift wraps** (kind 1059) with Cashu tokens
 - All sensitive data sent via NIP-17 encrypted private messages (Cashu tokens, SSH credentials)
-- **NIP-44 encryption + NIP-59 seals/gift wraps** - True end-to-end encryption
-- Automatically provisions SSH pods in Kubernetes with `activeDeadlineSeconds`
+- Users can select from multiple pod specifications (CPU/memory tiers)
+- Each pod specification has its own pricing
 - Replies with access details via **NIP-17 encrypted private messages** (kind 1059)
-- **Top-up Support**: Extend pod duration via encrypted private messages or HTTP
-- **Kubernetes Native**: Uses `activeDeadlineSeconds` for automatic pod termination
-- Fully decentralized - no HTTP endpoints needed
-- **Maximum privacy** - NIP-44 + NIP-59 protects both message content and metadata with multi-layered encryption
 
-## 🚀 Complete Setup Guide
+## 🎯 **Quick Start**
 
-### Prerequisites
+### **1. Setup Environment**
 
-#### 1. Install Minikube
-```bash
-# Install Minikube
-curl -LO https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64
-sudo install minikube-linux-amd64 /usr/local/bin/minikube
-
-# Install kubectl
-curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
-
-# Install Docker
-sudo apt update && sudo apt install -y docker.io
-sudo systemctl start docker
-sudo usermod -aG docker $USER
-# Log out and back in for group changes to take effect
-```
-
-#### 2. Install Required Tools
-```bash
-# Install jq for JSON parsing
-sudo apt install -y jq
-
-# Install Go and Nak (Nostr CLI)
-sudo apt install -y golang
-go install github.com/fiatjaf/nak@latest
-echo 'export PATH="$HOME/go/bin:$PATH"' >> ~/.bashrc
-source ~/.bashrc
-
-# Install Cashu CLI for payments
-pip install cashu
-```
-
-### Step 1: Start Minikube
-```bash
-# Start Minikube with sufficient resources
-minikube start --memory=4096 --cpus=2
-
-# Verify cluster is running
-kubectl cluster-info
-kubectl get nodes
-```
-
-### Step 2: Configure Environment Variables
-
-Create a `.env` file with your configuration:
+Create a `paygress.env` file with your configuration:
 
 ```bash
-# Create your configuration file
-cat > paygress.env << EOF
 # Service Configuration
 RUN_MODE=nostr
 BIND_ADDR=0.0.0.0:8080
 CASHU_DB_PATH=/app/data/cashu.db
 POD_NAMESPACE=user-workloads
-PAYMENT_RATE_SATS_PER_HOUR=100
-DEFAULT_POD_DURATION_MINUTES=60
+MINIMUM_POD_DURATION_SECONDS=60
 ENABLE_CLEANUP_TASK=true
 RUST_LOG=info
 
-# Nostr Configuration
-NOSTR_RELAYS=wss://relay.damus.io,wss://nos.lol,wss://relay.nostr.band
-NOSTR_PRIVATE_KEY=
+# Nostr Configuration (REQUIRED)
+NOSTR_RELAYS=wss://relay.damus.io,wss://nos.lol,wss://relay.nostr.band,wss://nostr.wine
+NOSTR_PRIVATE_KEY=nsec1your_private_key_here
 
-# Cashu Configuration
-WHITELISTED_MINTS=https://nofees.testnut.cashu.space,https://testnut.cashu.space
+# Cashu Configuration (REQUIRED)
+WHITELISTED_MINTS=https://mint.cashu.space,https://mint.f7z.io
 
 # SSH Pod Configuration
-SSH_BASE_IMAGE=linuxserver/openssh-server:latest
-SSH_PORT=2222
-SSH_HOST=localhost
+BASE_IMAGE=linuxserver/openssh-server:latest
+SSH_HOST=your-server-ip
+SSH_PORT_RANGE_START=2000
+SSH_PORT_RANGE_END=3000
 
-EOF
+# Pod Specifications (REQUIRED - JSON file path)
+POD_SPECS_FILE=pod-specs.json
 ```
 
-### Step 3: Deploy Paygress
+Create a `pod-specs.json` file with your pod specifications:
 
-```bash
-# Clone and navigate to project
-git clone <your-repo-url>
-cd paygress
-
-# Build Docker image from Dockerfile
-docker build -t paygress:latest .
-
-# Import image into Minikube
-minikube image load paygress:latest
-
-# Deploy to Kubernetes (creates namespace and all resources)
-kubectl apply -f k8s/sidecar-service.yaml
+```json
+[
+  {
+    "id": "basic",
+    "name": "Basic",
+    "description": "Basic VPS - 1 CPU core, 1GB RAM",
+    "cpu_millicores": 1000,
+    "memory_mb": 1024,
+    "rate_msats_per_sec": 100
+  },
+  {
+    "id": "standard", 
+    "name": "Standard",
+    "description": "Standard VPS - 2 CPU cores, 2GB RAM",
+    "cpu_millicores": 2000,
+    "memory_mb": 2048,
+    "rate_msats_per_sec": 200
+  },
+  {
+    "id": "premium",
+    "name": "Premium", 
+    "description": "Premium VPS - 4 CPU cores, 4GB RAM",
+    "cpu_millicores": 4000,
+    "memory_mb": 4096,
+    "rate_msats_per_sec": 400
+  }
+]
 ```
 
-### **Port Range Configuration**
-
-Paygress uses a configurable port range with **direct port exposure**:
-
-- **SSH_PORT_RANGE_START**: Start of the port range (default: 30000)
-- **SSH_PORT_RANGE_END**: End of the port range (default: 31000)
-- **SSH_PORT**: Internal SSH server port (default: 2222)
-
-**Direct Port Access**:
-- Each pod gets a unique port from your range (e.g., 15001)
-- Pod uses **host networking** for direct port exposure
-- SSH server runs on port 22 inside the pod
-- Port is **directly accessible** on your public IP:15001
-- **No port-forwarding needed** - direct access from internet
-
-**Benefits**:
-- ✅ **No file persistence** - Kubernetes handles everything
-- ✅ **No port-forwarding** - Direct internet access
-- ✅ **Simpler architecture** - Uses Kubernetes host networking
-- ✅ **Better performance** - No service layer overhead
-- ✅ **Easier debugging** - Direct port access
-
-### **Minikube-Specific Notes**
-
-Minikube image handling:
+### **2. Deploy to Kubernetes**
 
 ```bash
-
+# 1. Build the Docker image with timestamp
 IMAGE_TAG=$(date +%s)   # or use: $(git rev-parse --short HEAD)
 docker build -t paygress:$IMAGE_TAG .
 
-# 2. Load into Minikube
+# 2. Load into your Kubernetes cluster
+# For Minikube:
 minikube image load paygress:$IMAGE_TAG
 
-# 3. Verify it's available
-minikube image ls | grep paygress
+# For K3s:
+# sudo k3s ctr images import <(docker save paygress:$IMAGE_TAG)
 
-# 4. Update deployment to use the new image
+
+# 3. Create ConfigMaps from your configuration files (REQUIRED)
+kubectl create configmap paygress-env-config \
+    --from-env-file=paygress.env \
+    --namespace=ingress-system \
+    --dry-run=client -o yaml | kubectl apply -f -
+
+kubectl create configmap paygress-pod-specs \
+  --from-file=pod-specs.json \
+  --namespace=ingress-system \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+# 4. Deploy the application with the timestamped image
+kubectl apply -f k8s/sidecar-service.yaml
 kubectl set image deployment/paygress-sidecar \
     paygress-sidecar=paygress:$IMAGE_TAG \
     -n ingress-system
 
-# 5. Update ConfigMap from .env file
-kubectl create configmap paygress-sidecar-config \
-    --from-env-file=paygress.env \
-    --namespace=ingress-system \
-    --dry-run=client -o yaml | kubectl apply -f -
-
-# 6. Restart deployment to pick up new configuration
-kubectl rollout restart deployment/paygress-sidecar -n ingress-system
-
-# 7. Wait for rollout to finish
+# 5. Wait for deployment to be ready
 kubectl wait --for=condition=available --timeout=300s \
     deployment/paygress-sidecar -n ingress-system
 
-# 8. Check logs (to get public key or debug)
+# 6. Check logs (to get public key or debug)
 kubectl logs -n ingress-system -l app=paygress-sidecar
 ```
 
-### Step 4: Update Configuration
+**Note**: The YAML file references ConfigMaps (`paygress-env-config` and `paygress-pod-specs`) that must be created from your configuration files using the kubectl commands above. This approach ensures your actual files are the source of truth, not hardcoded values in YAML.
 
-To update your configuration, simply modify the `paygress.env` file and reapply:
-
+**After making code changes:**
 ```bash
-# 1. Update your configuration in paygress.env file
-nano paygress.env
-
-# 2. Reapply the ConfigMap (updates the configuration)
-kubectl create configmap paygress-sidecar-config \
-    --from-env-file=paygress.env \
-    --namespace=ingress-system \
-    --dry-run=client -o yaml | kubectl apply -f -
-
-# 3. Restart deployment to pick up new configuration
-kubectl rollout restart deployment/paygress-sidecar -n ingress-system
+# Rebuild and redeploy to pick up code changes
+IMAGE_TAG=$(date +%s)
+docker build -t paygress:$IMAGE_TAG .
+minikube image load paygress:$IMAGE_TAG  # or your cluster equivalent
+kubectl set image deployment/paygress-sidecar \
+    paygress-sidecar=paygress:$IMAGE_TAG \
+    -n ingress-system
+kubectl logs -n ingress-system -l app=paygress-sidecar -f
 ```
 
-**Note**: The order is important - always create/update the ConfigMap first, then restart the deployment so it picks up the new configuration.
 
-### Step 5: Verify Deployment
+## 📋 **Complete User Guide**
+
+### **Step 1: Get Available Offers**
+
+The service publishes offer events containing available pod specifications. To get the offers:
+
 ```bash
-# Check if everything is running
+# Using nostr-tools to get offers
+nostr-tools query --relay wss://relay.damus.io --kind 999 --limit 10
+
+# Look for events with tags: ["paygress", "offer"]
+```
+
+**Example Offer Event:**
+```json
+{
+  "kind": 999,
+  "content": "{\"minimum_duration_seconds\":60,\"whitelisted_mints\":[\"https://mint.cashu.space\"],\"pod_specs\":[{\"id\":\"basic\",\"name\":\"Basic\",\"description\":\"Basic VPS - 1 CPU core, 1GB RAM\",\"cpu_millicores\":1000,\"memory_mb\":1024,\"rate_msats_per_sec\":100},{\"id\":\"standard\",\"name\":\"Standard\",\"description\":\"Standard VPS - 2 CPU cores, 2GB RAM\",\"cpu_millicores\":2000,\"memory_mb\":2048,\"rate_msats_per_sec\":200},{\"id\":\"premium\",\"name\":\"Premium\",\"description\":\"Premium VPS - 4 CPU cores, 4GB RAM\",\"cpu_millicores\":4000,\"memory_mb\":4096,\"rate_msats_per_sec\":400}]}",
+  "tags": [
+    ["t", "paygress"],
+    ["t", "offer"]
+  ],
+  "pubkey": "service_public_key_here"
+}
+```
+
+### **Step 2: Choose Pod Specification**
+
+From the offer, you can see available pod specifications:
+
+| Specification | CPU | Memory | Rate (msats/sec) | Description |
+|---------------|-----|--------|------------------|-------------|
+| `basic` | 1000 millicores | 1GB | 100 | Basic VPS - 1 CPU core, 1GB RAM |
+| `standard` | 2000 millicores | 2GB | 200 | Standard VPS - 2 CPU cores, 2GB RAM |
+| `premium` | 4000 millicores | 4GB | 400 | Premium VPS - 4 CPU cores, 4GB RAM |
+
+**Calculate Payment Required:**
+```
+Payment (msats) = Duration (seconds) × Rate (msats/sec)
+```
+
+**Examples:**
+- 1 hour (3600 sec) Basic: 3600 × 100 = 360,000 msats
+- 2 hours (7200 sec) Standard: 7200 × 200 = 1,440,000 msats
+- 30 minutes (1800 sec) Premium: 1800 × 400 = 720,000 msats
+
+### **Step 3: Create Cashu Token**
+
+Generate a Cashu token for the required payment amount:
+
+```bash
+# Using cashu-cli (example)
+cashu-cli mint --amount 360000 --mint https://mint.cashu.space
+```
+
+### **Step 4: Send Pod Provisioning Request**
+
+Send a NIP-17 Gift Wrap private message to the service:
+
+**Request Structure:**
+```json
+{
+  "cashu_token": "cashuBo2FteCJodHRwczovL25vZmVlcy50ZXN0bnV0LmNhc2h1LnNwYWNlYXVjc2F0YXSBomFpSAC0zSfYhhpEYXCDo2FhBGFzeEBmNTNiMWQzMmI5YTUzMjg5MzhkYjY5NDUzMzgwYjZkMDVkZGZhZGJiZWU0NzFjZmEyNmQ0ZmUwYjFjYWM4NjA4YWNYIQMPHPPWoE6w_VW3PxfWSjuOZVPifjnkpvFe7VC7M_wuY6NhYRggYXN4QDlmMzk4NzAyN2RlYmRlYmJlNzhmNmM4YmJkZWU1MmRhZTg2ZmYzODA3OTc5N2VlNzc4ZmYzNGFkNTFmNDJlYWFhY1ghA6s8St63aM3eZRzYq6iJNv9xfgfLM0Mn7LC0npKsn82_o2FhGEBhc3hAMGRkMzhlY2IyNDhmMmQ3NzliMzFjZjAyYzEyN2FmN2YyOWY0YWM3NjZhNDY2MzVjMDhjZGZlMjQ5YzE5ZWJkNWFjWCECgzYuwUmEWMFVMP-ROxDzNAPJgZiXChNw66GUvggSwVA",
+  "pod_spec_id": "standard",
+  "pod_image": "linuxserver/openssh-server:latest",
+  "ssh_username": "alice",
+  "ssh_password": "my_secure_password"
+}
+```
+
+**Field Descriptions:**
+- `cashu_token`: Payment token for pod provisioning
+- `pod_spec_id`: Which specification to use (`basic`, `standard`, `premium`) - optional, defaults to first available
+- `pod_image`: Container image to use for the pod (required)
+- `ssh_username`: SSH username for pod access
+- `ssh_password`: SSH password for pod access
+
+**Using nostr-tools:**
+```bash
+# Create request JSON
+echo '{
+  "cashu_token": "your_cashu_token_here",
+  "pod_spec_id": "standard",
+  "pod_image": "linuxserver/openssh-server:latest",
+  "ssh_username": "alice",
+  "ssh_password": "my_secure_password"
+}' > request.json
+
+# Send as NIP-17 Gift Wrap private message
+nostr-tools encrypt --key your_nsec_key --pubkey service_npub_key < request.json | \
+nostr-tools publish --relay wss://relay.damus.io --kind 1059
+```
+
+### **Step 5: Receive Access Details**
+
+The service will send back access details via NIP-17 Gift Wrap private message:
+
+**Access Details Structure:**
+```json
+{
+  "pod_npub": "npub1abc123def456ghi789...",
+  "node_port": 2500,
+  "expires_at": "2025-09-23T15:30:00Z",
+  "cpu_millicores": 2000,
+  "memory_mb": 2048,
+  "pod_spec_name": "Standard",
+  "pod_spec_description": "Standard VPS - 2 CPU cores, 2GB RAM",
+  "instructions": [
+    "🚀 SSH access available:",
+    "",
+    "Direct access (no kubectl needed):",
+    "   ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no alice@37.27.165.100 -p 2500",
+    "",
+    "⚠️  Pod expires at:",
+    "   2025-09-23 15:30:00 UTC",
+    "",
+    "📋 Pod Details:",
+    "   Pod NPUB: npub1abc123def456...",
+    "   Specification: Standard (Standard VPS - 2 CPU cores, 2GB RAM)",
+    "   CPU: 2000 millicores",
+    "   Memory: 2048 MB",
+    "   Duration: 7200 seconds"
+  ]
+}
+```
+
+### **Step 6: Connect to Your Pod**
+
+Use the provided SSH command:
+
+```bash
+ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no alice@37.27.165.100 -p 2500
+```
+
+### **Step 7: Top-Up Pod Duration**
+
+To extend your pod's lifetime, send a top-up request:
+
+**Top-Up Request Structure:**
+```json
+{
+  "pod_npub": "npub1abc123def456ghi789...",
+  "cashu_token": "cashuBo2FteCJodHRwczovL25vZmVlcy50ZXN0bnV0LmNhc2h1LnNwYWNlYXVjc2F0YXSBomFpSAC0zSfYhhpEYXCDo2FhBGFzeEAzYTkwNWIzOTY0OWIyMGY1OTI0YTRkZGJiZjRlZWI4OGYwNWU2ZTljNGMyNDYyNWIxZWQwYTViZDNkNjM1ZWZhYWNYIQMsh6TMtV9nymg-fiTwRdwWpv7p2icKc4Zhp1RoNn4bU6NhYRggYXN4QGQ5MTUzMTdiYWU1OTVlOTJhZWIwMjhmM2ZjNmZiYzNlNzhlMjgxMGIwYmNiNTk3ZDc2OTY4ZWUyNmZkNWFlODFhY1ghA6oPPZrjcANzjAh3wMBthEthvwHMeDso851ktJ3l0Nboo2FhGEBhc3hAYzU2Yzc2ZDI2ZDIzNmE0NmY1MTQzZjQyNTg2MWU3ZGM5ZTcwMDQ1NDVlZjdjMTcyY2Y1YzkzZTYwNjI2ZDliY2FjWCEDMARUfSku0P5Iv4wRcD4luHIgLceeQIfl07CBBsG6qFE"
+}
+```
+
+**Field Descriptions:**
+- `pod_npub`: The pod's NPUB identifier (from access details)
+- `cashu_token`: Payment token for the extension
+
+**Using nostr-tools:**
+```bash
+# Create top-up request JSON
+echo '{
+  "pod_npub": "npub1abc123def456ghi789...",
+  "cashu_token": "your_topup_cashu_token_here"
+}' > topup.json
+
+# Send as NIP-17 Gift Wrap private message
+nostr-tools encrypt --key your_nsec_key --pubkey service_npub_key < topup.json | \
+nostr-tools publish --relay wss://relay.damus.io --kind 1059
+```
+
+### **Step 8: Receive Top-Up Confirmation**
+
+The service will send back a top-up confirmation via NIP-17 Gift Wrap private message:
+
+**Top-Up Success Response:**
+```json
+{
+  "success": true,
+  "pod_npub": "npub1abc123def456ghi789...",
+  "extended_duration_seconds": 3600,
+  "new_expires_at": "2025-09-23T16:30:00Z",
+  "message": "Pod successfully topped up!"
+}
+```
+
+**Top-Up Error Response:**
+```json
+{
+  "error_type": "pod_not_found",
+  "message": "Pod not found or expired",
+  "details": "Pod with NPUB 'npub1abc123...' not found or already expired"
+}
+```
+
+## 🔐 **Security Features**
+
+### **NIP-17 Encryption**
+- All requests and responses use NIP-17 Gift Wrap encryption
+- Only the intended recipient can decrypt messages
+- No sensitive data is publicly visible on relays
+
+### **Payment Verification**
+- All Cashu tokens are verified against whitelisted mints
+- Payment amounts are validated before pod creation
+- Automatic pod termination when payment expires
+
+### **Resource Isolation**
+- Each pod runs in its own namespace
+- CPU and memory limits enforced per specification
+- Automatic cleanup when pods expire
+
+## ⚠️ **Error Handling**
+
+The service provides comprehensive error responses for all failure scenarios:
+
+### **Pod Provisioning Errors**
+
+| Error Type | Description | When Sent |
+|------------|-------------|-----------|
+| `invalid_spec` | Pod specification not found | Invalid `pod_spec_id` |
+| `invalid_token` | Cashu token decode/verification failed | Token issues |
+| `insufficient_payment` | Payment below minimum requirement | Not enough payment |
+| `resource_unavailable` | SSH port allocation failed | No ports available |
+| `pod_creation_failed` | Kubernetes pod creation failed | K8s API errors |
+
+### **Top-Up Errors**
+
+| Error Type | Description | When Sent |
+|------------|-------------|-----------|
+| `pod_not_found` | Pod not found or expired | Top-up on non-existent pod |
+| `payment_failed` | Top-up payment verification failed | Invalid top-up token |
+| `internal_error` | Server-side processing error | Unexpected failures |
+
+### **Error Response Format**
+
+All error responses follow this structure:
+
+```json
+{
+  "error_type": "insufficient_payment",
+  "message": "Insufficient payment: 50000 msats",
+  "details": "Minimum required: 100000 msats for 60 seconds with Basic spec (rate: 100 msats/sec)"
+}
+```
+
+## 🛠️ **VPS Provider Configuration**
+
+### **Custom Pod Specifications**
+
+VPS providers can customize their offerings by modifying the `POD_SPECS` environment variable:
+
+```bash
+# Example: High-performance server offerings
+POD_SPECS=[
+  {
+    "id": "starter",
+    "name": "Starter",
+    "description": "Starter VPS - 0.5 CPU, 512MB RAM",
+    "cpu_millicores": 500,
+    "memory_mb": 512,
+    "rate_msats_per_sec": 50
+  },
+  {
+    "id": "professional",
+    "name": "Professional", 
+    "description": "Professional VPS - 8 CPU, 16GB RAM",
+    "cpu_millicores": 8000,
+    "memory_mb": 16384,
+    "rate_msats_per_sec": 800
+  },
+  {
+    "id": "enterprise",
+    "name": "Enterprise",
+    "description": "Enterprise VPS - 16 CPU, 32GB RAM", 
+    "cpu_millicores": 16000,
+    "memory_mb": 32768,
+    "rate_msats_per_sec": 1600
+  }
+]
+```
+
+### **Environment Variables Reference**
+
+| Variable | Required | Description | Example |
+|----------|----------|-------------|---------|
+| `NOSTR_RELAYS` | ✅ | Comma-separated relay URLs | `wss://relay.damus.io,wss://nos.lol` |
+| `NOSTR_PRIVATE_KEY` | ✅ | Service's Nostr private key (nsec) | `nsec1...` |
+| `WHITELISTED_MINTS` | ✅ | Comma-separated mint URLs | `https://mint.cashu.space,https://mint.f7z.io` |
+| `POD_SPECS` | ✅ | JSON array of pod specifications | See example above |
+| `SSH_HOST` | ✅ | Public IP for SSH access | `37.27.165.100` |
+| `POD_NAMESPACE` | ❌ | Kubernetes namespace | `user-workloads` |
+| `MINIMUM_POD_DURATION_SECONDS` | ❌ | Minimum pod lifetime | `60` |
+| `BASE_IMAGE` | ❌ | Base container image | `linuxserver/openssh-server:latest` |
+| `SSH_PORT_RANGE_START` | ❌ | Start of port range | `2000` |
+| `SSH_PORT_RANGE_END` | ❌ | End of port range | `3000` |
+
+## 🚀 **Kubernetes Deployment**
+
+### **Prerequisites**
+
+Ensure you have:
+- Kubernetes cluster running
+- `kubectl` configured to access your cluster
+- Your environment configuration file (`paygress.env`)
+
+### **Deployment Steps**
+
+```bash
+# 1. Apply the Kubernetes manifests
+kubectl apply -f k8s/
+
+# 2. Create configmap with your environment configuration
+kubectl create configmap paygress-config --from-env-file=paygress.env
+
+# 3. Verify deployment
 kubectl get pods -n ingress-system
-kubectl get svc -n ingress-system
+kubectl get services -n ingress-system
 
-# Check logs
+# 4. Check logs
 kubectl logs -n ingress-system -l app=paygress-sidecar
 
-# Test the service
-kubectl port-forward -n ingress-system svc/paygress-sidecar 8080:8080 &
-curl http://localhost:8080/healthz
-```
-
-## 🎛️ **Deployment Modes**
-
-The service supports two modes via `RUN_MODE` environment variable:
-
-### **Nostr Mode** (Default: `RUN_MODE=nostr`)
-- ✅ **Fully decentralized** - No HTTP endpoints
-- ✅ **Nostr events only** - All communication via relays
-- ✅ **Configurable relays** - Choose your preferred Nostr relays
-
-### **HTTP Mode** (`RUN_MODE=http`)
-- ✅ **Traditional REST API** - Standard HTTP endpoints
-- ✅ **Health checks enabled** - Kubernetes health monitoring
-- ✅ **Port forwarding** - SSH via kubectl port-forward
-- ✅ **Ingress integration** - Works with existing ingress controllers
-
-## 💰 Step 6: Get Cashu Tokens
-
-### Get Test Tokens
-```bash
-# Get tokens from test mint (1000 sats = 1000 minutes = ~16 hours)
-cashu mint 1000 --url https://mint.cashu.space
-
-# This will output a Cashu token like:
-# cashuAeyJ0b2tlbiI6W3sibWludCI6Imh0dHA...
-```
-
-## 📡 Step 7: Send Encrypted Nostr Request
-
-### Understanding Key Formats
-
-**For user configuration, we'll use bech32 format (`nsec1...` and `npub1...`) which is the standard in the Nostr ecosystem:**
-
-```bash
-# Bech32 format (user-friendly, standard format)
-PRIVATE_KEY="nsec1abc123..."  # Private key with nsec1 prefix
-PUBLIC_KEY="npub1def456..."   # Public key with npub1 prefix
-
-# nak can work with both bech32 and raw hex formats
-# We'll use bech32 for all user-facing operations
-```
-
-### Deriving Public Key from Private Key
-
-**If you only have a private key, you can derive the public key:**
-
-```bash
-# From bech32 private key (nsec1...) - convert to hex first
-NSEC="nsec1abc123..."
-# Note: nak key public needs hex, so we need to decode bech32 first
-# For now, we'll work with hex keys for nak operations
-
-# From raw hex private key - this works directly
-PRIVATE_HEX="f2cbda3e2094446a232fb3fff285091314167271ff3130e7f6a663528165d4662"
-npub=$(nak key public "$PRIVATE_HEX")
-echo "Public key (hex): $npub"
-
-# Convert to bech32 format
-npub_bech32=$(nak encode npub "$npub")
-echo "Public key (bech32): $npub_bech32"
-```
-
-### Generate User Keys with nak
-```bash
-# Generate user keys using nak (safer - no manual key handling)
-hex=$(nak key generate)
-echo "hex: $hex"
-
-# Convert hex to bech32 format (nsec1...)
-nsec=$(nak encode nsec "$hex")
-echo "nsec: $nsec"
-
-# Get public key from private key (use hex, not bech32)
-npub=$(nak key public "$hex")
-echo "npub: $npub"
-
-# Convert public key to bech32 format
-npub_bech32=$(nak encode npub "$npub")
-echo "npub (bech32): $npub_bech32"
-
-# Store your keys in bech32 format (user-friendly)
-export NSEC="$nsec"  # Your private key (bech32 format)
-export NPUB="$npub_bech32"  # Your public key (bech32 format)
-
-# Verify your keys work
-echo "Your private key: $NSEC"
-echo "Your public key: $NPUB"
-```
-
-### Working with Existing Keys
-
-**If you already have a private key (from another source):**
-
-```bash
-# If you have a bech32 private key (nsec1...) - recommended for storage
-EXISTING_NSEC="nsec1abc123..."
-# Note: nak key public needs hex, so we need to decode bech32 first
-# For now, we'll work with hex keys for nak operations
-
-# If you have a raw hex private key, this works directly
-EXISTING_PRIVATE_HEX="f2cbda3e2094446a232fb3fff285091314167271ff3130e7f6a663528165d4662"
-npub=$(nak key public "$EXISTING_PRIVATE_HEX")
-echo "Public key (hex): $npub"
-
-# Convert to bech32 format for user-friendly storage
-nsec=$(nak encode nsec "$EXISTING_PRIVATE_HEX")
-npub_bech32=$(nak encode npub "$npub")
-
-export NSEC="$nsec"
-export NPUB="$npub_bech32"
-
-# Verify the key pair is valid
-echo "Private key: $NSEC"
-echo "Public key: $NPUB"
-```
-
-### Create NIP-17 Private Direct Message Request
-```bash
-# Create your request JSON
-REQUEST_JSON='{"cashu_token":"<YOUR_CASHU_TOKEN>","ssh_username":"alice","ssh_password":"my_ssh_password","pod_image":"linuxserver/openssh-server:latest"}'
-
-# Get the service's public key from logs (you'll need this for NIP-17 private direct messages)
-# Check service logs to find the service public key:
-kubectl logs -n ingress-system -l app=paygress-sidecar | grep "Service public key"
-# Look for output like: "Service public key: npub1abc123..."
-
-SERVICE_NPUB="npub1abc123..."  # Replace with actual service public key from logs
-
-# Convert npub to hex format (nak requires 64-char hex, not npub)
-SERVICE_PUBKEY_HEX=$(nak pubkey --hex "$SERVICE_NPUB")
-
-# Send the request as a NIP-17 encrypted private message
-# Note: NIP-17 with NIP-44 + NIP-59 requires complex encryption (seals + gift wraps)
-# This example shows the concept - actual implementation requires proper NIP-44 + NIP-59 encryption
-# For production use, use a proper NIP-17 client that handles NIP-44 + NIP-59 automatically
-
-# Example using a hypothetical NIP-17 client (not nak - nak doesn't support NIP-44 + NIP-59 yet)
-# nip17-send --recipient "$SERVICE_PUBKEY_HEX" --content "$REQUEST_JSON" --relays wss://relay.damus.io wss://nos.lol wss://relay.nostr.band
-```
-
-## 🎯 Step 8: Listen for NIP-17 Private Direct Message Response
-
-```bash
-# Listen for NIP-17 private direct message response (kind 14)
-nak req -k 14 --stream wss://relay.damus.io wss://nos.lol wss://relay.nostr.band
-
-# The response will be a NIP-17 private direct message! NIP-17 handles decryption automatically.
-# Your Nostr client will automatically decrypt and display the content.
-# The response contains your SSH access details in JSON format:
-# - pod_name: ssh-pod-xxxxx
-# - ssh_username: alice
-# - ssh_password: xxxxxxxx
-# - node_port: 3xxxx
-# - expires_at: 2024-01-01T12:00:00Z
-# - **Sent directly from the pod itself!**
-```
-
-## 🔑 Step 9: Access Your Pod
-
-You'll receive SSH access details with two connection options:
-
-### **Option 1: Direct SSH Access (Recommended)**
-```bash
-# Connect directly via NodePort (no kubectl needed)
-ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no alice@$(minikube ip) -p <node_port>
-# Password: <from_nostr_response>
-```
-
-### **Option 2: Port Forward**
-```bash
-# Port forward to SSH service
-kubectl -n user-workloads port-forward svc/ssh-pod-<pod-id>-ssh 2222:2222
-
-# SSH to the pod
-ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no alice@localhost -p 2222
-# Password: <from_nostr_response>
-```
-
-## 🔄 Step 10: Extend Pod Duration (Top-ups)
-
-**✅ Extend your pod's lifetime with additional payments!**
-
-### HTTP Mode Top-up:
-```bash
-# Extend existing pod duration
-curl -X POST http://localhost:8080/top-up-pod \
-  -H "Content-Type: application/json" \
-  -d '{
-    "pod_name": "ssh-pod-abc12345",
-    "cashu_token": "your_topup_token_here"
-  }'
-```
-
-### Nostr Mode Top-up:
-```bash
-# Create top-up request
-TOPUP_JSON='{"pod_name":"ssh-pod-abc12345","cashu_token":"<YOUR_TOPUP_TOKEN>"}'
-
-# Get the service's public key from logs
-SERVICE_NPUB="npub1abc123..."  # Replace with actual service public key from logs
-
-# Send top-up as NIP-17 encrypted private message
-# NIP-17 with NIP-44 + NIP-59 requires proper encryption (seals + gift wraps)
-# Use a proper NIP-17 client that handles NIP-44 + NIP-59 automatically
-
-# Example using a hypothetical NIP-17 client
-# nip17-send --recipient "$SERVICE_PUBKEY_HEX" --content "$TOPUP_JSON" --relays wss://relay.damus.io wss://nos.lol wss://relay.nostr.band
-```
-
-### Top-up Features:
-- **Extend Duration**: Add more time to existing pods
-- **Payment Verification**: Validates Cashu tokens for top-ups
-- **Automatic Extension**: Updates `activeDeadlineSeconds` in Kubernetes
-- **No Interruption**: Pod continues running during extension
-- **Flexible Payment**: Pay any amount to extend by that many minutes
-
-## ⏰ Automatic Pod Lifecycle Management
-
-**✅ Your pods are automatically managed using Kubernetes' built-in `activeDeadlineSeconds`!**
-
-### How It Works:
-- **Payment = Duration**: 1 sat = 1 minute (e.g., 100 sats = 100 minutes)
-- **Kubernetes Native**: Uses `activeDeadlineSeconds` for automatic pod termination
-- **No Polling**: No cleanup tasks or CronJobs needed - Kubernetes handles everything
-- **Immediate Termination**: Pods are terminated as soon as their time expires
-- **Resource Cleanup**: Both the pod and its associated service are removed automatically
-
-### Pod Duration & Top-ups:
-- **Specify Duration**: Set `duration_minutes` in your request for custom duration
-- **Extend Duration**: Use top-up requests to extend existing pods
-- **Automatic Management**: Kubernetes handles all timing automatically
-
-### Configuration:
-```bash
-# Payment rate (1 sat = 1 minute by default)
-PAYMENT_RATE_SATS_PER_HOUR=100
-
-# Default duration if not specified in request
-DEFAULT_POD_DURATION_MINUTES=60
-
-# No cleanup task needed - Kubernetes handles everything
-ENABLE_CLEANUP_TASK=false
-```
-
-### Examples:
-- **10 sats** → Pod runs for **10 minutes**, then gets terminated
-- **100 sats** → Pod runs for **100 minutes** (~1.7 hours), then gets terminated
-- **1440 sats** → Pod runs for **1440 minutes** (24 hours), then gets terminated
-- **Top-up 60 sats** → Extends existing pod by 60 minutes
-
-**Note**: Kubernetes `activeDeadlineSeconds` ensures pods are terminated exactly when their paid duration expires. No external cleanup processes needed!
-
-## 🚀 **Optional: Docker Hub Deployment with GitHub Actions**
-
-> **Note**: This section is optional. The default deployment uses local Docker images built from the Dockerfile.
-
-This repository includes GitHub Actions workflows to automatically build and push Docker images to Docker Hub if you prefer to use a container registry.
-
-### **Setup GitHub Secrets**
-
-1. Go to your GitHub repository settings
-2. Navigate to **Secrets and variables** → **Actions**
-3. Add the following secrets:
-
-```bash
-DOCKERHUB_USERNAME=your_dockerhub_username
-DOCKERHUB_TOKEN=your_dockerhub_access_token
-```
-
-### **Docker Hub Access Token**
-
-1. Go to [Docker Hub](https://hub.docker.com/)
-2. Navigate to **Account Settings** → **Security**
-3. Click **New Access Token**
-4. Give it a name (e.g., "github-actions")
-5. Set permissions to **Read, Write, Delete**
-6. Copy the token and add it as `DOCKERHUB_TOKEN` secret
-
-### **Automatic Builds**
-
-The workflow will automatically:
-- **Build** on every push to `main`/`master` branch
-- **Build** on every pull request to `main`/`master` branch  
-- **Build and push** on version tags (e.g., `v1.0.0`)
-- **Build** for both `linux/amd64` and `linux/arm64` platforms
-
-### **Image Tags**
-
-Images will be tagged as:
-- `latest` - Latest commit on default branch
-- `main`/`master` - Branch name
-- `v1.0.0` - Version tags
-- `v1.0` - Major.minor version
-- `v1` - Major version
-
-### **Using Docker Hub Images (Optional)**
-
-If you want to use Docker Hub instead of local images:
-
-1. **Update the Kubernetes YAML:**
-   ```yaml
-   # In k8s/sidecar-service.yaml, change:
-   image: paygress:latest
-   imagePullPolicy: Never
-   
-   # To:
-   image: yourusername/paygress-sidecar:latest
-   imagePullPolicy: IfNotPresent
-   ```
-
-2. **Pull and use the images:**
-   ```bash
-   # Pull the latest image
-   docker pull yourusername/paygress-sidecar:latest
-   
-   # Pull a specific version
-   docker pull yourusername/paygress-sidecar:v1.0.0
-   
-   # Run the container directly
-   docker run -d \
-     --name paygress-sidecar \
-     -p 8080:8080 \
-     -e NOSTR_PRIVATE_KEY=your_nsec_key \
-     -e NOSTR_RELAYS=wss://relay.damus.io,wss://nos.lol \
-     yourusername/paygress-sidecar:latest
-   ```
-
-## 🔧 Configuration Examples
-
-### Common Configuration Changes
-
-**Change SSH User/Password:**
-```bash
-# Edit your paygress.env file
-nano paygress.env
-
-# Reapply configuration
-kubectl create configmap paygress-sidecar-config \
-    --from-env-file=paygress.env \
-    --namespace=ingress-system \
-    --dry-run=client -o yaml | kubectl apply -f -
-
+# 5. Update configuration (if needed)
+kubectl delete configmap paygress-config
+kubectl create configmap paygress-config --from-env-file=paygress.env
 kubectl rollout restart deployment/paygress-sidecar -n ingress-system
 ```
 
-## 🔧 Step 10: Monitor and Manage
+## 📊 **Event Flow**
 
-### Check Active Pods
+```
+User                    Service
+  |                       |
+  |-- Query offers ------>|  (Kind 999 events)
+  |<-- Offer response ----|  (Available pod specs)
+  |                       |
+  |-- Provision request ->|  (NIP-17 Gift Wrap with Cashu token)
+  |                       |-- Creates pod with selected spec
+  |<-- Access details ----|  (NIP-17 Gift Wrap with SSH details)
+  |                       |
+  |-- Top-up request ---->|  (NIP-17 Gift Wrap with Cashu token)
+  |                       |-- Extends pod lifetime
+  |                       |  (No response needed)
+```
+
+## 🎉 **Features**
+
+### **✅ Multiple Pod Specifications**
+- VPS providers can offer different CPU/memory tiers
+- Each specification has its own pricing
+- Users can select the specification that fits their needs
+
+### **✅ Encrypted Communication**
+- All requests are encrypted using NIP-17 Gift Wrap
+- Only the service can decrypt your requests
+- Your private keys stay secure
+
+### **✅ Automatic Pod Management**
+- Pods created with `activeDeadlineSeconds`
+- Top-ups extend the deadline automatically
+- Kubernetes handles termination
+
+### **✅ No HTTP Required**
+- Pure Nostr protocol
+- Works with any Nostr client
+- Decentralized and censorship-resistant
+
+### **✅ Same Functionality as HTTP**
+- Create pods with custom specifications
+- Extend pod duration with top-ups
+- All payment verification included
+
+## 🔧 **Troubleshooting**
+
+### **Common Issues**
+
+1. **"POD_SPECS environment variable is required"**
+   - Ensure `POD_SPECS` is set with valid JSON
+   - Check JSON syntax is correct
+
+2. **"No pod specification found for ID"**
+   - Verify the `pod_spec_id` matches an available specification
+   - Check the offer event for available IDs
+
+3. **"Insufficient payment"**
+   - Calculate required payment: `Duration × Rate`
+   - Ensure Cashu token has sufficient value
+
+4. **"Failed to parse private message content"**
+   - Check JSON syntax in your request
+   - Ensure all required fields are present
+
+### **Logs**
+
+Check service logs for detailed information:
 ```bash
-# List all active pods
-kubectl get pods -n user-workloads -l app=paygress-ssh-pod
-
-# Check specific pod logs
-kubectl logs -n user-workloads ssh-pod-<pod-id>
-
-# Check service logs
 kubectl logs -n ingress-system -l app=paygress-sidecar
 ```
 
-### Check Service Status
-```bash
-# Check sidecar service logs
-kubectl logs -n ingress-system -l app=paygress-sidecar
+## 📝 **API Reference**
 
-# Check service health (HTTP mode only)
-kubectl port-forward -n ingress-system svc/paygress-sidecar 8080:8080 &
-curl http://localhost:8080/healthz
+### **Pod Provisioning Request**
+```json
+{
+  "cashu_token": "string",      // Required: Payment token
+  "pod_spec_id": "string",      // Optional: Specification ID (defaults to first)
+  "pod_image": "string",        // Required: Container image for the pod
+  "ssh_username": "string",     // Required: SSH username
+  "ssh_password": "string"      // Required: SSH password
+}
 ```
 
-## 🔄 Updating the Deployment
-
-When you make changes to the code, update the deployment:
-
-```bash
-# Rebuild the Docker image
-docker build -t paygress:latest .
-
-# Load the new image into Minikube
-minikube image load paygress:latest
-
-# Restart the deployment to use the new image
-kubectl -n ingress-system rollout restart deploy/paygress-sidecar
-
-# Wait for the rollout to complete
-kubectl -n ingress-system rollout status deploy/paygress-sidecar
-
-# Check the new pod is running
-kubectl get pods -n ingress-system -l app=paygress-sidecar
+### **Top-Up Request**
+```json
+{
+  "pod_npub": "string",         // Required: Pod's NPUB identifier
+  "cashu_token": "string"       // Required: Payment token for extension
+}
 ```
 
-## 🧹 Cleanup
-
-To remove the Paygress deployment:
-
-```bash
-# Delete the deployment and related resources
-kubectl delete -f k8s/sidecar-service.yaml
-
-# Delete any remaining SSH pods
-kubectl delete pods -n user-workloads -l app=paygress-ssh-pod
-
-# Stop Minikube (optional)
-minikube stop
+### **Access Details Response**
+```json
+{
+  "pod_npub": "string",         // Pod's NPUB identifier
+  "node_port": "number",        // SSH port
+  "expires_at": "string",       // ISO 8601 expiration time
+  "cpu_millicores": "number",   // CPU allocation in millicores
+  "memory_mb": "number",        // Memory allocation in MB
+  "pod_spec_name": "string",    // Human-readable spec name
+  "pod_spec_description": "string", // Spec description
+  "instructions": ["string"]    // SSH connection instructions
+}
 ```
 
-## Files
-
-- `src/main.rs` - Main service with Nostr mode
-- `src/nostr.rs` - Nostr client for publishing/listening
-- `src/sidecar_service.rs` - Kubernetes pod provisioning
-- `src/cashu.rs` - Cashu payment verification
-- `k8s/sidecar-service.yaml` - Kubernetes deployment
-- `Dockerfile` - Container image
-
-## How it works
-
-1. **Service starts** → Connects to Nostr relays, publishes offer event
-2. **User sends NIP-17 encrypted private message** → Kind 1059 gift wrap with Cashu token and pod requirements (NIP-44 encryption + NIP-59 seals)
-3. **Service processes** → Verifies payment, creates SSH pod in Kubernetes with `activeDeadlineSeconds`
-4. **Service sends NIP-17 encrypted private message response** → Kind 1059 gift wrap with SSH access details (NIP-44 encryption + NIP-59 seals, sent by the service for security)
-5. **User accesses pod** → Uses provided SSH credentials via NodePort or port-forward
-6. **Optional: Extend duration** → Send NIP-17 encrypted private message or HTTP POST to extend pod lifetime
-7. **Automatic termination** → Kubernetes terminates pod when `activeDeadlineSeconds` expires
-
-**Complete NIP-17 encrypted private message-based workflow with NIP-44 + NIP-59 - no HTTP endpoints needed!**
-
-## 🔐 NIP-17 Encryption Implementation
-
-Paygress implements **NIP-17** with **NIP-44 encryption** and **NIP-59 seals/gift wraps** for maximum privacy:
-
-### Encryption Flow:
-1. **Kind 14 Message**: Unsigned chat message with content
-2. **NIP-44 Encryption**: Message encrypted with sender's private key and recipient's public key
-3. **Kind 13 Seal**: Encrypted message wrapped in a seal
-4. **NIP-59 Gift Wrap**: Seal wrapped in a gift wrap (kind 1059) for each recipient
-5. **Random Keys**: Gift wrap uses random keys to hide sender identity
-
-### Privacy Benefits:
-- ✅ **No Metadata Leak**: Participant identities, timestamps, and event kinds are hidden
-- ✅ **No Public Group Identifiers**: No central queue or channel to correlate messages
-- ✅ **No Shared Secrets**: No secrets that can leak or be shared
-- ✅ **Fully Recoverable**: Messages recoverable with user's private key
-- ✅ **Public Relay Compatible**: Works through public relays without privacy loss
-
-### Client Requirements:
-- Must support **NIP-44 encryption** (latest version)
-- Must support **NIP-59 seals and gift wraps**
-- Must handle **kind 1059 gift wraps** for receiving messages
-- Must create **kind 14 → 13 → 1059** chain for sending messages
-
-**Note**: Simple tools like `nak` don't yet support NIP-44 + NIP-59 encryption. Use proper NIP-17 clients.
-
-> **Note**: This implementation uses [NIP-17: Private Direct Messages](https://github.com/nostr-protocol/nips/blob/master/17.md) for enhanced privacy and security. NIP-17 handles all encryption/decryption automatically - no manual encryption required.
-
-## 🌐 HTTP Mode (Alternative)
-
-**✅ Also supports HTTP endpoints for traditional API access!**
-
-### Available Endpoints:
-- `GET /healthz` - Health check with feature status
-- `POST /spawn-pod` - Create new pod with duration
-- `POST /top-up-pod` - Extend existing pod duration
-- `GET /pods` - List all active pods
-- `GET /pods/:name` - Get specific pod info
-
-### HTTP Mode Usage:
-```bash
-# Create pod via HTTP
-curl -X POST http://localhost:8080/spawn-pod \
-  -H "Content-Type: application/json" \
-  -d '{
-    "cashu_token": "your_token_here",
-    "duration_minutes": 120,
-    "ssh_username": "alice"
-  }'
-
-# Extend pod via HTTP
-curl -X POST http://localhost:8080/top-up-pod \
-  -H "Content-Type: application/json" \
-  -d '{
-    "pod_name": "ssh-pod-abc12345",
-    "cashu_token": "your_topup_token"
-  }'
+### **Top-Up Success Response**
+```json
+{
+  "success": "boolean",         // Always true for success
+  "pod_npub": "string",         // Pod's NPUB identifier
+  "extended_duration_seconds": "number", // Seconds added to pod
+  "new_expires_at": "string",   // New expiration time (ISO 8601)
+  "message": "string"           // Success message
+}
 ```
 
-### Run in HTTP Mode:
-```bash
-# Set environment variable to enable HTTP mode
-export RUN_MODE=http
-cargo run
+### **Error Response**
+```json
+{
+  "error_type": "string",       // Type of error (see error types table)
+  "message": "string",          // Human-readable error message
+  "details": "string"           // Additional error details (optional)
+}
 ```
 
-## Decentralized Architecture
+---
 
-- **Nostr Events**: All communication via decentralized relay network
-- **Cashu Payments**: Bitcoin-based e-cash for payments
-- **Kubernetes**: Container orchestration with `activeDeadlineSeconds` for pod lifecycle
-- **Top-up Support**: Extend pod duration via Nostr (kind 1002) or HTTP
-- **Ready for Iroh**: Prepared for peer-to-peer networking integration
-
-**No centralized dependencies - fully decentralized pod provisioning!**
-
-## 🔧 Troubleshooting
-
-### **Pod Creation Fails**
-```bash
-# Check service account permissions
-kubectl auth can-i create pods --as=system:serviceaccount:ingress-system:paygress-sidecar -n user-workloads
-
-# Check logs
-kubectl logs -n ingress-system -l app=paygress-sidecar
-kubectl describe pod -n ingress-system -l app=paygress-sidecar
-```
-
-### **Minikube Image Issues**
-```bash
-# Check if image exists in Minikube
-minikube image ls | grep paygress
-
-# If image is missing, re-load it
-docker build -t paygress:latest .
-minikube image load paygress:latest
-
-# Check Minikube logs
-minikube logs
-
-# Restart Minikube if needed
-minikube stop && minikube start
-```
-
-### **ImagePullBackOff Error**
-```bash
-# This usually means the image isn't available in Minikube
-# Make sure you've loaded the image:
-minikube image load paygress:latest
-
-# Verify the image is there:
-minikube image ls | grep paygress
-```
-
-### **Port Allocation Issues**
-```bash
-# Check if all ports in range are allocated
-# Look for "No available ports in the configured range" in logs
-kubectl logs -n ingress-system -l app=paygress-sidecar | grep "No available ports"
-
-# Check current port usage
-kubectl logs -n ingress-system -l app=paygress-sidecar | grep "Allocated port"
-
-# If you run out of ports, increase the range in your environment:
-# SSH_PORT_RANGE_START=30000
-# SSH_PORT_RANGE_END=32000  # Increased from 31000
-```
-
-### **SSH Connection Fails**
-```bash
-# Check if pod is running
-kubectl get pods -n user-workloads
-kubectl get svc -n user-workloads
-
-# Check pod logs
-kubectl logs -n user-workloads ssh-pod-<pod-id>
-```
-
-### **Payment Verification Fails**
-```bash
-# Check if mint is accessible
-curl https://mint.cashu.space/info
-
-# Check Cashu database
-kubectl exec -n ingress-system deployment/paygress-sidecar -- ls -la /app/data/
-
-# Verify token manually (HTTP mode only)
-curl -X GET "http://localhost:8080/auth?token=YOUR_TOKEN&duration_minutes=60"
-```
-
-## 🎬 Quick Example
-
-```bash
-# Generate keys using nak
-hex=$(nak key generate)
-echo "hex: $hex"
-
-# Convert hex to bech32 format
-nsec=$(nak encode nsec "$hex")
-echo "nsec: $nsec"
-
-# Get public key (use hex, not bech32)
-npub=$(nak key public "$hex")
-echo "npub: $npub"
-
-# Convert public key to bech32 format
-npub_bech32=$(nak encode npub "$npub")
-echo "npub (bech32): $npub_bech32"
-
-# Store your keys
-export NSEC="$nsec"
-export NPUB="$npub_bech32"
-
-# Get payment
-cashu mint 1000 --url https://mint.cashu.space
-
-# Get service public key from logs
-SERVICE_NPUB="npub1abc123..."  # Replace with actual service public key
-
-# Create request
-REQUEST_JSON='{"cashu_token":"YOUR_TOKEN","ssh_username":"alice","ssh_password":"my_secure_password"}'
-# Send as NIP-17 encrypted private message (NIP-44 + NIP-59 encryption required)
-# Use a proper NIP-17 client that handles NIP-44 + NIP-59 automatically
-
-# Example using a hypothetical NIP-17 client
-# nip17-send --recipient "$SERVICE_PUBKEY_HEX" --content "$REQUEST_JSON" --relays wss://relay.damus.io wss://nos.lol wss://relay.nostr.band
-
-# Listen for NIP-17 private direct message response
-nak req -k 14 --stream wss://relay.damus.io wss://nos.lol wss://relay.nostr.band
-
-# Your client should automatically handle the NIP-17 private direct message
-# NIP-17 handles decryption automatically - the response contains your SSH access details
-
-# Connect via SSH using provided credentials
-ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no alice@$(minikube ip) -p $NODE_PORT
-```
-
-## ⚙️ **Configuration**
-
-### **Environment Variables**
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `RUN_MODE` | `nostr` | Service mode: `nostr` or `http` |
-| `NOSTR_RELAYS` | `wss://relay.damus.io,wss://nos.lol,wss://relay.nostr.band` | Comma-separated list of Nostr relays |
-| `NOSTR_PRIVATE_KEY` | `""` | Service's private key (nsec format) for consistent identity |
-| `WHITELISTED_MINTS` | `https://mint.cashu.space,https://mint.f7z.io,https://legend.lnbits.com/cashu/api/v1` | Comma-separated list of allowed Cashu mint URLs |
-| `POD_NAMESPACE` | `user-workloads` | Kubernetes namespace for SSH pods |
-| `PAYMENT_RATE_SATS_PER_HOUR` | `100` | Payment rate in satoshis per hour |
-| `SSH_BASE_IMAGE` | `linuxserver/openssh-server:latest` | SSH server container image |
-
-### **Custom Configuration**
-
-```bash
-# Set a consistent service identity (recommended for production)
-kubectl -n ingress-system set env deploy/paygress-sidecar NOSTR_PRIVATE_KEY="nsec1your_private_key_here"
-
-# Use custom relays
-kubectl -n ingress-system set env deploy/paygress-sidecar NOSTR_RELAYS="wss://your-relay.com,wss://another-relay.com"
-
-# Configure whitelisted Cashu mints
-kubectl -n ingress-system set env deploy/paygress-sidecar WHITELISTED_MINTS="https://mint.cashu.space,https://mint.f7z.io,https://your-mint.com"
-
-# Update payment rate
-kubectl -n ingress-system set env deploy/paygress-sidecar PAYMENT_RATE_SATS_PER_HOUR="200"
-```
-
-### **Setting Up Consistent Service Identity**
-
-For production use, you should set a consistent private key so your service always has the same public key:
-
-```bash
-# Generate a service keypair using nak
-hex=$(nak key generate)
-echo "hex: $hex"
-
-# Convert hex to bech32 format (nsec1...)
-nsec=$(nak encode nsec "$hex")
-echo "nsec: $nsec"
-
-# Get public key from private key (use hex, not bech32)
-npub=$(nak key public "$hex")
-echo "npub: $npub"
-
-# Convert public key to bech32 format
-npub_bech32=$(nak encode npub "$npub")
-echo "npub (bech32): $npub_bech32"
-
-# Set the private key in your deployment (use bech32 format)
-SERVICE_PRIVATE_KEY="$nsec"  # Your service private key in bech32 format
-kubectl -n ingress-system set env deploy/paygress-sidecar NOSTR_PRIVATE_KEY="$SERVICE_PRIVATE_KEY"
-
-# Share the public key with users
-echo "Service public key: $npub_bech32"
-```
+**Complete NIP-17 encrypted private message-based workflow - no HTTP endpoints needed!** 🚀
+**Complete NIP-17 encrypted private message-based workflow - no HTTP endpoints needed!** 🚀
