@@ -221,7 +221,7 @@
       git:
         repo: https://github.com/DhananjayPurohit/paygress.git
         dest: "{{ paygress_dir }}"
-        version: main
+        version: feat/ansible-script-with-port
 
     - name: Create user-workloads namespace
       become_user: "{{ paygress_user }}"

@@ -568,10 +568,10 @@ impl SidecarState {
         use std::net::{TcpListener, SocketAddr};
         let addr = SocketAddr::from(([0, 0, 0, 0], port));
         match TcpListener::bind(addr) {
-            Ok(_) => {
+            Ok(_listener) => {
                 // Port is available, but double-check with system commands
-                drop(addr); // Close the listener
-                false
+                // The listener will be automatically dropped when it goes out of scope
+                return false;
             },
             Err(_) => {
                 // Port is definitely in use
