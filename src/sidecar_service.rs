@@ -628,15 +628,54 @@ impl SidecarState {
         Err(format!("No available ports found in range {}-{}", start_port, start_port + max_attempts - 1))
     }
 
-    // Generate unique SSH port for each pod from the port pool with validation
-    pub fn generate_ssh_port(&self) -> Result<u16, String> {
-        let mut port_pool = self.port_pool.lock().map_err(|e| format!("Failed to lock port pool: {}", e))?;
+    // Check what ports are actually in use by existing pods
+    async fn get_ports_in_use_by_pods(&self) -> Result<HashSet<u16>, String> {
+        use kube::Api;
+        use k8s_openapi::api::core::v1::Pod;
         
-        // First, clean up any ports that are marked as allocated but are actually free
-        let allocated_ports: Vec<u16> = port_pool.allocated_ports.iter().cloned().collect();
+        let pods_api: Api<Pod> = Api::namespaced(self.k8s_client.client.clone(), &self.config.pod_namespace);
+        let pods = pods_api.list(&kube::api::ListParams::default()).await
+            .map_err(|e| format!("Failed to list pods: {}", e))?;
+        
+        let mut used_ports = HashSet::new();
+        for pod in pods.items {
+            if let Some(spec) = &pod.spec {
+                for container in &spec.containers {
+                    if let Some(ports) = &container.ports {
+                        for port in ports {
+                            if let Some(host_port) = port.host_port {
+                                used_ports.insert(host_port as u16);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        info!("Found {} ports in use by existing pods: {:?}", used_ports.len(), used_ports);
+        Ok(used_ports)
+    }
+
+    // Generate unique SSH port for each pod from the port pool with simple collision prevention
+    pub async fn generate_ssh_port(&self) -> Result<u16, String> {
+        // Get ports actually in use by existing pods first (before holding any locks)
+        let pods_using_ports = self.get_ports_in_use_by_pods().await
+            .unwrap_or_else(|e| {
+                warn!("Failed to get ports in use by pods: {}", e);
+                HashSet::new()
+            });
+        
+        // Get a snapshot of allocated ports to check outside the lock
+        let allocated_ports: Vec<u16> = {
+            let port_pool = self.port_pool.lock().map_err(|e| format!("Failed to lock port pool: {}", e))?;
+            port_pool.allocated_ports.iter().cloned().collect()
+        };
+        
+        // Clean up any ports that are marked as allocated but are actually free
         for port in allocated_ports {
-            if !self.is_port_in_use(port) {
+            if !self.is_port_in_use(port) && !pods_using_ports.contains(&port) {
                 // Port is actually free, move it back to available
+                let mut port_pool = self.port_pool.lock().map_err(|e| format!("Failed to lock port pool: {}", e))?;
                 port_pool.allocated_ports.remove(&port);
                 port_pool.available_ports.insert(port);
                 info!("Port {} was marked allocated but is actually free - moving back to available", port);
@@ -644,21 +683,37 @@ impl SidecarState {
         }
         
         // Try to find an available port that's actually free
-        let available_ports: Vec<u16> = port_pool.available_ports.iter().cloned().collect();
+        let available_ports: Vec<u16> = {
+            let port_pool = self.port_pool.lock().map_err(|e| format!("Failed to lock port pool: {}", e))?;
+            port_pool.available_ports.iter().cloned().collect()
+        };
         
         for port in available_ports {
-            // Double-check if port is actually available on the system
-            if !self.is_port_in_use(port) {
-                // Port is free, allocate it
-                port_pool.available_ports.remove(&port);
-                port_pool.allocated_ports.insert(port);
+            // Double-check if port is actually available on the system and not used by pods
+            if !self.is_port_in_use(port) && !pods_using_ports.contains(&port) {
+                // Add small random delay to reduce race conditions (1-10ms)
+                let delay_ms = (port % 10) + 1;
+                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms as u64)).await;
                 
-                info!("✅ Allocated unique SSH port {} from pool ({} available, {} allocated)", 
-                      port, port_pool.available_count(), port_pool.allocated_count());
-                return Ok(port);
+                // Double-check again after delay
+                if !self.is_port_in_use(port) && !pods_using_ports.contains(&port) {
+                    // Port is free, allocate it
+                    let mut port_pool = self.port_pool.lock().map_err(|e| format!("Failed to lock port pool: {}", e))?;
+                    port_pool.available_ports.remove(&port);
+                    port_pool.allocated_ports.insert(port);
+                    
+                    info!("✅ Allocated unique SSH port {} from pool ({} available, {} allocated)", 
+                          port, port_pool.available_count(), port_pool.allocated_count());
+                    return Ok(port);
+                }
+            }
+            
+            // Port is in use by system or pods, remove from available pool
+            let mut port_pool = self.port_pool.lock().map_err(|e| format!("Failed to lock port pool: {}", e))?;
+            port_pool.available_ports.remove(&port);
+            if pods_using_ports.contains(&port) {
+                warn!("Port {} is in use by existing pod - removed from pool", port);
             } else {
-                // Port is in use by system, remove from available pool
-                port_pool.available_ports.remove(&port);
                 warn!("Port {} is in use by system - removed from pool", port);
             }
         }
@@ -670,14 +725,25 @@ impl SidecarState {
         info!("No ports available in pool, searching range {}-{}", start_port, end_port);
         
         for port in start_port..=end_port {
-            // Skip if already allocated in our pool
-            if port_pool.allocated_ports.contains(&port) {
+            // Skip if used by existing pods
+            if pods_using_ports.contains(&port) {
+                continue;
+            }
+            
+            // Check if port is already allocated in our pool
+            let is_allocated = {
+                let port_pool = self.port_pool.lock().map_err(|e| format!("Failed to lock port pool: {}", e))?;
+                port_pool.allocated_ports.contains(&port)
+            };
+            
+            if is_allocated {
                 continue;
             }
             
             // Check if port is actually available on system
             if !self.is_port_in_use(port) {
                 // Found a free port outside our pool - allocate it
+                let mut port_pool = self.port_pool.lock().map_err(|e| format!("Failed to lock port pool: {}", e))?;
                 port_pool.allocated_ports.insert(port);
                 
                 info!("✅ Allocated unique SSH port {} from range ({} available, {} allocated)", 
@@ -916,7 +982,7 @@ async fn spawn_pod_handler(
     let username = request.ssh_username.unwrap_or_else(|| format!("user-{}", &pod_name[4..12]));
     let password = request.ssh_password.unwrap_or_else(|| SidecarState::generate_password());
     let image = request.pod_image.unwrap_or_else(|| state.config.base_image.clone());
-    let allocated_port = match state.generate_ssh_port() {
+    let allocated_port = match state.generate_ssh_port().await {
         Ok(port) => port,
         Err(e) => {
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(SpawnPodResponse {

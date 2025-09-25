@@ -287,7 +287,7 @@ async fn handle_spawn_pod_request(
     let username = request.ssh_username;
     let password = request.ssh_password;
     let image = request.pod_image;
-    let ssh_port = match state_clone.generate_ssh_port() {
+    let ssh_port = match state_clone.generate_ssh_port().await {
         Ok(port) => port,
         Err(e) => {
             let error = paygress::nostr::ErrorResponseContent {
