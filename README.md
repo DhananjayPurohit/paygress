@@ -434,8 +434,10 @@ Ensure you have:
 # 1. Apply the Kubernetes manifests
 kubectl apply -f k8s/
 
-# 2. Create configmap with your environment configuration
-kubectl create configmap paygress-config --from-env-file=paygress.env
+# 2. Create configmaps with your environment configuration
+kubectl create configmap paygress-env-config --from-env-file=paygress.env --namespace=ingress-system --dry-run=client -o yaml | kubectl apply -f -
+
+kubectl create configmap paygress-pod-specs --from-file=pod-specs.json --namespace=ingress-system --dry-run=client -o yaml | kubectl apply -f -
 
 # 3. Verify deployment
 kubectl get pods -n ingress-system
@@ -445,8 +447,10 @@ kubectl get services -n ingress-system
 kubectl logs -n ingress-system -l app=paygress-sidecar
 
 # 5. Update configuration (if needed)
-kubectl delete configmap paygress-config
-kubectl create configmap paygress-config --from-env-file=paygress.env
+kubectl delete configmap paygress-env-config -n ingress-system
+kubectl delete configmap paygress-pod-specs -n ingress-system
+kubectl create configmap paygress-env-config --from-env-file=paygress.env --namespace=ingress-system --dry-run=client -o yaml | kubectl apply -f -
+kubectl create configmap paygress-pod-specs --from-file=pod-specs.json --namespace=ingress-system --dry-run=client -o yaml | kubectl apply -f -
 kubectl rollout restart deployment/paygress-sidecar -n ingress-system
 ```
 

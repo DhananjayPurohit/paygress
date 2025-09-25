@@ -203,8 +203,6 @@ impl PodManager {
         use kube::Api;
 
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
-        let _services: Api<Service> = Api::namespaced(self.client.clone(), namespace);
-        let _configmaps: Api<k8s_openapi::api::core::v1::ConfigMap> = Api::namespaced(self.client.clone(), namespace);
 
         // Create SSH environment variables
         let env_vars = vec![
@@ -302,13 +300,13 @@ impl PodManager {
         // Create volumes
         let _volumes: Vec<Volume> = Vec::new();
 
-        // Create containers with host networking
+        // Create containers with direct host port binding for SSH access
         let containers = vec![Container {
             name: "ssh-server".to_string(),
             image: Some(image.to_string()),
             ports: Some(vec![ContainerPort {
                 container_port: 22, // SSH listens on port 22 inside container
-                host_port: Some(ssh_port as i32), // Map to unique host port (2222, 2223, 2224, etc.)
+                host_port: Some(ssh_port as i32), // Bind directly to unique host port
                 name: Some("ssh".to_string()),
                 protocol: Some("TCP".to_string()),
                 ..Default::default()
@@ -347,7 +345,8 @@ impl PodManager {
                 volumes: None,
                 restart_policy: Some("Never".to_string()),
                 active_deadline_seconds: Some(duration_seconds as i64), // Kubernetes will auto-terminate after this time
-                host_network: Some(false), // Use hostPort instead of host networking
+                host_network: Some(false), // Use regular pod networking with hostPort binding
+                dns_policy: Some("ClusterFirst".to_string()), // Standard DNS policy
                 ..Default::default()
             }),
             ..Default::default()
@@ -357,12 +356,15 @@ impl PodManager {
         let pp = PostParams::default();
         pods.create(&pp, &pod).await.map_err(|e| format!("Failed to create pod: {}", e))?;
 
+        // Use host networking with direct port binding for efficiency
+        // This eliminates the need for separate services per pod
+        // Each pod gets a unique port on the host directly
+
         // Wait for pod to be ready
         tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
 
-        // With hostPort, SSH is directly accessible on the host at the allocated port
-        // No service needed - direct access via public IP + unique port
-        let node_port = ssh_port; // The allocated port is directly accessible
+        // SSH is directly accessible via hostPort binding
+        let node_port = ssh_port; // The allocated port is directly accessible on the host
 
         info!(
             pod_name = %pod_name, 
@@ -370,7 +372,8 @@ impl PodManager {
             duration_seconds = %duration_seconds,
             ssh_port = %ssh_port,
             username = %username,
-            "Created SSH pod with service"
+            node_port = %node_port,
+            "SSH pod created with direct host port access (no service overhead)"
         );
 
         // Access details are now sent via NIP-17 Gift Wrap private messages from main.rs
@@ -428,22 +431,15 @@ impl PodManager {
     pub async fn delete_pod(&self, namespace: &str, pod_name: &str) -> Result<(), String> {
         use kube::api::DeleteParams;
         use kube::Api;
-        use k8s_openapi::api::core::v1::{Pod, Service, ConfigMap};
+        use k8s_openapi::api::core::v1::Pod;
 
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
-        let services: Api<Service> = Api::namespaced(self.client.clone(), namespace);
-        let _configmaps: Api<ConfigMap> = Api::namespaced(self.client.clone(), namespace);
 
         // Delete the pod
         let dp = DeleteParams::default();
         let _ = pods.delete(pod_name, &dp).await;
 
-        // Delete the associated service
-        let service_name = format!("{}-ssh", pod_name);
-        let _ = services.delete(&service_name, &dp).await;
-
-
-        info!(pod_name = %pod_name, namespace = %namespace, "Deleted pod and service");
+        info!(pod_name = %pod_name, namespace = %namespace, "Deleted pod (no services to clean up - using hostPort)");
         Ok(())
     }
 
@@ -564,46 +560,62 @@ impl SidecarState {
         }
     }
 
-    // Check if port is in use by checking netstat or ss command
+    // Check if port is in use using multiple methods for reliability
     pub fn is_port_in_use(&self, port: u16) -> bool {
         use std::process::Command;
         
-        // Try netstat first
-        let netstat_result = Command::new("netstat")
-            .args(&["-tlnp"])
-            .output();
-            
-        if let Ok(output) = netstat_result {
-            let output_str = String::from_utf8_lossy(&output.stdout);
-            // Check for both :port and :port  patterns
-            if output_str.contains(&format!(":{} ", port)) || 
-               output_str.contains(&format!(":{}:", port)) ||
-               output_str.contains(&format!(":{}", port)) {
+        // Method 1: Try to bind to the port (most reliable)
+        use std::net::{TcpListener, SocketAddr};
+        let addr = SocketAddr::from(([0, 0, 0, 0], port));
+        match TcpListener::bind(addr) {
+            Ok(_) => {
+                // Port is available, but double-check with system commands
+                drop(addr); // Close the listener
+                false
+            },
+            Err(_) => {
+                // Port is definitely in use
                 return true;
             }
         }
         
-        // Fallback to ss command
+        // Method 2: Check with ss command (more reliable than netstat)
         let ss_result = Command::new("ss")
             .args(&["-tlnp"])
             .output();
             
         if let Ok(output) = ss_result {
             let output_str = String::from_utf8_lossy(&output.stdout);
-            if output_str.contains(&format!(":{} ", port)) || 
-               output_str.contains(&format!(":{}:", port)) ||
-               output_str.contains(&format!(":{}", port)) {
-                return true;
+            // Look for exact port matches in listening state
+            for line in output_str.lines() {
+                if line.contains("LISTEN") && 
+                   (line.contains(&format!(":{} ", port)) || 
+                    line.contains(&format!(":{}:", port)) ||
+                    line.ends_with(&format!(":{}", port))) {
+                    return true;
+                }
             }
         }
         
-        // Also check if port is in use by trying to bind to it
-        use std::net::{TcpListener, SocketAddr};
-        let addr = SocketAddr::from(([0, 0, 0, 0], port));
-        match TcpListener::bind(addr) {
-            Ok(_) => false, // Port is available
-            Err(_) => true, // Port is in use
+        // Method 3: Fallback to netstat
+        let netstat_result = Command::new("netstat")
+            .args(&["-tlnp"])
+            .output();
+            
+        if let Ok(output) = netstat_result {
+            let output_str = String::from_utf8_lossy(&output.stdout);
+            for line in output_str.lines() {
+                if line.contains("LISTEN") && 
+                   (line.contains(&format!(":{} ", port)) || 
+                    line.contains(&format!(":{}:", port)) ||
+                    line.ends_with(&format!(":{}", port))) {
+                    return true;
+                }
+            }
         }
+        
+        // If all checks pass, port is available
+        false
     }
 
     // Find next available port starting from a given port
@@ -641,27 +653,34 @@ impl SidecarState {
                 port_pool.available_ports.remove(&port);
                 port_pool.allocated_ports.insert(port);
                 
-                info!("Allocated port {} from pool ({} available, {} allocated)", 
+                info!("✅ Allocated unique SSH port {} from pool ({} available, {} allocated)", 
                       port, port_pool.available_count(), port_pool.allocated_count());
                 return Ok(port);
             } else {
-                // Port is in use, remove from available pool and add to allocated
+                // Port is in use by system, remove from available pool
                 port_pool.available_ports.remove(&port);
-                port_pool.allocated_ports.insert(port);
-                warn!("Port {} was marked available but is actually in use - removing from pool", port);
+                warn!("Port {} is in use by system - removed from pool", port);
             }
         }
         
-        // If no ports in pool, try to find any available port in range
+        // If no ports in pool, search entire range for any free port
         let start_port = self.config.ssh_port_range_start;
         let end_port = self.config.ssh_port_range_end;
         
+        info!("No ports available in pool, searching range {}-{}", start_port, end_port);
+        
         for port in start_port..=end_port {
+            // Skip if already allocated in our pool
+            if port_pool.allocated_ports.contains(&port) {
+                continue;
+            }
+            
+            // Check if port is actually available on system
             if !self.is_port_in_use(port) {
-                // Found an available port outside the pool
+                // Found a free port outside our pool - allocate it
                 port_pool.allocated_ports.insert(port);
                 
-                info!("Allocated port {} outside pool ({} available, {} allocated)", 
+                info!("✅ Allocated unique SSH port {} from range ({} available, {} allocated)", 
                       port, port_pool.available_count(), port_pool.allocated_count());
                 return Ok(port);
             }

@@ -147,43 +147,6 @@ spec:
     name: http
   type: ClusterIP
 ---
-# ServiceAccount for the paygress-sidecar
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: paygress-sidecar
-  namespace: ingress-system
----
-# ClusterRole with permissions to manage pods
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: paygress-sidecar
-rules:
-- apiGroups: [""]
-  resources: ["pods"]
-  verbs: ["get", "list", "create", "update", "patch", "delete"]
-- apiGroups: [""]
-  resources: ["services"]
-  verbs: ["get", "list", "create", "update", "patch", "delete"]
-- apiGroups: [""]
-  resources: ["namespaces"]
-  verbs: ["get", "list"]
----
-# ClusterRoleBinding to bind the ClusterRole to the ServiceAccount
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: paygress-sidecar
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: paygress-sidecar
-subjects:
-- kind: ServiceAccount
-  name: paygress-sidecar
-  namespace: ingress-system
----
 # User workloads namespace for SSH pods
 apiVersion: v1
 kind: Namespace
