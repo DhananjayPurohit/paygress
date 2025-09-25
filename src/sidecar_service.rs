@@ -305,7 +305,7 @@ impl PodManager {
             name: "ssh-server".to_string(),
             image: Some(image.to_string()),
             ports: Some(vec![ContainerPort {
-                container_port: 22, // SSH listens on port 22 inside container
+                container_port: 2222, // SSH listens on port 2222 inside linuxserver/openssh-server container
                 host_port: Some(ssh_port as i32), // Bind directly to unique host port
                 name: Some("ssh".to_string()),
                 protocol: Some("TCP".to_string()),
