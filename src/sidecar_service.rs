@@ -11,20 +11,19 @@ use std::sync::Arc;
 use tracing::{info, warn, error};
 use std::collections::{HashMap, BTreeMap, HashSet};
 use chrono::{DateTime, Utc};
-use nostr_sdk::{Keys, Client, Url, EventBuilder, Kind, Tag};
+// Removed unused nostr_sdk imports
 use kube::{Api, api::ListParams};
 use k8s_openapi::api::core::v1::Pod;
 // Using NIP-17 private direct messages - no manual encryption needed
 use std::sync::Mutex;
 
-use crate::{cashu, initialize_cashu};
+use crate::{cashu, initialize_cashu, nostr};
 
 // Configuration for the sidecar service
 #[derive(Clone, Debug)]
 pub struct SidecarConfig {
     pub cashu_db_path: String,
     pub pod_namespace: String,
-    pub payment_rate_msats_per_sec: u64, // Payment rate in msats per second
     pub minimum_pod_duration_seconds: u64, // Minimum pod duration in seconds
     pub base_image: String, // Base image for pods
     pub ssh_host: String, // SSH host for connections
@@ -32,6 +31,7 @@ pub struct SidecarConfig {
     pub ssh_port_range_end: u16, // End of port range for pod allocation
     pub enable_cleanup_task: bool,
     pub whitelisted_mints: Vec<String>, // Allowed Cashu mint URLs
+    pub pod_specs: Vec<nostr::PodSpec>, // Available pod specifications
 }
 
 impl Default for SidecarConfig {
@@ -39,18 +39,14 @@ impl Default for SidecarConfig {
         Self {
             cashu_db_path: "./cashu.db".to_string(),
             pod_namespace: "user-workloads".to_string(),
-            payment_rate_msats_per_sec: 100, // 100 msats per second
             minimum_pod_duration_seconds: 60, // 1 minute minimum
             base_image: "linuxserver/openssh-server:latest".to_string(),
             ssh_host: "localhost".to_string(),
             ssh_port_range_start: 30000,
             ssh_port_range_end: 31000,
             enable_cleanup_task: true,
-            whitelisted_mints: vec![
-                "https://mint.cashu.space".to_string(),
-                "https://mint.f7z.io".to_string(),
-                "https://legend.lnbits.com/cashu/api/v1".to_string(),
-            ],
+            whitelisted_mints: vec![], // Will be populated from environment variables
+            pod_specs: vec![], // Will be populated from environment variables
         }
     }
 }
@@ -377,17 +373,8 @@ impl PodManager {
             "Created SSH pod with service"
         );
 
-        // Send access event from the service (not the pod) for security
-        let _ = Self::send_pod_access_event_from_service(
-            &pod_npub,
-            user_pubkey,
-            &pod_name,
-            username,
-            password,
-            node_port,
-            duration_seconds,
-            &config.ssh_host,
-        ).await;
+        // Access details are now sent via NIP-17 Gift Wrap private messages from main.rs
+        // No need to send public kind 15 events anymore
 
         Ok(node_port)
     }
@@ -436,89 +423,6 @@ impl PodManager {
     }
 
 
-    // Function to send access event from the service (secure)
-    async fn send_pod_access_event_from_service(
-        pod_npub: &str,
-        user_pubkey: &str,
-        _pod_name: &str,
-        username: &str,
-        password: &str,
-        node_port: u16,
-        duration_seconds: u64,
-        ssh_host: &str,
-    ) -> Result<(), String> {
-        use nostr_sdk::prelude::*;
-        use std::env;
-        
-        // Create access details
-        let access_details = serde_json::json!({
-            "kind": "access_details",
-            "pod_npub": pod_npub,        // Use NPUB instead of pod_name
-            "ssh_username": username,
-            "ssh_password": password,
-            "node_port": node_port,
-            "expires_at": (Utc::now() + chrono::Duration::seconds(duration_seconds as i64)).to_rfc3339(),
-            "instructions": vec![
-                "🚀 SSH access available:".to_string(),
-                "".to_string(),
-                "Direct access (no kubectl needed):".to_string(),
-                format!("   ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no {}@{} -p {}", username, ssh_host, node_port),
-                "".to_string(),
-                "⚠️  Pod expires at:".to_string(),
-                format!("   {}", (Utc::now() + chrono::Duration::seconds(duration_seconds as i64)).format("%Y-%m-%d %H:%M:%S UTC")),
-                "".to_string(),
-                "📋 Pod Details:".to_string(),
-                format!("   Pod NPUB: {}", pod_npub),
-                format!("   Duration: {} seconds", duration_seconds),
-            ]
-        });
-
-        // Get service keys from environment
-        let service_nsec = env::var("NOSTR_PRIVATE_KEY")
-            .map_err(|_| "NOSTR_PRIVATE_KEY not found in environment")?;
-        let service_keys = Keys::parse(&service_nsec)
-            .map_err(|e| format!("Invalid service nsec: {}", e))?;
-        
-        let client = Client::new(&service_keys);
-        
-        // Add relays
-        let relay_urls = env::var("NOSTR_RELAYS")
-            .unwrap_or_else(|_| "wss://relay.damus.io,wss://nos.lol,wss://relay.nostr.band".to_string());
-        for relay_url in relay_urls.split(',') {
-            let relay = relay_url.trim();
-            if !relay.is_empty() {
-                let _ = client.add_relay(relay).await;
-            }
-        }
-        
-        client.connect().await;
-        
-        // Parse user public key
-        let user_pubkey_parsed = nostr_sdk::PublicKey::parse(user_pubkey)
-            .map_err(|e| format!("Invalid user pubkey: {}", e))?;
-        
-        // Send as kind 15 event
-        let tags = vec![
-            Tag::hashtag("paygress"),
-            Tag::hashtag("access_details"),
-        ];
-        
-        let builder = EventBuilder::new(Kind::Custom(15), access_details.to_string(), tags);
-        let event = builder.to_event(&service_keys)
-            .map_err(|e| format!("Failed to create event: {}", e))?;
-        
-        match client.send_event(event).await {
-            Ok(event_id) => {
-                info!("Service sent access details via kind 15 event with ID: {:?}", event_id);
-            }
-            Err(e) => {
-                error!("Failed to send kind 15 event from service: {}", e);
-                return Err(format!("Failed to send kind 15 event: {}", e));
-            }
-        }
-        
-        Ok(())
-    }
 
 
     pub async fn delete_pod(&self, namespace: &str, pod_name: &str) -> Result<(), String> {
@@ -618,9 +522,12 @@ impl SidecarState {
         })
     }
 
-    // Calculate duration based on payment amount (configurable pricing)
+    // Calculate duration based on payment amount (using first available spec as default)
     pub fn calculate_duration_from_payment(&self, payment_msats: u64) -> u64 {
-        let msats_per_sec = self.config.payment_rate_msats_per_sec.max(1);
+        let msats_per_sec = self.config.pod_specs.first()
+            .map(|spec| spec.rate_msats_per_sec)
+            .unwrap_or(100) // Default rate if no specs available
+            .max(1);
         
         // Calculate duration in seconds: payment_msats / msats_per_sec
         payment_msats / msats_per_sec
@@ -887,7 +794,7 @@ async fn auth_check(
     if !state.is_payment_sufficient(payment_amount_msats) {
         warn!("❌ Insufficient payment: {} msats (minimum required: {} msats for {} seconds)", 
             payment_amount_msats, 
-            state.config.minimum_pod_duration_seconds * state.config.payment_rate_msats_per_sec,
+            state.config.minimum_pod_duration_seconds * state.config.pod_specs.first().map(|s| s.rate_msats_per_sec).unwrap_or(100),
             state.config.minimum_pod_duration_seconds);
         return StatusCode::PAYMENT_REQUIRED.into_response();
     }
@@ -945,7 +852,7 @@ async fn spawn_pod_handler(
 
     // Check if payment is sufficient for minimum duration
     if !state.is_payment_sufficient(payment_amount_msats) {
-        let minimum_required = state.config.minimum_pod_duration_seconds * state.config.payment_rate_msats_per_sec;
+        let minimum_required = state.config.minimum_pod_duration_seconds * state.config.pod_specs.first().map(|s| s.rate_msats_per_sec).unwrap_or(100);
         return (StatusCode::PAYMENT_REQUIRED, Json(SpawnPodResponse {
             success: false,
             message: format!("Insufficient payment: {} msats. Minimum required: {} msats for {} seconds", 
@@ -1218,7 +1125,7 @@ pub async fn top_up_pod_handler(
         return (StatusCode::PAYMENT_REQUIRED, Json(TopUpPodResponse {
             success: false,
             message: format!("Insufficient payment: {} msats. Minimum required: {} msats for 1 second extension", 
-                payment_amount_msats, state.config.payment_rate_msats_per_sec),
+                payment_amount_msats, state.config.pod_specs.first().map(|s| s.rate_msats_per_sec).unwrap_or(100)),
             pod_info: None,
             extended_duration_seconds: None,
         })).into_response();
@@ -1359,7 +1266,10 @@ pub async fn start_sidecar_service(bind_addr: &str, config: SidecarConfig) -> Re
     
     println!("🚀 Starting Paygress Sidecar Service");
     println!("📍 Listening on: {}", bind_addr);
-    println!("💰 Payment rate: {} msats/second", config.payment_rate_msats_per_sec);
+    println!("💰 Available pod specs: {}", config.pod_specs.len());
+    for spec in &config.pod_specs {
+        println!("   - {}: {} msats/sec ({} CPU, {} MB)", spec.name, spec.rate_msats_per_sec, spec.cpu_millicores, spec.memory_mb);
+    }
     println!("⏱️  Minimum duration: {} seconds", config.minimum_pod_duration_seconds);
     println!("🔐 SSH port range: {}-{}", config.ssh_port_range_start, config.ssh_port_range_end);
     println!("📋 Endpoints:");
