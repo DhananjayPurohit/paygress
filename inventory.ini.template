@@ -1,0 +1,14 @@
+[ubuntu_servers]
+# Replace with your actual server details
+# Example:
+production ansible_host=YOUR_SERVER_IP ansible_user=YOUR_USERNAME ansible_ssh_pass=YOUR_PASSWORD ansible_become_pass=YOUR_PASSWORD
+
+# Alternative with SSH key (recommended for production):
+# production ansible_host=YOUR_SERVER_IP ansible_user=YOUR_USERNAME ansible_ssh_private_key_file=~/.ssh/your_key
+
+# For testing with localhost (if you want to test on the same machine):
+# localhost ansible_connection=local ansible_user=YOUR_LOCAL_USER
+
+[ubuntu_servers:vars]
+ansible_python_interpreter=/usr/bin/python3
+ansible_ssh_common_args='-o StrictHostKeyChecking=no'
