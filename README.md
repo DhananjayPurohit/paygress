@@ -29,14 +29,14 @@ RUST_LOG=info
 
 # Nostr Configuration (REQUIRED)
 NOSTR_RELAYS=wss://relay.damus.io,wss://nos.lol,wss://relay.nostr.band,wss://nostr.wine
-NOSTR_PRIVATE_KEY=nsec1your_private_key_here
+NOSTR_PRIVATE_KEY=nsec1...
 
 # Cashu Configuration (REQUIRED)
 WHITELISTED_MINTS=https://mint.cashu.space,https://mint.f7z.io
 
 # SSH Pod Configuration
 BASE_IMAGE=linuxserver/openssh-server:latest
-SSH_HOST=your-server-ip
+SSH_HOST=server-public-ip
 SSH_PORT_RANGE_START=2000
 SSH_PORT_RANGE_END=3000
 
@@ -192,7 +192,7 @@ Send a NIP-17 Gift Wrap private message to the service:
 **Request Structure:**
 ```json
 {
-  "cashu_token": "cashuBo2FteCJodHRwczovL25vZmVlcy50ZXN0bnV0LmNhc2h1LnNwYWNlYXVjc2F0YXSBomFpSAC0zSfYhhpEYXCDo2FhBGFzeEBmNTNiMWQzMmI5YTUzMjg5MzhkYjY5NDUzMzgwYjZkMDVkZGZhZGJiZWU0NzFjZmEyNmQ0ZmUwYjFjYWM4NjA4YWNYIQMPHPPWoE6w_VW3PxfWSjuOZVPifjnkpvFe7VC7M_wuY6NhYRggYXN4QDlmMzk4NzAyN2RlYmRlYmJlNzhmNmM4YmJkZWU1MmRhZTg2ZmYzODA3OTc5N2VlNzc4ZmYzNGFkNTFmNDJlYWFhY1ghA6s8St63aM3eZRzYq6iJNv9xfgfLM0Mn7LC0npKsn82_o2FhGEBhc3hAMGRkMzhlY2IyNDhmMmQ3NzliMzFjZjAyYzEyN2FmN2YyOWY0YWM3NjZhNDY2MzVjMDhjZGZlMjQ5YzE5ZWJkNWFjWCECgzYuwUmEWMFVMP-ROxDzNAPJgZiXChNw66GUvggSwVA",
+  "cashu_token": "cashu...",
   "pod_spec_id": "standard",
   "pod_image": "linuxserver/openssh-server:latest",
   "ssh_username": "alice",
@@ -230,7 +230,7 @@ The service will send back access details via NIP-17 Gift Wrap private message:
 **Access Details Structure:**
 ```json
 {
-  "pod_npub": "npub1abc123def456ghi789...",
+  "pod_npub": "npub...",
   "node_port": 2500,
   "expires_at": "2025-09-23T15:30:00Z",
   "cpu_millicores": 2000,
@@ -241,7 +241,7 @@ The service will send back access details via NIP-17 Gift Wrap private message:
     "🚀 SSH access available:",
     "",
     "Direct access (no kubectl needed):",
-    "   ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no alice@37.27.165.100 -p 2500",
+    "   ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no alice@-PUBLIC-IP -p 2500",
     "",
     "⚠️  Pod expires at:",
     "   2025-09-23 15:30:00 UTC",
@@ -261,7 +261,7 @@ The service will send back access details via NIP-17 Gift Wrap private message:
 Use the provided SSH command:
 
 ```bash
-ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no alice@37.27.165.100 -p 2500
+   ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no alice@server-public-ip -p 2500
 ```
 
 ### **Step 7: Top-Up Pod Duration**
@@ -271,8 +271,8 @@ To extend your pod's lifetime, send a top-up request:
 **Top-Up Request Structure:**
 ```json
 {
-  "pod_npub": "npub1abc123def456ghi789...",
-  "cashu_token": "cashuBo2FteCJodHRwczovL25vZmVlcy50ZXN0bnV0LmNhc2h1LnNwYWNlYXVjc2F0YXSBomFpSAC0zSfYhhpEYXCDo2FhBGFzeEAzYTkwNWIzOTY0OWIyMGY1OTI0YTRkZGJiZjRlZWI4OGYwNWU2ZTljNGMyNDYyNWIxZWQwYTViZDNkNjM1ZWZhYWNYIQMsh6TMtV9nymg-fiTwRdwWpv7p2icKc4Zhp1RoNn4bU6NhYRggYXN4QGQ5MTUzMTdiYWU1OTVlOTJhZWIwMjhmM2ZjNmZiYzNlNzhlMjgxMGIwYmNiNTk3ZDc2OTY4ZWUyNmZkNWFlODFhY1ghA6oPPZrjcANzjAh3wMBthEthvwHMeDso851ktJ3l0Nboo2FhGEBhc3hAYzU2Yzc2ZDI2ZDIzNmE0NmY1MTQzZjQyNTg2MWU3ZGM5ZTcwMDQ1NDVlZjdjMTcyY2Y1YzkzZTYwNjI2ZDliY2FjWCEDMARUfSku0P5Iv4wRcD4luHIgLceeQIfl07CBBsG6qFE"
+  "pod_npub": "npub...",
+  "cashu_token": "cashu..."
 }
 ```
 
@@ -284,7 +284,7 @@ To extend your pod's lifetime, send a top-up request:
 ```bash
 # Create top-up request JSON
 echo '{
-  "pod_npub": "npub1abc123def456ghi789...",
+  "pod_npub": "npub...",
   "cashu_token": "your_topup_cashu_token_here"
 }' > topup.json
 
@@ -301,7 +301,7 @@ The service will send back a top-up confirmation via NIP-17 Gift Wrap private me
 ```json
 {
   "success": true,
-  "pod_npub": "npub1abc123def456ghi789...",
+  "pod_npub": "npub...",
   "extended_duration_seconds": 3600,
   "new_expires_at": "2025-09-23T16:30:00Z",
   "message": "Pod successfully topped up!"
@@ -412,7 +412,7 @@ POD_SPECS=[
 | `NOSTR_PRIVATE_KEY` | ✅ | Service's Nostr private key (nsec) | `nsec1...` |
 | `WHITELISTED_MINTS` | ✅ | Comma-separated mint URLs | `https://mint.cashu.space,https://mint.f7z.io` |
 | `POD_SPECS` | ✅ | JSON array of pod specifications | See example above |
-| `SSH_HOST` | ✅ | Public IP for SSH access | `37.27.165.100` |
+| `SSH_HOST` | ✅ | Public IP for SSH access | `server-public-ip` |
 | `POD_NAMESPACE` | ❌ | Kubernetes namespace | `user-workloads` |
 | `MINIMUM_POD_DURATION_SECONDS` | ❌ | Minimum pod lifetime | `60` |
 | `BASE_IMAGE` | ❌ | Base container image | `linuxserver/openssh-server:latest` |

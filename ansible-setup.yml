@@ -7,11 +7,8 @@
     containerd_version: "1.6.24"
     paygress_user: "{{ ansible_user }}"
     paygress_dir: "/home/{{ paygress_user }}/paygress"
-    # Public IP configuration - set these in your inventory or group_vars
-    public_ip: "{{ public_ip | default('CHANGE_ME') }}"
-    ssh_port_start: "{{ ssh_port_start | default(1000) }}"
-    ssh_port_end: "{{ ssh_port_end | default(1999) }}"
-    main_service_port: "{{ main_service_port | default(1000) }}"
+    # All configuration variables are defined in inventory.ini
+    # public_ip, ssh_port_start, ssh_port_end, main_service_port
     
   tasks:
     # ===============================
@@ -253,6 +250,27 @@
         regexp: 'CASHU_DB_PATH=.*'
         replace: 'CASHU_DB_PATH={{ paygress_dir }}/data/cashu.db'
 
+    - name: Update paygress.env with Nostr relays
+      become_user: "{{ paygress_user }}"
+      replace:
+        path: "{{ paygress_dir }}/paygress.env"
+        regexp: 'NOSTR_RELAYS=.*'
+        replace: 'NOSTR_RELAYS={{ nostr_relays }}'
+
+    - name: Update paygress.env with Nostr private key
+      become_user: "{{ paygress_user }}"
+      replace:
+        path: "{{ paygress_dir }}/paygress.env"
+        regexp: 'NOSTR_PRIVATE_KEY=.*'
+        replace: 'NOSTR_PRIVATE_KEY={{ nostr_private_key }}'
+
+    - name: Update paygress.env with whitelisted mints
+      become_user: "{{ paygress_user }}"
+      replace:
+        path: "{{ paygress_dir }}/paygress.env"
+        regexp: 'WHITELISTED_MINTS=.*'
+        replace: 'WHITELISTED_MINTS={{ whitelisted_mints }}'
+
     - name: Update port range for production
       become_user: "{{ paygress_user }}"
       replace:
@@ -368,10 +386,14 @@
           echo "🎉 Paygress setup completed!"
           echo ""
           echo "📋 Next steps:"
-          echo "1. Update your Nostr private key in {{ paygress_dir }}/paygress.env"
-          echo "2. Start the service: sudo systemctl start paygress"
-          echo "3. Check service status: sudo systemctl status paygress"
-          echo "4. View logs: sudo journalctl -u paygress -f"
+          echo "1. Configure your settings in inventory.ini:"
+          echo "   - Set nostr_private_key to your actual private key"
+          echo "   - Verify nostr_relays and whitelisted_mints"
+          echo "   - Update public_ip with your server public IP"
+          echo "2. Re-run ansible-playbook ansible-setup.yml to apply changes"
+          echo "3. Start the service: sudo systemctl start paygress"
+          echo "4. Check service status: sudo systemctl status paygress"
+          echo "5. View logs: sudo journalctl -u paygress -f"
           echo ""
           echo "🌐 Service is running in Nostr mode:"
           echo "   - Listen for NIP-17 encrypted messages on configured relays"
