@@ -96,6 +96,7 @@ spec:
         ports:
         - containerPort: 8080
           name: http
+          hostPort: {{ main_service_port | default(1000) }}
         envFrom:
         - configMapRef:
             name: paygress-env-config
@@ -131,21 +132,26 @@ spec:
       securityContext:
         fsGroup: 1000
 ---
+# Service is optional since we're using hostPort
+# The pod will be directly accessible on the host IP
+---
+# NodePort service for SSH pods external access (using available port range)
 apiVersion: v1
 kind: Service
 metadata:
-  name: paygress-sidecar
-  namespace: ingress-system
+  name: ssh-pods-nodeport
+  namespace: user-workloads
   labels:
-    app: paygress-sidecar
+    app: ssh-pods
 spec:
-  selector:
-    app: paygress-sidecar
+  type: NodePort
   ports:
-  - port: 8080
-    targetPort: 8080
-    name: http
-  type: ClusterIP
+  - port: 22
+    targetPort: 22
+    nodePort: {{ ssh_port_end | default(1999) }}
+    name: ssh
+  selector:
+    app: ssh-pod
 ---
 # User workloads namespace for SSH pods
 apiVersion: v1
