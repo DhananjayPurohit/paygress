@@ -23,13 +23,13 @@ Update the following in `inventory.ini`:
 
 ```bash
 # Copy the template
-cp paygress.env.template paygress.env
+cp paygress.env.template .env
 
 # Edit with your actual configuration
-nano paygress.env
+nano .env
 ```
 
-Update the following in `paygress.env`:
+Update the following in `.env`:
 - `nsec1your_private_key_here` → Your actual Nostr private key
 - `YOUR_SERVER_IP` → Your server's public IP address
 - Update mint URLs if needed
@@ -47,7 +47,7 @@ chmod +x setup-paygress.sh
 
 ## 🚨 **Security Notes**
 
-- **Never commit** `inventory.ini` or `paygress.env` to git
+- **Never commit** `inventory.ini` or `.env` to git
 - These files contain sensitive information (passwords, private keys)
 - The `.gitignore` file is configured to exclude these files
 - Always use the template files as starting points
@@ -59,7 +59,7 @@ paygress/
 ├── inventory.ini.template     # Template for server inventory
 ├── paygress.env.template      # Template for environment config
 ├── inventory.ini              # Your actual inventory (not in git)
-├── paygress.env               # Your actual environment (not in git)
+├── .env                       # Your actual environment (not in git)
 ├── ansible-setup.yml          # Ansible playbook
 ├── setup-paygress.sh          # Setup script
 └── .gitignore                 # Excludes sensitive files

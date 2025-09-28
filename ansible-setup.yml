@@ -239,49 +239,49 @@
     - name: Update paygress.env with server IP
       become_user: "{{ paygress_user }}"
       replace:
-        path: "{{ paygress_dir }}/paygress.env"
+        path: "{{ paygress_dir }}/.env"
         regexp: 'SSH_HOST=.*'
         replace: 'SSH_HOST={{ public_ip }}'
 
     - name: Update paygress.env with correct data path
       become_user: "{{ paygress_user }}"
       replace:
-        path: "{{ paygress_dir }}/paygress.env"
+        path: "{{ paygress_dir }}/.env"
         regexp: 'CASHU_DB_PATH=.*'
         replace: 'CASHU_DB_PATH={{ paygress_dir }}/data/cashu.db'
 
     - name: Update paygress.env with Nostr relays
       become_user: "{{ paygress_user }}"
       replace:
-        path: "{{ paygress_dir }}/paygress.env"
+        path: "{{ paygress_dir }}/.env"
         regexp: 'NOSTR_RELAYS=.*'
         replace: 'NOSTR_RELAYS={{ nostr_relays }}'
 
     - name: Update paygress.env with Nostr private key
       become_user: "{{ paygress_user }}"
       replace:
-        path: "{{ paygress_dir }}/paygress.env"
+        path: "{{ paygress_dir }}/.env"
         regexp: 'NOSTR_PRIVATE_KEY=.*'
         replace: 'NOSTR_PRIVATE_KEY={{ nostr_private_key }}'
 
     - name: Update paygress.env with whitelisted mints
       become_user: "{{ paygress_user }}"
       replace:
-        path: "{{ paygress_dir }}/paygress.env"
+        path: "{{ paygress_dir }}/.env"
         regexp: 'WHITELISTED_MINTS=.*'
         replace: 'WHITELISTED_MINTS={{ whitelisted_mints }}'
 
     - name: Update port range for production
       become_user: "{{ paygress_user }}"
       replace:
-        path: "{{ paygress_dir }}/paygress.env"
+        path: "{{ paygress_dir }}/.env"
         regexp: 'SSH_PORT_RANGE_START=.*'
         replace: 'SSH_PORT_RANGE_START={{ ssh_port_start }}'
 
     - name: Update port range end for production
       become_user: "{{ paygress_user }}"
       replace:
-        path: "{{ paygress_dir }}/paygress.env"
+        path: "{{ paygress_dir }}/.env"
         regexp: 'SSH_PORT_RANGE_END=.*'
         replace: 'SSH_PORT_RANGE_END={{ ssh_port_end }}'
 
@@ -326,11 +326,12 @@
           Environment=PATH=/home/{{ paygress_user }}/.cargo/bin:/usr/local/bin:/usr/bin:/bin
 
           # Load environment variables
-          EnvironmentFile={{ paygress_dir }}/paygress.env
+          EnvironmentFile={{ paygress_dir }}/.env
 
           [Install]
           WantedBy=multi-user.target
         dest: /etc/systemd/system/paygress.service
+      notify: restart paygress
 
     - name: Reload systemd
       systemd:
@@ -340,6 +341,7 @@
       systemd:
         name: paygress
         enabled: yes
+        state: started
 
     # ===============================
     # Configure Firewall
@@ -391,9 +393,8 @@
           echo "   - Verify nostr_relays and whitelisted_mints"
           echo "   - Update public_ip with your server public IP"
           echo "2. Re-run ansible-playbook ansible-setup.yml to apply changes"
-          echo "3. Start the service: sudo systemctl start paygress"
-          echo "4. Check service status: sudo systemctl status paygress"
-          echo "5. View logs: sudo journalctl -u paygress -f"
+          echo "3. Check service status: sudo systemctl status paygress"
+          echo "4. View logs: sudo journalctl -u paygress -f"
           echo ""
           echo "🌐 Service is running in Nostr mode:"
           echo "   - Listen for NIP-17 encrypted messages on configured relays"
@@ -403,13 +404,18 @@
           echo "   ssh user@{{ public_ip }} -p <allocated-port>"
           echo ""
           echo "📁 Paygress directory: {{ paygress_dir }}"
-          echo "⚙️  Configuration file: {{ paygress_dir }}/paygress.env"
+          echo "⚙️  Configuration file: {{ paygress_dir }}/.env"
         dest: "/home/{{ paygress_user }}/setup-complete.sh"
         mode: '0755'
         owner: "{{ paygress_user }}"
         group: "{{ paygress_user }}"
 
   handlers:
+    - name: restart paygress
+      systemd:
+        name: paygress
+        state: restarted
+
     - name: restart docker
       systemd:
         name: docker

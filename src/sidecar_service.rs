@@ -182,7 +182,7 @@ impl PodManager {
 
     pub async fn create_ssh_pod(
         &self,
-        config: &SidecarConfig,
+        _config: &SidecarConfig,
         namespace: &str,
         pod_name: &str,
         pod_npub: &str,        // Add NPUB parameter

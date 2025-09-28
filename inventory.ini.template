@@ -14,7 +14,7 @@ main_service_port=1000
 
 # Nostr Configuration
 nostr_relays=wss://relay.damus.io,wss://nos.lol,wss://relay.nostr.band,wss://nostr.wine,wss://nostr.mom
-nostr_private_key=nsec1...  # Replace with your actual private key
+nostr_private_key=nsec1...  
 
 # Cashu Configuration
 whitelisted_mints=https://nofees.testnut.cashu.space,https://testnut.cashu.space

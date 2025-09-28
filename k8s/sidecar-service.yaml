@@ -96,7 +96,7 @@ spec:
         ports:
         - containerPort: 8080
           name: http
-          hostPort: {{ main_service_port | default(1000) }}
+          # hostPort will be set via environment variable SSH_PORT_RANGE_START
         envFrom:
         - configMapRef:
             name: paygress-env-config
@@ -148,7 +148,7 @@ spec:
   ports:
   - port: 22
     targetPort: 22
-    nodePort: {{ ssh_port_end | default(1999) }}
+    nodePort: 1999  # Will be configured via SSH_PORT_RANGE_END from ConfigMap
     name: ssh
   selector:
     app: ssh-pod

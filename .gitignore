@@ -1,2 +1,12 @@
 /target
 inventory.ini
+
+
+# Environment files
+.env
+*.env.local
+*.env.production
+*.env.staging
+
+# Keep template files
+!*.env.template

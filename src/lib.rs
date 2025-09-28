@@ -151,6 +151,7 @@ pub struct NostrEvent {
     pub tags: Vec<Vec<String>>,
     pub content: String,
     pub sig: String,
+    pub message_type: String, // "nip04" or "nip17" to track which method was used
 }
 
 #[derive(Debug, Clone, Deserialize)]

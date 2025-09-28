@@ -1,10 +1,11 @@
 #!/bin/bash
 
 # =============================================================================
-# Paygress Testing Script
+# Paygress NIP-04 Testing Script
 # =============================================================================
 # Usage: ./test-paygress.sh [SERVICE_NPUB]
 # If SERVICE_NPUB is not provided, the script will prompt for it
+# This script tests NIP-04 (Encrypted Direct Messages) functionality
 
 SERVICE_NPUB_INPUT="$1"
 
@@ -43,13 +44,13 @@ if ! validate_npub "$SERVICE_NPUB_INPUT"; then
 fi
 
 SERVICE_NPUB="$SERVICE_NPUB_INPUT"
-# This script demonstrates the complete workflow for testing the Paygress system:
+# This script demonstrates the complete NIP-04 workflow for testing the Paygress system:
 # 1. Generate user keypair for Nostr communication
 # 2. Configure service public key
 # 3. Generate Cashu payment tokens using CDK CLI
-# 4. Send encrypted Nostr request to provision a pod
-# 5. Listen for encrypted response with access credentials
-# 6. Decrypt response to get SSH access details
+# 4. Send NIP-04 encrypted direct message to provision a pod
+# 5. Listen for NIP-04 encrypted response with access credentials
+# 6. Parse response to get SSH access details (nak auto-decrypts)
 # 7. Connect to the provisioned pod via SSH
 
 # Requirements:
@@ -101,15 +102,18 @@ echo "-----------------------------------------"
 
 echo "Service public key (bech32): $SERVICE_NPUB"
 
-# Convert service public key to hex format (nak encrypt requires 64-char hex)
-echo "DEBUG: Service public key (bech32): $SERVICE_NPUB"
-SERVICE_PUBKEY_HEX=$(echo "$SERVICE_NPUB" | nak decode | cut -d' ' -f1)
-echo "DEBUG: Service public key (hex): $SERVICE_PUBKEY_HEX"
+# Convert npub to hex format for the p tag
+echo "Converting npub to hex format..."
+SERVICE_PUBKEY_HEX=$(nak decode --pubkey "$SERVICE_NPUB" 2>/dev/null)
 if [ -z "$SERVICE_PUBKEY_HEX" ]; then
-    echo "❌ Failed to decode service public key"
+    echo "❌ Error: Failed to convert npub to hex format"
+    echo "Make sure nak is installed and the npub format is correct"
     exit 1
 fi
-echo "Service public key (hex): $SERVICE_PUBKEY_HEX"
+
+echo "DEBUG: Service public key (bech32): $SERVICE_NPUB"
+echo "DEBUG: Service public key (hex): $SERVICE_PUBKEY_HEX"
+echo "✅ Successfully converted npub to hex format"
 
 echo "✅ Service public key configured"
 echo ""
@@ -119,23 +123,9 @@ echo ""
 # =============================================================================
 # Generate Cashu payment tokens for pod provisioning
 echo "💰 Step 3: Generating Cashu Payment Tokens"
-echo "-------------------------------------------"
-
-# Check if CDK CLI is available
-if ! command -v ../cdk/target/release/cdk-cli &> /dev/null; then
-    echo "❌ Error: CDK CLI not found. Please build it first:"
-    echo "   cd ../cdk && cargo build --bin cdk-cli --release"
-    exit 1
-fi
 
 # Get tokens from test mint (1000 sats = 1000 minutes = ~16 hours)
 echo "Getting Cashu tokens from test mint..."
-# Ensure we're in the correct directory and CDK CLI is built
-if [ ! -f "../cdk/target/release/cdk-cli" ]; then
-    echo "❌ Error: CDK CLI binary not found at ../cdk/target/release/cdk-cli"
-    echo "Please ensure CDK CLI is built: cd ../cdk && cargo build --release"
-    exit 1
-fi
 
 # Check wallet balance and mint tokens if needed
 echo "Checking wallet balance..."
@@ -217,14 +207,14 @@ echo "✅ Cashu token generated successfully"
 echo ""
 
 # =============================================================================
-# 4. CREATE ENCRYPTED NOSTR REQUEST
+# 4. CREATE ENCRYPTED NOSTR REQUEST (NIP-04)
 # =============================================================================
-# Create and send encrypted Nostr request to provision a pod
-echo "📨 Step 4: Creating and Sending Encrypted Nostr Request"
-echo "------------------------------------------------------"
+# Create and send NIP-04 encrypted Nostr request to provision a pod
+echo "📨 Step 4: Creating and Sending NIP-04 Encrypted Nostr Request"
+echo "--------------------------------------------------------------"
 
 # Create your request JSON with payment token and pod configuration
-REQUEST_JSON="{\"cashu_token\":\"$CASHU_TOKEN\",\"ssh_username\":\"alice\",\"pod_image\":\"linuxserver/openssh-server:latest\",\"duration_minutes\":60}"
+REQUEST_JSON="{\"cashu_token\":\"$CASHU_TOKEN\",\"pod_spec_id\":\"standard\",\"pod_image\":\"linuxserver/openssh-server:latest\",\"ssh_username\":\"alice\",\"ssh_password\":\"my_secure_password\"}"
 
 echo "Request JSON: $REQUEST_JSON"
 
@@ -235,57 +225,86 @@ echo "DEBUG: Request JSON length: ${#REQUEST_JSON}"
 echo "DEBUG: User private key: $NSEC"
 echo "DEBUG: Service public key (hex): $SERVICE_PUBKEY_HEX"
 
-# Try to encrypt the request
-# Use command line argument instead of piping to avoid "plaintext can't be empty" error
-ENCRYPTED_CONTENT=$(nak encrypt --sec "$NSEC" --recipient-pubkey "$SERVICE_PUBKEY_HEX" "$REQUEST_JSON" 2>&1)
-ENCRYPT_EXIT_CODE=$?
+# Send NIP-04 encrypted direct message using nak
+echo "Sending NIP-04 encrypted direct message..."
+echo "DEBUG: Request JSON: $REQUEST_JSON"
+echo "DEBUG: User private key: $NSEC"
+echo "DEBUG: Service public key (npub): $SERVICE_NPUB"
+echo "DEBUG: Service public key (hex): $SERVICE_PUBKEY_HEX"
 
-# Debug: Show the encryption output and exit code
-echo "DEBUG: Encryption exit code: $ENCRYPT_EXIT_CODE"
-echo "DEBUG: Encryption output: $ENCRYPTED_CONTENT"
-
-# Check if encryption was successful
-if [ $ENCRYPT_EXIT_CODE -ne 0 ] || [ -z "$ENCRYPTED_CONTENT" ] || [[ "$ENCRYPTED_CONTENT" == *"error"* ]] || [[ "$ENCRYPTED_CONTENT" == *"Error"* ]] || [[ "$ENCRYPTED_CONTENT" == *"failed"* ]]; then
-    echo "❌ Error: Failed to encrypt request"
-    echo "Encryption command failed with exit code: $ENCRYPT_EXIT_CODE"
-    echo "Encryption output: $ENCRYPTED_CONTENT"
+# Encrypt the content manually using NIP-04 to ensure compatibility
+echo "Encrypting content with NIP-04..."
+ENCRYPTED_CONTENT=$(nak encrypt --nip04 --sec "$NSEC" --recipient-pubkey "$SERVICE_PUBKEY_HEX" "$REQUEST_JSON" 2>/dev/null)
+if [ -z "$ENCRYPTED_CONTENT" ]; then
+    echo "❌ Error: Failed to encrypt content with NIP-04"
     exit 1
 fi
 
-echo "Encrypted content: $ENCRYPTED_CONTENT"
+echo "✅ Content encrypted successfully"
+echo "DEBUG: Encrypted content length: ${#ENCRYPTED_CONTENT}"
 
-# Send the encrypted event to Nostr relays
-echo "Sending encrypted Nostr event..."
-nak event \
-  --kind 1000 \
-  --content "$ENCRYPTED_CONTENT" \
+# Send NIP-04 encrypted direct message with manually encrypted content
+EVENT_ID=$(nak event \
   --sec "$NSEC" \
-  --tag "paygress" \
-  --tag "encrypted" \
-  --tag "provisioning" \
-  wss://relay.damus.io wss://nos.lol wss://relay.nostr.band
+  --kind 4 \
+  -p "$SERVICE_PUBKEY_HEX" \
+  --content "$ENCRYPTED_CONTENT" \
+  wss://relay.damus.io wss://nos.lol wss://relay.nostr.band 2>&1)
+SEND_EXIT_CODE=$?
 
-echo "✅ Encrypted Nostr request sent"
+# Debug: Show the send output and exit code
+echo "DEBUG: Send exit code: $SEND_EXIT_CODE"
+echo "DEBUG: Event ID: $EVENT_ID"
+
+# Extract the actual event ID from the JSON output
+ACTUAL_EVENT_ID=$(echo "$EVENT_ID" | grep -o '"id":"[^"]*"' | cut -d'"' -f4)
+
+# Check if send was successful
+if [ $SEND_EXIT_CODE -ne 0 ]; then
+    echo "❌ Error: Failed to send NIP-04 encrypted message"
+    echo "Send command failed with exit code: $SEND_EXIT_CODE"
+    echo "Send output: $EVENT_ID"
+    exit 1
+fi
+
+# Check for error patterns in output (POSIX compatible)
+case "$EVENT_ID" in
+    *"error"*|*"Error"*|*"failed"*|*"invalid"*)
+        echo "❌ Error: Failed to send NIP-04 encrypted message"
+        echo "Send output contains error: $EVENT_ID"
+        exit 1
+        ;;
+esac
+
+# Check if we got a valid event ID
+if [ -z "$ACTUAL_EVENT_ID" ]; then
+    echo "❌ Error: Could not extract event ID from output"
+    echo "Send output: $EVENT_ID"
+    exit 1
+fi
+
+echo "✅ NIP-04 encrypted message sent successfully"
+echo "Event ID: $ACTUAL_EVENT_ID"
 echo ""
 
 # =============================================================================
-# 5. LISTEN FOR ENCRYPTED RESPONSE
+# 5. LISTEN FOR NIP-04 ENCRYPTED RESPONSE
 # =============================================================================
-# Listen for the encrypted response from the service with access credentials
-echo "👂 Step 5: Listening for Encrypted Response"
-echo "-------------------------------------------"
+# Listen for NIP-04 encrypted response from the service with access credentials
+echo "👂 Step 5: Listening for NIP-04 Encrypted Response"
+echo "--------------------------------------------------"
 
 # Create a temporary file to store responses
 RESPONSE_FILE=$(mktemp)
 echo "Storing responses in: $RESPONSE_FILE"
 
-echo "Listening for response event (kind 1001) from service..."
+echo "Listening for NIP-04 encrypted direct message (kind 4) from service..."
 echo "This will timeout after 120 seconds if no response is received"
 echo "Looking for responses with SSH access details from the container..."
 
-# Listen for encrypted response (kind 1001) with a timeout
-# We'll filter for events with tags indicating they are paygress responses
-timeout 120 nak req -k 1001 -t t=paygress -t t=response --stream wss://relay.damus.io wss://nos.lol wss://relay.nostr.band > "$RESPONSE_FILE" 2>&1 &
+# Listen for NIP-04 encrypted direct messages (kind 4) with a timeout
+# nak will automatically decrypt messages for us
+timeout 120 nak req --sec "$NSEC" --kind 4 --stream wss://relay.damus.io wss://nos.lol wss://relay.nostr.band > "$RESPONSE_FILE" 2>&1 &
 LISTEN_PID=$!
 
 # Wait for the background process to complete or timeout
@@ -353,30 +372,23 @@ echo "✅ Paygress response received and filtered"
 echo ""
 
 # =============================================================================
-# 6. DECRYPT RESPONSE
+# 6. PARSE NIP-04 RESPONSE
 # =============================================================================
-# Decrypt the response to get SSH access credentials
-echo "🔓 Step 6: Decrypting Response"
-echo "------------------------------"
+# Parse the NIP-04 response (nak automatically decrypts for us)
+echo "🔓 Step 6: Parsing NIP-04 Response"
+echo "----------------------------------"
 
 # Use the first response from the response file
-ENCRYPTED_RESPONSE="$FIRST_RESPONSE"
+RESPONSE_JSON="$FIRST_RESPONSE"
 
-echo "Decrypting response from container..."
-# Extract the content field from the JSON response
-ENCRYPTED_CONTENT=$(echo "$ENCRYPTED_RESPONSE" | jq -r '.content')
+echo "Parsing response from service..."
+# Extract the content field from the JSON response (already decrypted by nak)
+DECRYPTED_RESPONSE=$(echo "$RESPONSE_JSON" | jq -r '.content')
 
-# Decrypt using the sender's pubkey (already extracted in step 5)
-# SENDER_PUBKEY is already set from step 5
-
-DECRYPTED_RESPONSE=$(echo "$ENCRYPTED_CONTENT" | nak decrypt --sec "$NSEC" --sender-pubkey "$SENDER_PUBKEY" 2>/dev/null)
-DECRYPT_EXIT_CODE=$?
-
-if [ $DECRYPT_EXIT_CODE -ne 0 ] || [ -z "$DECRYPTED_RESPONSE" ]; then
-    echo "❌ Error: Failed to decrypt response"
-    echo "Decryption exit code: $DECRYPT_EXIT_CODE"
-    echo "Make sure you have the correct encrypted response content"
-    echo "The response should come from the container that was provisioned for you"
+if [ -z "$DECRYPTED_RESPONSE" ] || [ "$DECRYPTED_RESPONSE" = "null" ]; then
+    echo "❌ Error: Failed to parse response content"
+    echo "Make sure you have the correct response from the service"
+    echo "The response should come from the Paygress service"
     exit 1
 fi
 
@@ -456,4 +468,27 @@ echo "  1. Including a unique request ID in your request"
 echo "  2. Looking for responses that reference that request ID"
 echo "  3. Verifying the sender is the container you provisioned"
 echo ""
-echo "🎉 Paygress testing workflow completed!"
+echo "🎉 Paygress NIP-04 testing workflow completed!"
+echo ""
+echo "📋 NIP-04 Testing Commands Summary:"
+echo "=================================="
+echo ""
+echo "1. Generate user keypair:"
+echo "   nak key generate"
+echo ""
+echo "2. Send NIP-04 encrypted message:"
+echo "   nak event --sec <your-nsec> --kind 4 -p <service-pubkey-hex> --content '<json>' <relay-urls>"
+echo ""
+echo "3. Listen for NIP-04 responses:"
+echo "   nak req --sec <your-nsec> --kind 4 --stream <relay-urls>"
+echo ""
+echo "4. Get recent direct messages:"
+echo "   nak get-events --kind 4 --limit 10"
+echo ""
+echo "5. Decrypt specific message:"
+echo "   nak get-event --event-id <event-id>"
+echo ""
+echo "🔧 Example NIP-04 Request JSON:"
+echo "{\"action\": \"spawn_pod\", \"offer_id\": \"basic-ssh-pod\", \"duration_minutes\": 60, \"payment_proof\": \"cashu1...\"}"
+echo ""
+echo "✅ NIP-04 testing completed successfully!"

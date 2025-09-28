@@ -139,7 +139,7 @@ async fn run_private_message_nostr_mode(config: SidecarConfig) -> Result<(), Box
             match parse_private_message_content(&message_content) {
                 Ok(request) => {
                     tracing::info!("Successfully parsed as pod creation request");
-                    handle_spawn_pod_request(state_clone, request, &event.pubkey, nostr_for_handler.clone()).await?;
+                    handle_spawn_pod_request(state_clone, request, &event.pubkey, &event.message_type, nostr_for_handler.clone()).await?;
                     return Ok(());
                 }
                 Err(e) => {
@@ -151,7 +151,7 @@ async fn run_private_message_nostr_mode(config: SidecarConfig) -> Result<(), Box
             match serde_json::from_str::<EncryptedTopUpPodRequest>(&message_content) {
                 Ok(request) => {
                     tracing::info!("Successfully parsed as top-up request");
-                    handle_top_up_request(state_clone, request, nostr_for_handler.clone()).await?;
+                    handle_top_up_request(state_clone, request, &event.pubkey, &event.message_type, nostr_for_handler.clone()).await?;
                     return Ok(());
                 }
                 Err(e) => {
@@ -175,6 +175,7 @@ async fn handle_spawn_pod_request(
     state_clone: SidecarState,
     request: EncryptedSpawnPodRequest,
     user_pubkey: &str,
+    message_type: &str,
     nostr_client: paygress::nostr::NostrRelaySubscriber,
 ) -> Result<(), anyhow::Error> {
     // Select pod specification
@@ -192,7 +193,7 @@ async fn handle_spawn_pod_request(
                 message: format!("Pod specification '{}' not found", request.pod_spec_id.as_deref().unwrap_or("default")),
                 details: Some("Please check available specifications in the offer event".to_string()),
             };
-            if let Err(e) = nostr_client.send_error_response_private_message(user_pubkey, error).await {
+            if let Err(e) = nostr_client.send_error_response_private_message(user_pubkey, error, message_type).await {
                 tracing::error!("Failed to send error response: {}", e);
             }
             return Ok(());
@@ -208,7 +209,7 @@ async fn handle_spawn_pod_request(
                 message: "Failed to decode Cashu token".to_string(),
                 details: Some(format!("Token decode error: {}", e)),
             };
-            if let Err(e) = nostr_client.send_error_response_private_message(user_pubkey, error).await {
+            if let Err(e) = nostr_client.send_error_response_private_message(user_pubkey, error, message_type).await {
                 tracing::error!("Failed to send error response: {}", e);
             }
             return Ok(());
@@ -227,7 +228,7 @@ async fn handle_spawn_pod_request(
                 pod_spec.name,
                 pod_spec.rate_msats_per_sec)),
         };
-        if let Err(e) = nostr_client.send_error_response_private_message(user_pubkey, error).await {
+        if let Err(e) = nostr_client.send_error_response_private_message(user_pubkey, error, message_type).await {
             tracing::error!("Failed to send error response: {}", e);
         }
         return Ok(());
@@ -245,7 +246,7 @@ async fn handle_spawn_pod_request(
                 message: "Cashu token verification failed".to_string(),
                 details: Some("Token is invalid or not from a whitelisted mint".to_string()),
             };
-            if let Err(e) = nostr_client.send_error_response_private_message(user_pubkey, error).await {
+            if let Err(e) = nostr_client.send_error_response_private_message(user_pubkey, error, message_type).await {
                 tracing::error!("Failed to send error response: {}", e);
             }
             return Ok(());
@@ -270,7 +271,7 @@ async fn handle_spawn_pod_request(
                 message,
                 details,
             };
-            if let Err(e) = nostr_client.send_error_response_private_message(user_pubkey, error).await {
+            if let Err(e) = nostr_client.send_error_response_private_message(user_pubkey, error, message_type).await {
                 tracing::error!("Failed to send error response: {}", e);
             }
             return Ok(());
@@ -295,7 +296,7 @@ async fn handle_spawn_pod_request(
                 message: "Failed to allocate SSH port".to_string(),
                 details: Some(format!("Port allocation error: {}", e)),
             };
-            if let Err(e) = nostr_client.send_error_response_private_message(user_pubkey, error).await {
+            if let Err(e) = nostr_client.send_error_response_private_message(user_pubkey, error, message_type).await {
                 tracing::error!("Failed to send error response: {}", e);
             }
             return Ok(());
@@ -364,9 +365,9 @@ async fn handle_spawn_pod_request(
                 ],
             };
 
-            match nostr_client.send_access_details_private_message(user_pubkey, access_details).await {
+            match nostr_client.send_access_details_private_message(user_pubkey, access_details, message_type).await {
                 Ok(event_id) => {
-                    info!("✅ Sent access details via NIP-17 Gift Wrap private message to {}: {}", user_pubkey, event_id);
+                    info!("✅ Sent access details via {} private message to {}: {}", message_type.to_uppercase(), user_pubkey, event_id);
                 }
                 Err(e) => {
                     tracing::error!("❌ Failed to send access details via private message: {}", e);
@@ -381,7 +382,7 @@ async fn handle_spawn_pod_request(
                 message: "Failed to create pod".to_string(),
                 details: Some(format!("Pod creation error: {}", e)),
             };
-            if let Err(e) = nostr_client.send_error_response_private_message(user_pubkey, error).await {
+            if let Err(e) = nostr_client.send_error_response_private_message(user_pubkey, error, message_type).await {
                 tracing::error!("Failed to send error response: {}", e);
             }
         }
@@ -394,6 +395,8 @@ async fn handle_spawn_pod_request(
 async fn handle_top_up_request(
     state_clone: SidecarState,
     request: EncryptedTopUpPodRequest,
+    user_pubkey: &str,
+    message_type: &str,
     nostr_client: paygress::nostr::NostrRelaySubscriber,
 ) -> Result<(), anyhow::Error> {
     info!("Pod top-up request received for NPUB: {}", request.pod_npub);
@@ -421,7 +424,7 @@ async fn handle_top_up_request(
                 new_expires_at: "2025-12-31T23:59:59Z".to_string(), // Placeholder
                 message: "Pod successfully topped up!".to_string(),
             };
-            if let Err(e) = nostr_client.send_topup_response_private_message(&pod_npub, success_response).await {
+            if let Err(e) = nostr_client.send_topup_response_private_message(&pod_npub, success_response, message_type).await {
                 tracing::error!("Failed to send top-up success response: {}", e);
             }
             info!("✅ Top-up request processed successfully for NPUB: {}", pod_npub);
@@ -432,7 +435,7 @@ async fn handle_top_up_request(
                 message: "Pod not found or expired".to_string(),
                 details: Some(format!("Pod with NPUB '{}' not found or already expired", pod_npub)),
             };
-            if let Err(e) = nostr_client.send_error_response_private_message(&pod_npub, error).await {
+            if let Err(e) = nostr_client.send_error_response_private_message(&pod_npub, error, message_type).await {
                 tracing::error!("Failed to send error response: {}", e);
             }
             tracing::warn!("❌ Pod with NPUB {} not found or expired", pod_npub);
@@ -443,7 +446,7 @@ async fn handle_top_up_request(
                 message: "Payment verification failed".to_string(),
                 details: Some("Cashu token verification failed or insufficient payment".to_string()),
             };
-            if let Err(e) = nostr_client.send_error_response_private_message(&pod_npub, error).await {
+            if let Err(e) = nostr_client.send_error_response_private_message(&pod_npub, error, message_type).await {
                 tracing::error!("Failed to send error response: {}", e);
             }
             tracing::warn!("❌ Payment verification failed for NPUB: {}", pod_npub);
@@ -454,7 +457,7 @@ async fn handle_top_up_request(
                 message: "Internal server error".to_string(),
                 details: Some("Failed to process top-up request".to_string()),
             };
-            if let Err(e) = nostr_client.send_error_response_private_message(&pod_npub, error).await {
+            if let Err(e) = nostr_client.send_error_response_private_message(&pod_npub, error, message_type).await {
                 tracing::error!("Failed to send error response: {}", e);
             }
             tracing::error!("❌ Internal error processing top-up for NPUB: {}", pod_npub);
@@ -465,7 +468,7 @@ async fn handle_top_up_request(
                 message: "Unexpected error occurred".to_string(),
                 details: Some("Unknown error processing top-up request".to_string()),
             };
-            if let Err(e) = nostr_client.send_error_response_private_message(&pod_npub, error).await {
+            if let Err(e) = nostr_client.send_error_response_private_message(&pod_npub, error, message_type).await {
                 tracing::error!("Failed to send error response: {}", e);
             }
             tracing::warn!("❌ Unexpected response for top-up request NPUB: {}", pod_npub);

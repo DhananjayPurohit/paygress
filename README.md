@@ -15,7 +15,7 @@
 
 ### **1. Setup Environment**
 
-Create a `paygress.env` file with your configuration:
+Create a `.env` file from the template:
 
 ```bash
 # Service Configuration
@@ -92,7 +92,7 @@ minikube image load paygress:$IMAGE_TAG
 
 # 3. Create ConfigMaps from your configuration files (REQUIRED)
 kubectl create configmap paygress-env-config \
-    --from-env-file=paygress.env \
+    --from-env-file=.env \
     --namespace=ingress-system \
     --dry-run=client -o yaml | kubectl apply -f -
 
@@ -426,7 +426,7 @@ POD_SPECS=[
 Ensure you have:
 - Kubernetes cluster running
 - `kubectl` configured to access your cluster
-- Your environment configuration file (`paygress.env`)
+- Your environment configuration file (`.env`)
 
 ### **Deployment Steps**
 
@@ -435,7 +435,7 @@ Ensure you have:
 kubectl apply -f k8s/
 
 # 2. Create configmaps with your environment configuration
-kubectl create configmap paygress-env-config --from-env-file=paygress.env --namespace=ingress-system --dry-run=client -o yaml | kubectl apply -f -
+kubectl create configmap paygress-env-config --from-env-file=.env --namespace=ingress-system --dry-run=client -o yaml | kubectl apply -f -
 
 kubectl create configmap paygress-pod-specs --from-file=pod-specs.json --namespace=ingress-system --dry-run=client -o yaml | kubectl apply -f -
 
@@ -449,7 +449,7 @@ kubectl logs -n ingress-system -l app=paygress-sidecar
 # 5. Update configuration (if needed)
 kubectl delete configmap paygress-env-config -n ingress-system
 kubectl delete configmap paygress-pod-specs -n ingress-system
-kubectl create configmap paygress-env-config --from-env-file=paygress.env --namespace=ingress-system --dry-run=client -o yaml | kubectl apply -f -
+kubectl create configmap paygress-env-config --from-env-file=.env --namespace=ingress-system --dry-run=client -o yaml | kubectl apply -f -
 kubectl create configmap paygress-pod-specs --from-file=pod-specs.json --namespace=ingress-system --dry-run=client -o yaml | kubectl apply -f -
 kubectl rollout restart deployment/paygress-sidecar -n ingress-system
 ```
@@ -582,5 +582,68 @@ kubectl logs -n ingress-system -l app=paygress-sidecar
 
 ---
 
-**Complete NIP-17 encrypted private message-based workflow - no HTTP endpoints needed!** 🚀
-**Complete NIP-17 encrypted private message-based workflow - no HTTP endpoints needed!** 🚀
+## 🧪 Local Development (Kubernetes)
+
+For local development, you can deploy Paygress using Kubernetes instead of systemd.
+
+### Prerequisites
+- Docker installed
+- K3s or Kubernetes cluster running locally
+- kubectl configured
+
+### Configuration
+The Kubernetes deployment automatically reads environment variables from your `.env` file. Simply edit `.env` to modify the configuration.
+
+### Deployment
+```bash
+# Build the Docker image
+docker build -t paygress:latest .
+
+# Import the image into K3s (if using K3s)
+sudo k3s ctr images import <(docker save paygress:latest)
+
+# Create ConfigMap from .env file
+kubectl create configmap paygress-env-config --from-env-file=paygress.env -n ingress-system --dry-run=client -o yaml | kubectl apply -f -
+
+# Apply the Kubernetes manifests
+kubectl apply -f k8s/sidecar-service.yaml
+
+# Wait for deployment to be ready
+kubectl wait --for=condition=available --timeout=300s deployment/paygress-sidecar -n ingress-system
+```
+
+### Management
+```bash
+# View logs
+kubectl logs -f deployment/paygress-sidecar -n ingress-system
+
+# Port forward for local access
+kubectl port-forward deployment/paygress-sidecar 8080:8080 -n ingress-system
+
+# Delete deployment
+kubectl delete -f k8s/sidecar-service.yaml
+```
+
+---
+
+**Complete NIP-04 and NIP-17 encrypted private message-based workflow - no HTTP endpoints needed!** 🚀
+
+## 🔄 Switching Between Deployments
+
+### From Kubernetes to Systemd (Production)
+```bash
+# Stop Kubernetes deployment
+kubectl delete -f k8s/sidecar-service.yaml
+
+# Deploy with Ansible
+ansible-playbook -i inventory.ini ansible-setup.yml
+```
+
+### From Systemd to Kubernetes (Local Development)
+```bash
+# Stop systemd service
+sudo systemctl stop paygress
+sudo systemctl disable paygress
+
+# Deploy to Kubernetes (see Local Development section above)
+```

@@ -7,7 +7,7 @@ This document explains how to use the Ansible playbook to deploy Paygress.
 All configuration is done through the `inventory.ini` file. The Ansible script will:
 
 1. Clone the repository
-2. Update the `paygress.env` file with settings from `inventory.ini`
+2. Update the `.env` file with settings from `inventory.ini`
 3. Build and deploy the service
 
 ## Required Configuration
@@ -48,7 +48,7 @@ whitelisted_mints=https://nofees.testnut.cashu.space,https://testnut.cashu.space
 
 - Installs Docker, Kubernetes, and Rust
 - Clones the Paygress repository
-- Updates `paygress.env` with server-specific settings
+- Updates `.env` with server-specific settings
 - Builds the Paygress service
 - Creates and starts the systemd service
 - Configures firewall rules
