@@ -21,19 +21,27 @@ Update the following in `inventory.ini`:
 
 ### **Step 2: Create Your Environment File**
 
+**⚠️ IMPORTANT: No `.env` file is included in the repository for security reasons. You must create it from the template.**
+
 ```bash
-# Copy the template
-cp paygress.env.template .env
+# Copy the template to create your environment file
+cp .env.template .env
 
 # Edit with your actual configuration
 nano .env
 ```
 
-Update the following in `.env`:
-- `nsec1your_private_key_here` → Your actual Nostr private key
-- `YOUR_SERVER_IP` → Your server's public IP address
-- Update mint URLs if needed
-- Update relay URLs if needed
+**Required Configuration in `.env`:**
+- `YOUR_NOSTR_PRIVATE_KEY_HERE` → Your actual Nostr private key (starts with `nsec1`)
+- `YOUR_SERVER_PUBLIC_IP` → Your server's public IP address
+- Update mint URLs if needed (WHITELISTED_MINTS)
+- Update relay URLs if needed (NOSTR_RELAYS)
+
+**Example:**
+```bash
+NOSTR_PRIVATE_KEY=nsec1your_actual_private_key_here
+SSH_HOST=203.0.113.1
+```
 
 ### **Step 3: Run the Setup**
 
@@ -57,9 +65,9 @@ chmod +x setup-paygress.sh
 ```
 paygress/
 ├── inventory.ini.template     # Template for server inventory
-├── paygress.env.template      # Template for environment config
+├── .env.template              # Template for environment config
 ├── inventory.ini              # Your actual inventory (not in git)
-├── .env                       # Your actual environment (not in git)
+├── .env                       # Your actual environment (not in git, create from template)
 ├── ansible-setup.yml          # Ansible playbook
 ├── setup-paygress.sh          # Setup script
 └── .gitignore                 # Excludes sensitive files

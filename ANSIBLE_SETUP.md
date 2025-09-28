@@ -7,8 +7,10 @@ This document explains how to use the Ansible playbook to deploy Paygress.
 All configuration is done through the `inventory.ini` file. The Ansible script will:
 
 1. Clone the repository
-2. Update the `.env` file with settings from `inventory.ini`
+2. Create `.env` from `.env.template` and update it with settings from `inventory.ini`
 3. Build and deploy the service
+
+**⚠️ Note:** The repository only contains `.env.template`. Your actual `.env` file will be created during deployment.
 
 ## Required Configuration
 

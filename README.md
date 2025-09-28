@@ -15,8 +15,24 @@
 
 ### **1. Setup Environment**
 
-Create a `.env` file from the template:
+Create your `.env` file from the template:
 
+```bash
+# Copy the template to create your environment file
+cp .env.template .env
+
+# Edit the .env file with your actual configuration
+nano .env
+```
+
+**⚠️ Important: You MUST configure these values in your `.env` file:**
+
+1. **NOSTR_PRIVATE_KEY**: Replace `YOUR_NOSTR_PRIVATE_KEY_HERE` with your actual Nostr private key
+2. **SSH_HOST**: Replace `YOUR_SERVER_PUBLIC_IP` with your server's public IP address
+3. **NOSTR_RELAYS**: Update relay URLs if needed
+4. **WHITELISTED_MINTS**: Update mint URLs if needed
+
+**Example Configuration:**
 ```bash
 # Service Configuration
 RUN_MODE=nostr

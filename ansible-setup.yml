@@ -236,7 +236,15 @@
     # ===============================
     # Configure Paygress Environment
     # ===============================
-    - name: Update paygress.env with server IP
+    - name: Copy .env.template to .env
+      become_user: "{{ paygress_user }}"
+      copy:
+        src: "{{ paygress_dir }}/.env.template"
+        dest: "{{ paygress_dir }}/.env"
+        remote_src: yes
+        mode: '0600'
+
+    - name: Update .env with server IP
       become_user: "{{ paygress_user }}"
       replace:
         path: "{{ paygress_dir }}/.env"
