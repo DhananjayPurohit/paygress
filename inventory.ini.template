@@ -1,14 +1,20 @@
-[ubuntu_servers]
+[paygress_servers]
 # Replace with your actual server details
-# Example:
-production ansible_host=YOUR_SERVER_IP ansible_user=YOUR_USERNAME ansible_ssh_pass=YOUR_PASSWORD ansible_become_pass=YOUR_PASSWORD
+production ansible_host=YOUR-SERVER-IP ansible_user=YOUR-USERNAME ansible_ssh_pass=YOUR-PASSWORD ansible_become_pass=YOUR-PASSWORD ansible_ssh_port=22
 
-# Alternative with SSH key (recommended for production):
-# production ansible_host=YOUR_SERVER_IP ansible_user=YOUR_USERNAME ansible_ssh_private_key_file=~/.ssh/your_key
-
-# For testing with localhost (if you want to test on the same machine):
-# localhost ansible_connection=local ansible_user=YOUR_LOCAL_USER
-
-[ubuntu_servers:vars]
+[paygress_servers:vars]
 ansible_python_interpreter=/usr/bin/python3
 ansible_ssh_common_args='-o StrictHostKeyChecking=no'
+# Set your server public IP here
+public_ip=YOUR-SERVER-IP
+# SSH port range for Paygress pods
+ssh_port_start=1000
+ssh_port_end=1999
+main_service_port=1000
+
+# Nostr Configuration
+nostr_relays=wss://relay.damus.io,wss://nos.lol,wss://relay.nostr.band,wss://nostr.wine,wss://nostr.mom
+nostr_private_key=nsec1...  # Replace with your actual private key
+
+# Cashu Configuration
+whitelisted_mints=https://nofees.testnut.cashu.space,https://testnut.cashu.space

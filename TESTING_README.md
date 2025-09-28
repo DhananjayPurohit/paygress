@@ -54,7 +54,7 @@ Pass the service public key as a command-line argument:
 
 Example:
 ```bash
-./test-paygress.sh npub17fhydww6c2pxqmrqe4xtefgwkm59uxw2upt5xp6dla67u78q6efq3ecqkh
+./test-paygress.sh npub...
 ```
 
 ### Method 2: Interactive Prompt
@@ -96,14 +96,14 @@ The testing script automatically performs the following steps:
 🔐 Step 1: Generating User Keypair
 ----------------------------------
 Generated private key (hex): 8d3f031a8b870c967a50011a1cb2cd2aeab63a24cc3459346d6a8cfa4a1257ee
-User private key (bech32/nsec): nsec135lsxx5tsuxfv7jsqydpevkd9t4tvw3yes69jdrdd2x05jsj2lhqkq4dnk
+User private key (bech32/nsec): nsec...
 User public key (hex): 1d9257727bd2b6734f9044a72db2584ea77d44a6e762079e5da4bf6a3b89c511
-User public key (bech32/npub): npub1rkf9wunm62m8xnusgjnjmvjcf6nh639xua3q08ja5jlk5wufc5gscletnp
+User public key (bech32/npub): npub...
 ✅ User keypair generated and exported
 
 📡 Step 2: Configuring Service Public Key
 -----------------------------------------
-Service public key (bech32): npub1w9xusq8ueyh0f2szrhrdzk8xq4hw72kzvgm25dp72kr9qkmpx4ps2u323e
+Service public key (bech32): npub...
 Service public key (hex): 1d9257727bd2b6734f9044a72db2584ea77d44a6e762079e5da4bf6a3b89c511
 ✅ Service public key configured
 ```
@@ -127,7 +127,7 @@ Service public key (hex): 1d9257727bd2b6734f9044a72db2584ea77d44a6e762079e5da4bf
 
 4. **Invalid service public key format**:
    - Ensure the key starts with `npub1` followed by valid base32 characters
-   - Example: `npub1w9xusq8ueyh0f2szrhrdzk8xq4hw72kzvgm25dp72kr9qkmpx4ps2u323e`
+   - Example: `npub...`
 
 ## 🔧 Making CDK CLI Accessible
 
