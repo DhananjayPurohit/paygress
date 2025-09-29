@@ -223,7 +223,7 @@
       git:
         repo: https://github.com/DhananjayPurohit/paygress.git
         dest: "{{ paygress_dir }}"
-        version: feat/ansible-script-with-port
+        version: feat/nip04
 
     - name: Create user-workloads namespace
       become_user: "{{ paygress_user }}"
@@ -238,11 +238,9 @@
     # ===============================
     - name: Copy .env.template to .env
       become_user: "{{ paygress_user }}"
-      copy:
-        src: "{{ paygress_dir }}/.env.template"
-        dest: "{{ paygress_dir }}/.env"
-        remote_src: yes
-        mode: '0600'
+      shell: "cp {{ paygress_dir }}/.env.template {{ paygress_dir }}/.env && chmod 600 {{ paygress_dir }}/.env"
+      args:
+        chdir: "{{ paygress_dir }}"
 
     - name: Update .env with server IP
       become_user: "{{ paygress_user }}"
