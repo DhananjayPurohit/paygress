@@ -30,6 +30,7 @@ pub async fn run_http_interface(service: Arc<PodProvisioningService>) -> Result<
     let app = Router::new()
         .route("/health", get(health_check))
         .route("/offers", get(get_offers))
+        .route("/pods/status", post(get_pod_status))
         .route("/pods/spawn", post(spawn_pod))
         .route("/pods/topup", post(topup_pod))
         .with_state(service);
@@ -73,6 +74,40 @@ async fn get_offers(State(service): State<Arc<PodProvisioningService>>) -> Resul
     }
 }
 
+/// Get pod status
+async fn get_pod_status(
+    State(service): State<Arc<PodProvisioningService>>,
+    Json(request): Json<GetPodStatusHttpRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    info!("📨 Received get pod status request via HTTP");
+
+    let status_tool = crate::pod_provisioning::GetPodStatusTool {
+        pod_npub: request.pod_npub,
+    };
+
+    match service.get_pod_status(status_tool).await {
+        Ok(response) => {
+            let response_json = serde_json::json!({
+                "success": response.success,
+                "message": response.message,
+                "pod_npub": response.pod_npub,
+                "found": response.found,
+                "created_at": response.created_at,
+                "expires_at": response.expires_at,
+                "time_remaining_seconds": response.time_remaining_seconds,
+                "pod_spec_name": response.pod_spec_name,
+                "cpu_millicores": response.cpu_millicores,
+                "memory_mb": response.memory_mb,
+                "status": response.status
+            });
+            Ok(Json(response_json))
+        }
+        Err(e) => {
+            error!("Failed to get pod status: {}", e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
 
 /// Spawn a new pod
 async fn spawn_pod(
@@ -158,4 +193,9 @@ struct SpawnPodHttpRequest {
 struct TopUpPodHttpRequest {
     pub pod_npub: String,
     pub cashu_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GetPodStatusHttpRequest {
+    pub pod_npub: String,
 }

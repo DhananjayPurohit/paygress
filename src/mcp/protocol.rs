@@ -67,6 +67,17 @@ pub fn handle_tools_list(request: &Value) -> Value {
                     "name": "get_offers",
                     "description": "Get available pod specifications and pricing information",
                     "inputSchema": {"type": "object", "properties": {}}
+                },
+                {
+                    "name": "get_pod_status",
+                    "description": "Get pod status, time remaining, and specifications by NPUB",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "pod_npub": {"type": "string", "description": "Pod's NPUB identifier"}
+                        },
+                        "required": ["pod_npub"]
+                    }
                 }
             ]
         }
@@ -85,6 +96,7 @@ pub async fn handle_tools_call(service: &PodProvisioningService, request: &Value
         "spawn_pod" => call_spawn_pod(service, arguments).await,
         "topup_pod" => call_topup_pod(service, arguments).await,
         "get_offers" => call_get_offers(service).await,
+        "get_pod_status" => call_get_pod_status(service, arguments).await,
         _ => {
             return json!({
                 "jsonrpc": "2.0",
@@ -278,6 +290,87 @@ async fn call_get_offers(service: &PodProvisioningService) -> Value {
                     {
                         "type": "text",
                         "text": format!("❌ Internal error getting offers: {}", e)
+                    }
+                ],
+                "isError": true
+            })
+        }
+    }
+}
+
+/// Call get_pod_status tool
+async fn call_get_pod_status(service: &PodProvisioningService, arguments: &Value) -> Value {
+    use serde_json::json;
+    
+    let pod_npub = arguments["pod_npub"].as_str().unwrap_or("");
+
+    let request = crate::pod_provisioning::GetPodStatusTool {
+        pod_npub: pod_npub.to_string(),
+    };
+    
+    match service.get_pod_status(request).await {
+        Ok(response) => {
+            if response.found {
+                let status_text = if let Some(time_remaining) = response.time_remaining_seconds {
+                    if time_remaining > 0 {
+                        let hours = time_remaining / 3600;
+                        let minutes = (time_remaining % 3600) / 60;
+                        let seconds = time_remaining % 60;
+                        
+                        format!(
+                            "📊 **Pod Status for {}**\n\n✅ **Status:** {}\n⏰ **Time Remaining:** {}h {}m {}s\n📅 **Created:** {}\n📅 **Expires:** {}\n\n⚙️ **Specifications:**\n- CPU: {} millicores\n- Memory: {} MB\n- Spec: {}\n\n🔑 **Environment Variables Available:**\n- `$POD_NPUB` - Your pod's NPUB\n- `$POD_NSEC` - Your pod's NSEC (private key)",
+                            response.pod_npub,
+                            response.status.as_deref().unwrap_or("unknown"),
+                            hours, minutes, seconds,
+                            response.created_at.as_deref().unwrap_or("N/A"),
+                            response.expires_at.as_deref().unwrap_or("N/A"),
+                            response.cpu_millicores.map(|c| c.to_string()).as_deref().unwrap_or("N/A"),
+                            response.memory_mb.map(|m| m.to_string()).as_deref().unwrap_or("N/A"),
+                            response.pod_spec_name.as_deref().unwrap_or("N/A")
+                        )
+                    } else {
+                        format!(
+                            "⏰ **Pod Status for {}**\n\n❌ **Status:** Expired\n📅 **Created:** {}\n📅 **Expired:** {}\n\nThis pod has expired and is no longer accessible.",
+                            response.pod_npub,
+                            response.created_at.as_deref().unwrap_or("N/A"),
+                            response.expires_at.as_deref().unwrap_or("N/A")
+                        )
+                    }
+                } else {
+                    format!(
+                        "📊 **Pod Status for {}**\n\n⚠️ **Status:** Unknown\n📅 **Created:** {}\n\nPod exists but status is unclear.",
+                        response.pod_npub,
+                        response.created_at.as_deref().unwrap_or("N/A")
+                    )
+                };
+                
+                json!({
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": status_text
+                        }
+                    ],
+                    "isError": false
+                })
+            } else {
+                json!({
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": format!("❌ **Pod Not Found**\n\nPod with NPUB `{}` was not found. It may have expired, been deleted, or the NPUB is incorrect.", response.pod_npub)
+                        }
+                    ],
+                    "isError": false
+                })
+            }
+        }
+        Err(e) => {
+            json!({
+                "content": [
+                    {
+                        "type": "text",
+                        "text": format!("❌ Internal error getting pod status: {}", e)
                     }
                 ],
                 "isError": true

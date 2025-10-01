@@ -30,6 +30,12 @@ pub struct TopUpPodTool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetOffersTool {}
 
+/// Request for getting pod status/details
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetPodStatusTool {
+    pub pod_npub: String,
+}
+
 /// Response for pod spawning
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpawnPodResponse {
@@ -62,6 +68,22 @@ pub struct GetOffersResponse {
     pub minimum_duration_seconds: u64,
     pub whitelisted_mints: Vec<String>,
     pub pod_specs: Vec<PodSpec>,
+}
+
+/// Response for pod status
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetPodStatusResponse {
+    pub success: bool,
+    pub message: String,
+    pub pod_npub: String,
+    pub found: bool,
+    pub created_at: Option<String>,
+    pub expires_at: Option<String>,
+    pub time_remaining_seconds: Option<u64>,
+    pub pod_spec_name: Option<String>,
+    pub cpu_millicores: Option<u64>,
+    pub memory_mb: Option<u64>,
+    pub status: Option<String>,
 }
 
 /// Unified service handler for pod provisioning
@@ -152,6 +174,131 @@ impl PodProvisioningService {
             whitelisted_mints: self.state.config.whitelisted_mints.clone(),
             pod_specs: self.state.config.pod_specs.clone(),
         })
+    }
+
+    /// Handle get pod status request
+    pub async fn get_pod_status(&self, request: GetPodStatusTool) -> Result<GetPodStatusResponse> {
+        info!("Get pod status request received for NPUB: {}", request.pod_npub);
+
+        use kube::{Api, api::ListParams};
+        use k8s_openapi::api::core::v1::Pod;
+        use chrono::Utc;
+
+        // First check our internal tracking
+        let active_pods = self.state.active_pods.read().await;
+        let pod_info = active_pods.get(&request.pod_npub);
+
+        if let Some(info) = pod_info {
+            // Calculate time remaining
+            let now = Utc::now();
+            let time_remaining = if info.expires_at > now {
+                Some((info.expires_at - now).num_seconds() as u64)
+            } else {
+                Some(0) // Expired
+            };
+
+            // Get pod spec details
+            let pod_spec = self.state.config.pod_specs.first(); // Default spec
+
+            Ok(GetPodStatusResponse {
+                success: true,
+                message: "Pod found and active".to_string(),
+                pod_npub: request.pod_npub.clone(),
+                found: true,
+                created_at: Some(info.created_at.to_rfc3339()),
+                expires_at: Some(info.expires_at.to_rfc3339()),
+                time_remaining_seconds: time_remaining,
+                pod_spec_name: pod_spec.map(|s| s.name.clone()),
+                cpu_millicores: pod_spec.map(|s| s.cpu_millicores),
+                memory_mb: pod_spec.map(|s| s.memory_mb),
+                status: Some(if time_remaining.unwrap_or(0) > 0 { "running".to_string() } else { "expired".to_string() }),
+            })
+        } else {
+            // Pod not found in our tracking, check if it exists in Kubernetes but expired
+            let pods_api: Api<Pod> = Api::namespaced(self.state.k8s_client.client.clone(), &self.state.config.pod_namespace);
+            let pods = match pods_api.list(&ListParams::default()).await {
+                Ok(pods) => pods,
+                Err(_) => {
+                    // If we can't list pods, assume pod doesn't exist
+                    return Ok(GetPodStatusResponse {
+                        success: true,
+                        message: "Pod not found".to_string(),
+                        pod_npub: request.pod_npub.clone(),
+                        found: false,
+                        created_at: None,
+                        expires_at: None,
+                        time_remaining_seconds: None,
+                        pod_spec_name: None,
+                        cpu_millicores: None,
+                        memory_mb: None,
+                        status: None,
+                    });
+                }
+            };
+
+            // Check if pod exists in Kubernetes
+            let target_pod = pods.items.iter().find(|pod| {
+                pod.metadata.labels.as_ref()
+                    .and_then(|labels| labels.get("pod-npub"))
+                    .map(|stored_hex| {
+                        let requested_hex = if request.pod_npub.starts_with("npub1") {
+                            &request.pod_npub[5..]
+                        } else {
+                            &request.pod_npub
+                        };
+                        let stored_truncated = if stored_hex.len() > 63 {
+                            &stored_hex[..63]
+                        } else {
+                            stored_hex
+                        };
+                        let requested_truncated = if requested_hex.len() > 63 {
+                            &requested_hex[..63]
+                        } else {
+                            requested_hex
+                        };
+                        stored_truncated == requested_truncated
+                    })
+                    .unwrap_or(false)
+            });
+
+            if let Some(pod) = target_pod {
+                // Pod exists in Kubernetes but not in our tracking (likely expired)
+                let status = pod.status.as_ref()
+                    .and_then(|status| status.phase.as_ref())
+                    .map(|phase| phase.clone())
+                    .unwrap_or_else(|| "unknown".to_string());
+
+                Ok(GetPodStatusResponse {
+                    success: true,
+                    message: "Pod found but not tracked (likely expired)".to_string(),
+                    pod_npub: request.pod_npub.clone(),
+                    found: true,
+                    created_at: pod.metadata.creation_timestamp.as_ref()
+                        .map(|ts| ts.0.to_rfc3339()),
+                    expires_at: None,
+                    time_remaining_seconds: Some(0), // Assume expired
+                    pod_spec_name: None,
+                    cpu_millicores: None,
+                    memory_mb: None,
+                    status: Some(status),
+                })
+            } else {
+                // Pod not found anywhere
+                Ok(GetPodStatusResponse {
+                    success: true,
+                    message: "Pod not found".to_string(),
+                    pod_npub: request.pod_npub.clone(),
+                    found: false,
+                    created_at: None,
+                    expires_at: None,
+                    time_remaining_seconds: None,
+                    pod_spec_name: None,
+                    cpu_millicores: None,
+                    memory_mb: None,
+                    status: None,
+                })
+            }
+        }
     }
 
     /// Internal handler for spawning pods (adapted from main.rs)
@@ -509,12 +656,89 @@ impl PodProvisioningService {
             }
         }
 
-        // Update the pod's activeDeadlineSeconds in Kubernetes
-        if let Err(e) = self.state.k8s_client.extend_pod_deadline(&self.state.config.pod_namespace, &pod_name, additional_duration_seconds).await {
-            error!("Failed to extend pod deadline in Kubernetes: {}", e);
+        // Get current pod configuration before restarting
+        
+        let pods_api: Api<Pod> = Api::namespaced(self.state.k8s_client.client.clone(), &self.state.config.pod_namespace);
+        let current_pod = match pods_api.get(&pod_name).await {
+            Ok(pod) => pod,
+            Err(e) => {
+                error!("Failed to get current pod configuration: {}", e);
+                return Ok(TopUpPodResponse {
+                    success: false,
+                    message: format!("Failed to get pod configuration: {}", e),
+                    pod_npub: request.pod_npub,
+                    extended_duration_seconds: None,
+                    new_expires_at: None,
+                });
+            }
+        };
+
+        // Extract current configuration - get the current activeDeadlineSeconds
+        let current_deadline_seconds = current_pod
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.active_deadline_seconds)
+            .unwrap_or(0);
+        
+        // Calculate new deadline by adding the top-up duration
+        let new_deadline_seconds = current_deadline_seconds + additional_duration_seconds as i64;
+
+        // Delete the current pod to restart it
+        if let Err(e) = self.state.k8s_client.delete_pod(&self.state.config.pod_namespace, &pod_name).await {
+            error!("Failed to delete pod for restart: {}", e);
             return Ok(TopUpPodResponse {
                 success: false,
-                message: format!("Failed to extend pod deadline: {}", e),
+                message: format!("Failed to restart pod: {}", e),
+                pod_npub: request.pod_npub,
+                extended_duration_seconds: None,
+                new_expires_at: None,
+            });
+        }
+
+        // Wait a moment for pod deletion to complete
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+        // Get pod info from our tracking to recreate with same configuration
+        let active_pods = self.state.active_pods.read().await;
+        let pod_info = match active_pods.get(&request.pod_npub) {
+            Some(info) => info.clone(),
+            None => {
+                error!("Pod info not found in active pods tracking");
+                return Ok(TopUpPodResponse {
+                    success: false,
+                    message: "Pod info not found in tracking".to_string(),
+                    pod_npub: request.pod_npub,
+                    extended_duration_seconds: None,
+                    new_expires_at: None,
+                });
+            }
+        };
+        drop(active_pods); // Release the lock
+
+        // Use the same port that was allocated before
+        let ssh_port = pod_info.node_port.unwrap_or(pod_info.allocated_port);
+
+        // Recreate the pod with extended deadline using the same configuration
+        let pod_spec = self.state.config.pod_specs.first().unwrap(); // Use default spec for restart
+        if let Err(e) = self.state.k8s_client.create_ssh_pod(
+            &self.state.config,
+            &self.state.config.pod_namespace,
+            &pod_name,
+            &request.pod_npub,
+            &pod_info.nostr_private_key, // Use the existing private key
+            "linuxserver/openssh-server:latest", // Use default image
+            ssh_port,
+            &pod_info.ssh_username,
+            &pod_info.ssh_password,
+            new_deadline_seconds as u64, // Use the new extended deadline
+            pod_spec.memory_mb,
+            pod_spec.cpu_millicores,
+            "topup-user",
+        ).await {
+            error!("Failed to recreate pod after restart: {}", e);
+            return Ok(TopUpPodResponse {
+                success: false,
+                message: format!("Failed to recreate pod after restart: {}", e),
                 pod_npub: request.pod_npub,
                 extended_duration_seconds: None,
                 new_expires_at: None,
@@ -524,20 +748,30 @@ impl PodProvisioningService {
         // Calculate new expiration time (simplified - assume current time + extension)
         let new_expires_at = Utc::now() + chrono::Duration::seconds(additional_duration_seconds as i64);
         
+        // Update the pod info in our tracking with the new deadline
+        let mut active_pods = self.state.active_pods.write().await;
+        if let Some(pod_info) = active_pods.get_mut(&request.pod_npub) {
+            pod_info.expires_at = new_expires_at;
+            pod_info.duration_seconds = new_deadline_seconds as u64;
+        }
+        drop(active_pods);
+
         info!(
-            "🔄 Pod '{}' (NPUB: {}) extended by {} seconds",
+            "🔄 Pod '{}' (NPUB: {}) restarted and extended by {} seconds (new deadline: {} seconds)",
             pod_name,
             request.pod_npub,
-            additional_duration_seconds
+            additional_duration_seconds,
+            new_deadline_seconds
         );
 
         Ok(TopUpPodResponse {
             success: true,
             message: format!(
-                "Pod '{}' (NPUB: {}) successfully extended by {} seconds",
+                "Pod '{}' (NPUB: {}) successfully restarted and extended by {} seconds. New deadline: {} seconds",
                 pod_name,
                 request.pod_npub,
-                additional_duration_seconds
+                additional_duration_seconds,
+                new_deadline_seconds
             ),
             pod_npub: request.pod_npub,
             extended_duration_seconds: Some(additional_duration_seconds),

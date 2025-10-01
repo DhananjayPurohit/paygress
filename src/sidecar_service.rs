@@ -198,7 +198,7 @@ impl PodManager {
         user_pubkey: &str, // User's public key for sending access events
     ) -> Result<u16, String> { // Return only node_port since we have NPUB
         use k8s_openapi::api::core::v1::{
-            Container, Pod, PodSpec, EnvVar, ContainerPort, Service, Volume,
+            Container, Pod, PodSpec, EnvVar, ContainerPort, Volume,
         };
         use kube::api::PostParams;
         use kube::Api;
