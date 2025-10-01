@@ -171,7 +171,7 @@ pub struct AuthQuery {
 
 // Pod management service
 pub struct PodManager {
-    client: kube::Client,
+    pub client: kube::Client,
 }
 
 impl PodManager {
