@@ -1,12 +1,15 @@
 /target
 inventory.ini
 
+# Database files
+cashu.db
+*.db
+
+# Data directories
+data/
 
 # Environment files
 .env
-*.env.local
-*.env.production
-*.env.staging
 
 # Keep template files
 !*.env.template

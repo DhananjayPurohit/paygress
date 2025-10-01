@@ -17,7 +17,8 @@ use k8s_openapi::api::core::v1::Pod;
 // Using NIP-17 private direct messages - no manual encryption needed
 use std::sync::Mutex;
 
-use crate::{cashu, initialize_cashu, nostr};
+use crate::{cashu, nostr};
+use crate::cashu::initialize_cashu;
 
 // Configuration for the sidecar service
 #[derive(Clone, Debug)]

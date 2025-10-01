@@ -4,7 +4,7 @@
 // for the Model Context Protocol (MCP) server implementation.
 
 use serde_json::Value;
-use crate::mcp_server::PodProvisioningService;
+use crate::pod_provisioning::PodProvisioningService;
 
 /// Handle MCP initialization request
 pub fn handle_initialize(request: &Value) -> Value {
@@ -64,11 +64,6 @@ pub fn handle_tools_list(request: &Value) -> Value {
                     }
                 },
                 {
-                    "name": "list_pods",
-                    "description": "List all currently active pods with their details",
-                    "inputSchema": {"type": "object", "properties": {}}
-                },
-                {
                     "name": "get_offers",
                     "description": "Get available pod specifications and pricing information",
                     "inputSchema": {"type": "object", "properties": {}}
@@ -89,7 +84,6 @@ pub async fn handle_tools_call(service: &PodProvisioningService, request: &Value
     let result = match tool_name {
         "spawn_pod" => call_spawn_pod(service, arguments).await,
         "topup_pod" => call_topup_pod(service, arguments).await,
-        "list_pods" => call_list_pods(service).await,
         "get_offers" => call_get_offers(service).await,
         _ => {
             return json!({
@@ -121,7 +115,7 @@ async fn call_spawn_pod(service: &PodProvisioningService, arguments: &Value) -> 
     let ssh_password = arguments["ssh_password"].as_str().unwrap_or("");
     let user_pubkey = arguments["user_pubkey"].as_str();
 
-    let request = crate::mcp_server::SpawnPodTool {
+    let request = crate::pod_provisioning::SpawnPodTool {
         cashu_token: cashu_token.to_string(),
         pod_spec_id: pod_spec_id.map(|s| s.to_string()),
         pod_image: pod_image.to_string(),
@@ -187,7 +181,7 @@ async fn call_topup_pod(service: &PodProvisioningService, arguments: &Value) -> 
     let pod_npub = arguments["pod_npub"].as_str().unwrap_or("");
     let cashu_token = arguments["cashu_token"].as_str().unwrap_or("");
 
-    let request = crate::mcp_server::TopUpPodTool {
+    let request = crate::pod_provisioning::TopUpPodTool {
         pod_npub: pod_npub.to_string(),
         cashu_token: cashu_token.to_string(),
     };
@@ -235,73 +229,12 @@ async fn call_topup_pod(service: &PodProvisioningService, arguments: &Value) -> 
     }
 }
 
-/// Call list_pods tool
-async fn call_list_pods(service: &PodProvisioningService) -> Value {
-    use serde_json::json;
-    
-    let request = crate::mcp_server::ListPodsTool {};
-    
-    match service.list_pods(request).await {
-        Ok(response) => {
-            if response.total_active > 0 {
-                let mut pod_list = format!("📋 **Active Pods ({}):**\n\n", response.total_active);
-                
-                for (i, pod) in response.pods.iter().enumerate() {
-                    pod_list.push_str(&format!(
-                        "**{}. Pod {}**\n- NPUB: {}\n- SSH: {}@{}:{}\n- Created: {}\n- Expires: {}\n- Duration: {} seconds\n- Namespace: {}\n\n",
-                        i + 1,
-                        pod.pod_spec_name.as_deref().unwrap_or("Unknown"),
-                        pod.pod_npub,
-                        pod.ssh_username,
-                        pod.ssh_host,
-                        pod.ssh_port,
-                        pod.created_at,
-                        pod.expires_at,
-                        pod.duration_seconds,
-                        pod.namespace
-                    ));
-                }
-                
-                json!({
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": pod_list
-                        }
-                    ],
-                    "isError": false
-                })
-            } else {
-                json!({
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": "📭 No active pods found."
-                        }
-                    ],
-                    "isError": false
-                })
-            }
-        }
-        Err(e) => {
-            json!({
-                "content": [
-                    {
-                        "type": "text",
-                        "text": format!("❌ Internal error listing pods: {}", e)
-                    }
-                ],
-                "isError": true
-            })
-        }
-    }
-}
 
 /// Call get_offers tool
 async fn call_get_offers(service: &PodProvisioningService) -> Value {
     use serde_json::json;
     
-    let request = crate::mcp_server::GetOffersTool {};
+    let request = crate::pod_provisioning::GetOffersTool {};
     
     match service.get_offers(request).await {
         Ok(response) => {

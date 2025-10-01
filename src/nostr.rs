@@ -1,6 +1,6 @@
 // Nostr client for receiving pod provisioning events with private messaging
 use anyhow::{Context, Result};
-use nostr_sdk::{Client, Keys, Filter, Kind, RelayPoolNotification, Url, EventBuilder, Tag, ToBech32, Event};
+use nostr_sdk::{Client, Keys, Filter, Kind, RelayPoolNotification, Url, EventBuilder, Tag, ToBech32};
 use nostr_sdk::nips::nip59::UnwrappedGift;
 use nostr_sdk::nips::nip04;
 use serde::{Deserialize, Serialize};
@@ -242,7 +242,12 @@ impl NostrRelaySubscriber {
                 match self.keys.secret_key() {
                     Ok(secret_key) => {
                         let encrypted_content = nip04::encrypt(&secret_key, &request_pubkey_parsed, &details_json)?;
-                        let event_builder = EventBuilder::new(Kind::EncryptedDirectMessage, encrypted_content, []);
+                        
+                        // Create proper tags for NIP-04: p tag with receiver's public key hex
+                        let receiver_tag = Tag::public_key(request_pubkey_parsed);
+                        let alt_tag = Tag::parse(&["alt", "Private Message"])?;
+                        
+                        let event_builder = EventBuilder::new(Kind::EncryptedDirectMessage, encrypted_content, [receiver_tag, alt_tag]);
                         let event = event_builder.to_event(&self.keys)?;
                         let event_id = self.client.send_event(event).await?;
                         info!("Sent access details via NIP-04 Encrypted Direct Message to {}: {:?}", request_pubkey, event_id);
@@ -285,7 +290,12 @@ impl NostrRelaySubscriber {
                 match self.keys.secret_key() {
                     Ok(secret_key) => {
                         let encrypted_content = nip04::encrypt(&secret_key, &request_pubkey_parsed, &error_json)?;
-                        let event_builder = EventBuilder::new(Kind::EncryptedDirectMessage, encrypted_content, []);
+                        
+                        // Create proper tags for NIP-04: p tag with receiver's public key hex
+                        let receiver_tag = Tag::public_key(request_pubkey_parsed);
+                        let alt_tag = Tag::parse(&["alt", "Private Message"])?;
+                        
+                        let event_builder = EventBuilder::new(Kind::EncryptedDirectMessage, encrypted_content, [receiver_tag, alt_tag]);
                         let event = event_builder.to_event(&self.keys)?;
                         let event_id = self.client.send_event(event).await?;
                         info!("Sent error response via NIP-04 Encrypted Direct Message to {}: {:?}", request_pubkey, event_id);
@@ -328,7 +338,12 @@ impl NostrRelaySubscriber {
                 match self.keys.secret_key() {
                     Ok(secret_key) => {
                         let encrypted_content = nip04::encrypt(&secret_key, &request_pubkey_parsed, &response_json)?;
-                        let event_builder = EventBuilder::new(Kind::EncryptedDirectMessage, encrypted_content, []);
+                        
+                        // Create proper tags for NIP-04: p tag with receiver's public key hex
+                        let receiver_tag = Tag::public_key(request_pubkey_parsed);
+                        let alt_tag = Tag::parse(&["alt", "Private Message"])?;
+                        
+                        let event_builder = EventBuilder::new(Kind::EncryptedDirectMessage, encrypted_content, [receiver_tag, alt_tag]);
                         let event = event_builder.to_event(&self.keys)?;
                         let event_id = self.client.send_event(event).await?;
                         info!("Sent top-up response via NIP-04 Encrypted Direct Message to {}: {:?}", request_pubkey, event_id);

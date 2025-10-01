@@ -7,15 +7,10 @@ description = "Cashu payment verification and pod provisioning for ingress contr
 license = "MIT"
 
 
-# Binary for sidecar service
+# Unified Paygress service binary
 [[bin]]
-name = "paygress-sidecar"
+name = "paygress"
 path = "src/main.rs"
-
-# Binary for MCP server
-[[bin]]
-name = "paygress-mcp-server"
-path = "src/mcp_main.rs"
 
 [dependencies]
 # Core dependencies
@@ -47,6 +42,9 @@ chrono = { version = "0.4", features = ["serde"] }
 # MCP server dependencies
 rmcp = { version = "0.2.1", features = ["server", "transport-io", "macros"] }
 async-trait = "0.1"
+
+# Environment file loading
+dotenv = "0.15"
 
 
 [profile.release]

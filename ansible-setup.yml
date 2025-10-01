@@ -294,11 +294,11 @@
     # ===============================
     # Build and Deploy Paygress
     # ===============================
-    - name: Build paygress service
+    - name: Build unified paygress service
       become_user: "{{ paygress_user }}"
       shell: |
         . ~/.cargo/env
-        cargo build --release --bin paygress-sidecar
+        cargo build --release --bin paygress
       args:
         chdir: "{{ paygress_dir }}"
 
@@ -313,11 +313,11 @@
         group: "{{ paygress_user }}"
         mode: '0755'
 
-    - name: Create paygress systemd service
+    - name: Create unified paygress systemd service
       copy:
         content: |
           [Unit]
-          Description=Paygress Nostr Encrypted Message Pod Provisioning Service
+          Description=Paygress Unified Service (Nostr + MCP + HTTP)
           After=network.target docker.service
           Requires=docker.service
 
@@ -326,7 +326,7 @@
           User={{ paygress_user }}
           WorkingDirectory={{ paygress_dir }}
           ExecStartPre=/bin/mkdir -p {{ paygress_dir }}/data
-          ExecStart={{ paygress_dir }}/target/release/paygress-sidecar
+          ExecStart={{ paygress_dir }}/target/release/paygress
           Restart=always
           RestartSec=10
           Environment=PATH=/home/{{ paygress_user }}/.cargo/bin:/usr/local/bin:/usr/bin:/bin
@@ -348,6 +348,7 @@
         name: paygress
         enabled: yes
         state: started
+
 
     # ===============================
     # Configure Firewall
@@ -402,9 +403,23 @@
           echo "3. Check service status: sudo systemctl status paygress"
           echo "4. View logs: sudo journalctl -u paygress -f"
           echo ""
-          echo "🌐 Service is running in Nostr mode:"
-          echo "   - Listen for NIP-17 encrypted messages on configured relays"
+          echo "🌐 Unified service running:"
+          echo "   - Nostr interface: Listen for NIP-17 encrypted messages on configured relays"
+          echo "   - MCP interface: Context VM integration via Model Context Protocol"
+          echo "   - HTTP interface: REST API endpoints for pod provisioning"
           echo "   - Service public key available in logs: sudo journalctl -u paygress -f"
+          echo ""
+          echo "🤖 Context VM Integration:"
+          echo "   - MCP interface running on stdio transport"
+          echo "   - Available tools: spawn_pod, topup_pod, list_pods, get_offers"
+          echo "   - Use gateway-cli to connect: gateway-cli --server ./start-paygress-context-vm.sh"
+          echo ""
+          echo "🌐 HTTP API Endpoints:"
+          echo "   - Health check: http://{{ public_ip }}:8080/health"
+          echo "   - Get offers: http://{{ public_ip }}:8080/offers"
+          echo "   - List pods: http://{{ public_ip }}:8080/pods"
+          echo "   - Spawn pod: POST http://{{ public_ip }}:8080/pods/spawn"
+          echo "   - Topup pod: POST http://{{ public_ip }}:8080/pods/topup"
           echo ""
           echo "🔐 SSH pods will be accessible at:"
           echo "   ssh user@{{ public_ip }} -p <allocated-port>"

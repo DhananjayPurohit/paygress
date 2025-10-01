@@ -6,6 +6,7 @@ use serde::Deserialize;
 pub mod cashu;
 pub mod nostr;
 pub mod sidecar_service;
+pub mod pod_provisioning;
 
 // Re-export public types and functions for easy access
 pub use nostr::{NostrRelaySubscriber, RelayConfig, default_relay_config, custom_relay_config};

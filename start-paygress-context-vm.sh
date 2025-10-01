@@ -12,5 +12,10 @@ export POD_NAMESPACE="user-workloads"
 export SSH_HOST="localhost"
 export BASE_IMAGE="linuxserver/openssh-server:latest"
 
+# Set up environment for MCP interface only
+export ENABLE_NOSTR=false
+export ENABLE_MCP=true
+export ENABLE_HTTP=false
+
 # replace the shell with your binary (preserves fd/stdin/stdout)
-exec "$BASEDIR/target/debug/paygress-mcp-server" "$@"
+exec "$BASEDIR/target/debug/paygress" "$@"

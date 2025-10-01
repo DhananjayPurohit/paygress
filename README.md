@@ -642,6 +642,86 @@ kubectl delete -f k8s/sidecar-service.yaml
 
 ---
 
+## 🤖 **Context VM Integration**
+
+Paygress now supports **Context VM** integration through the Model Context Protocol (MCP). This allows AI assistants and other tools to interact with your pod provisioning service directly.
+
+### **Context VM Setup**
+
+1. **Install gateway-cli**:
+   ```bash
+   # Install gateway-cli for Context VM
+   npm install -g @contextvm/gateway-cli
+   ```
+
+2. **Configure your Context VM**:
+   ```bash
+   # Set up your private key and relay
+   export CONTEXTVM_PRIVATE_KEY="your_nostr_private_key_here"
+   export CONTEXTVM_RELAY="wss://relay.contextvm.org"
+   ```
+
+3. **Start the MCP Server**:
+   ```bash
+   # Build the MCP server
+   cargo build --bin paygress-mcp-server
+   
+   # Run the MCP server
+   ./start-paygress-context-vm.sh
+   ```
+
+4. **Connect with gateway-cli**:
+   ```bash
+   gateway-cli \
+     --private-key "your_private_key_here" \
+     --relays "wss://relay.contextvm.org" \
+     --server ./start-paygress-context-vm.sh
+   ```
+
+### **Available MCP Tools**
+
+The Context VM integration provides these tools:
+
+| Tool | Description | Parameters |
+|------|-------------|------------|
+| `spawn_pod` | Create a new SSH-accessible pod | `cashu_token`, `pod_image`, `ssh_username`, `ssh_password`, `pod_spec_id` (optional) |
+| `topup_pod` | Extend pod duration | `pod_npub`, `cashu_token` |
+| `get_offers` | Get available pod specifications | None |
+
+### **Example Context VM Usage**
+
+```bash
+# Get available offers
+gateway-cli --tool get_offers
+
+# Spawn a new pod
+gateway-cli --tool spawn_pod \
+  --cashu_token "cashuA..." \
+  --pod_image "linuxserver/openssh-server:latest" \
+  --ssh_username "alice" \
+  --ssh_password "secure_password" \
+  --pod_spec_id "standard"
+
+
+# Top up a pod
+gateway-cli --tool topup_pod \
+  --pod_npub "npub1..." \
+  --cashu_token "cashuB..."
+```
+
+### **Context VM Configuration**
+
+Add these environment variables to your `.env` file for Context VM support:
+
+```bash
+# Context VM Configuration
+CONTEXTVM_PRIVATE_KEY=nsec1...
+CONTEXTVM_RELAY=wss://relay.contextvm.org
+CONTEXTVM_ENABLED=true
+```
+
+---
+
 **Complete NIP-04 and NIP-17 encrypted private message-based workflow - no HTTP endpoints needed!** 🚀
 
 ## 🔄 Switching Between Deployments
