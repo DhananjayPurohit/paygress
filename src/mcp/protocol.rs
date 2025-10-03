@@ -143,8 +143,7 @@ async fn call_spawn_pod(service: &PodProvisioningService, arguments: &Value) -> 
                     "content": [
                         {
                             "type": "text",
-                            "text": format!("✅ Pod created successfully!\n\n🔑 **Access Details:**\n- Pod NPUB: {}\n- SSH Host: {}\n- SSH Port: {}\n- Username: {}\n- Password: {}\n- Expires: {}\n- Spec: {}\n\n📋 **Instructions:**\n{}", 
-                                response.pod_npub.as_deref().unwrap_or("N/A"),
+                            "text": format!("✅ Pod created successfully!\n\n🔑 **Access Details:**\n- SSH Host: {}\n- SSH Port: {}\n- Username: {}\n- Password: {}\n- Expires: {}\n- Spec: {}\n\n📋 **Instructions:**\n{}", 
                                 response.ssh_host.as_deref().unwrap_or("N/A"),
                                 response.ssh_port.map(|p| p.to_string()).as_deref().unwrap_or("N/A"),
                                 response.ssh_username.as_deref().unwrap_or("N/A"),
@@ -318,7 +317,7 @@ async fn call_get_pod_status(service: &PodProvisioningService, arguments: &Value
                         let seconds = time_remaining % 60;
                         
                         format!(
-                            "📊 **Pod Status for {}**\n\n✅ **Status:** {}\n⏰ **Time Remaining:** {}h {}m {}s\n📅 **Created:** {}\n📅 **Expires:** {}\n\n⚙️ **Specifications:**\n- CPU: {} millicores\n- Memory: {} MB\n- Spec: {}\n\n🔑 **Environment Variables Available:**\n- `$POD_NPUB` - Your pod's NPUB\n- `$POD_NSEC` - Your pod's NSEC (private key)",
+                            "📊 **Pod Status for {}**\n\n✅ **Status:** {}\n⏰ **Time Remaining:** {}h {}m {}s\n📅 **Created:** {}\n📅 **Expires:** {}\n\n⚙️ **Specifications:**\n- CPU: {} millicores\n- Memory: {} MB\n- Spec: {}",
                             response.pod_npub,
                             response.status.as_deref().unwrap_or("unknown"),
                             hours, minutes, seconds,

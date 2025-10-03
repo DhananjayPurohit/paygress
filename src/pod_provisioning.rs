@@ -673,105 +673,59 @@ impl PodProvisioningService {
             }
         };
 
-        // Extract current configuration - get the current activeDeadlineSeconds
+        // Use the proper deadline extension method instead of recreating the pod
+        if let Err(e) = self.state.k8s_client.extend_pod_deadline(&self.state.config.pod_namespace, &pod_name, additional_duration_seconds).await {
+            error!("Failed to extend pod deadline: {}", e);
+            return Ok(TopUpPodResponse {
+                success: false,
+                message: format!("Failed to extend pod deadline: {}", e),
+                pod_npub: request.pod_npub,
+                extended_duration_seconds: None,
+                new_expires_at: None,
+            });
+        }
+
+        // Get current pod expiration time to calculate new expiration
         let current_deadline_seconds = current_pod
             .spec
             .as_ref()
             .and_then(|spec| spec.active_deadline_seconds)
             .unwrap_or(0);
         
-        // Calculate new deadline by adding the top-up duration
-        let new_deadline_seconds = current_deadline_seconds + additional_duration_seconds as i64;
-
-        // Delete the current pod to restart it
-        if let Err(e) = self.state.k8s_client.delete_pod(&self.state.config.pod_namespace, &pod_name).await {
-            error!("Failed to delete pod for restart: {}", e);
-            return Ok(TopUpPodResponse {
-                success: false,
-                message: format!("Failed to restart pod: {}", e),
-                pod_npub: request.pod_npub,
-                extended_duration_seconds: None,
-                new_expires_at: None,
-            });
-        }
-
-        // Wait a moment for pod deletion to complete
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-
-        // Get pod info from our tracking to recreate with same configuration
-        let active_pods = self.state.active_pods.read().await;
-        let pod_info = match active_pods.get(&request.pod_npub) {
-            Some(info) => info.clone(),
-            None => {
-                error!("Pod info not found in active pods tracking");
-                return Ok(TopUpPodResponse {
-                    success: false,
-                    message: "Pod info not found in tracking".to_string(),
-                    pod_npub: request.pod_npub,
-                    extended_duration_seconds: None,
-                    new_expires_at: None,
-                });
+        // Calculate new expiration time from pod creation time + new deadline
+        let new_expires_at = match &current_pod.metadata.creation_timestamp {
+            Some(creation_time) => {
+                let creation_utc = creation_time.0;
+                let new_deadline_seconds = current_deadline_seconds + additional_duration_seconds as i64;
+                creation_utc + chrono::Duration::seconds(new_deadline_seconds)
             }
+            None => Utc::now() + chrono::Duration::seconds(additional_duration_seconds as i64), // Fallback
         };
-        drop(active_pods); // Release the lock
-
-        // Use the same port that was allocated before
-        let ssh_port = pod_info.node_port.unwrap_or(pod_info.allocated_port);
-
-        // Recreate the pod with extended deadline using the same configuration
-        let pod_spec = self.state.config.pod_specs.first().unwrap(); // Use default spec for restart
-        if let Err(e) = self.state.k8s_client.create_ssh_pod(
-            &self.state.config,
-            &self.state.config.pod_namespace,
-            &pod_name,
-            &request.pod_npub,
-            &pod_info.nostr_private_key, // Use the existing private key
-            "linuxserver/openssh-server:latest", // Use default image
-            ssh_port,
-            &pod_info.ssh_username,
-            &pod_info.ssh_password,
-            new_deadline_seconds as u64, // Use the new extended deadline
-            pod_spec.memory_mb,
-            pod_spec.cpu_millicores,
-            "topup-user",
-        ).await {
-            error!("Failed to recreate pod after restart: {}", e);
-            return Ok(TopUpPodResponse {
-                success: false,
-                message: format!("Failed to recreate pod after restart: {}", e),
-                pod_npub: request.pod_npub,
-                extended_duration_seconds: None,
-                new_expires_at: None,
-            });
-        }
-
-        // Calculate new expiration time (simplified - assume current time + extension)
-        let new_expires_at = Utc::now() + chrono::Duration::seconds(additional_duration_seconds as i64);
         
         // Update the pod info in our tracking with the new deadline
         let mut active_pods = self.state.active_pods.write().await;
         if let Some(pod_info) = active_pods.get_mut(&request.pod_npub) {
             pod_info.expires_at = new_expires_at;
-            pod_info.duration_seconds = new_deadline_seconds as u64;
+            pod_info.duration_seconds = current_deadline_seconds as u64 + additional_duration_seconds;
         }
         drop(active_pods);
 
         info!(
-            "🔄 Pod '{}' (NPUB: {}) restarted and extended by {} seconds (new deadline: {} seconds)",
+            "🔄 Pod '{}' (NPUB: {}) extended by {} seconds (new deadline: {} seconds)",
             pod_name,
             request.pod_npub,
             additional_duration_seconds,
-            new_deadline_seconds
+            current_deadline_seconds + additional_duration_seconds as i64
         );
 
         Ok(TopUpPodResponse {
             success: true,
             message: format!(
-                "Pod '{}' (NPUB: {}) successfully restarted and extended by {} seconds. New deadline: {} seconds",
+                "Pod '{}' (NPUB: {}) successfully extended by {} seconds. New expiration: {}",
                 pod_name,
                 request.pod_npub,
                 additional_duration_seconds,
-                new_deadline_seconds
+                new_expires_at.format("%Y-%m-%d %H:%M:%S UTC")
             ),
             pod_npub: request.pod_npub,
             extended_duration_seconds: Some(additional_duration_seconds),

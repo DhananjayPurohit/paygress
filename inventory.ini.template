@@ -18,3 +18,12 @@ nostr_private_key=nsec1...
 
 # Cashu Configuration
 whitelisted_mints=https://nofees.testnut.cashu.space,https://testnut.cashu.space
+
+# Interface Configuration
+enable_nostr=true
+enable_mcp=true
+enable_http=true
+
+# HTTP Settings (Only required if enable_http=true)
+http_port=8080
+http_bind_addr=0.0.0.0:8080

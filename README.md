@@ -509,10 +509,11 @@ User                    Service
 - Works with any Nostr client
 - Decentralized and censorship-resistant
 
-### **✅ Same Functionality as HTTP**
-- Create pods with custom specifications
-- Extend pod duration with top-ups
-- All payment verification included
+### **✅ HTTP API Support**
+- REST API endpoints for pod provisioning
+- curl commands for easy integration
+- Same functionality as Nostr interface
+- Configurable via `ENABLE_HTTP` setting
 
 ## 🔧 **Troubleshooting**
 
@@ -638,6 +639,186 @@ kubectl port-forward deployment/paygress-sidecar 8080:8080 -n ingress-system
 
 # Delete deployment
 kubectl delete -f k8s/sidecar-service.yaml
+```
+
+---
+
+## 🌐 **HTTP API Endpoints**
+
+The unified service also provides HTTP endpoints for pod provisioning when `ENABLE_HTTP=true` is set in your configuration:
+
+- **Health Check**: `GET /health`
+- **Get Offers**: `GET /offers` 
+- **List Pods**: `GET /pods`
+- **Spawn Pod**: `POST /pods/spawn`
+- **Topup Pod**: `POST /pods/topup`
+
+### HTTP API Usage with curl Commands
+
+**Get Available Offers:**
+```bash
+curl -X GET http://your-server-ip:8080/offers
+```
+
+**Example Response:**
+```json
+{
+  "minimum_duration_seconds": 60,
+  "whitelisted_mints": ["https://mint.cashu.space"],
+  "pod_specs": [
+    {
+      "id": "basic",
+      "name": "Basic",
+      "description": "Basic VPS - 1 CPU core, 1GB RAM",
+      "cpu_millicores": 1000,
+      "memory_mb": 1024,
+      "rate_msats_per_sec": 100
+    },
+    {
+      "id": "standard",
+      "name": "Standard", 
+      "description": "Standard VPS - 2 CPU cores, 2GB RAM",
+      "cpu_millicores": 2000,
+      "memory_mb": 2048,
+      "rate_msats_per_sec": 200
+    }
+  ]
+}
+```
+
+**Spawn a New Pod:**
+```bash
+curl -X POST http://your-server-ip:8080/pods/spawn \
+  -H "Content-Type: application/json" \
+  -d '{
+    "cashu_token": "cashu...",
+    "pod_spec_id": "standard",
+    "pod_image": "linuxserver/openssh-server:latest",
+    "ssh_username": "alice",
+    "ssh_password": "my_secure_password"
+  }'
+```
+
+**Example Response:**
+```json
+{
+  "pod_npub": "npub1abc123def456...",
+  "node_port": 2500,
+  "expires_at": "2025-09-23T15:30:00Z",
+  "cpu_millicores": 2000,
+  "memory_mb": 2048,
+  "pod_spec_name": "Standard",
+  "pod_spec_description": "Standard VPS - 2 CPU cores, 2GB RAM",
+  "instructions": [
+    "🚀 SSH access available:",
+    "",
+    "Direct access (no kubectl needed):",
+    "   ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no alice@your-server-ip -p 2500",
+    "",
+    "⚠️  Pod expires at:",
+    "   2025-09-23 15:30:00 UTC",
+    "",
+    "📋 Pod Details:",
+    "   Pod NPUB: npub1abc123def456...",
+    "   Specification: Standard (Standard VPS - 2 CPU cores, 2GB RAM)",
+    "   CPU: 2000 millicores",
+    "   Memory: 2048 MB",
+    "   Duration: 7200 seconds"
+  ]
+}
+```
+
+**Topup a Pod:**
+```bash
+curl -X POST http://your-server-ip:8080/pods/topup \
+  -H "Content-Type: application/json" \
+  -d '{
+    "pod_npub": "npub1abc123def456...",
+    "cashu_token": "cashu..."
+  }'
+```
+
+**Example Success Response:**
+```json
+{
+  "success": true,
+  "pod_npub": "npub1abc123def456...",
+  "extended_duration_seconds": 3600,
+  "new_expires_at": "2025-09-23T16:30:00Z",
+  "message": "Pod successfully topped up!"
+}
+```
+
+**Example Error Response:**
+```json
+{
+  "error_type": "pod_not_found",
+  "message": "Pod not found or expired",
+  "details": "Pod with NPUB 'npub1abc123...' not found or already expired"
+}
+```
+
+**List Active Pods:**
+```bash
+curl -X GET http://your-server-ip:8080/pods
+```
+
+**Example Response:**
+```json
+[
+  {
+    "pod_npub": "npub1abc123def456...",
+    "node_port": 2500,
+    "expires_at": "2025-09-23T15:30:00Z",
+    "cpu_millicores": 2000,
+    "memory_mb": 2048,
+    "pod_spec_name": "Standard",
+    "ssh_username": "alice"
+  }
+]
+```
+
+**Health Check:**
+```bash
+curl -X GET http://your-server-ip:8080/health
+```
+
+**Example Response:**
+```json
+{
+  "status": "healthy",
+  "timestamp": "2025-01-27T10:30:00Z",
+  "version": "1.0.0",
+  "uptime_seconds": 3600,
+  "active_pods": 3,
+  "available_ports": 850
+}
+```
+
+### HTTP API Error Handling
+
+All HTTP endpoints return appropriate HTTP status codes:
+
+- **200 OK**: Successful operation
+- **400 Bad Request**: Invalid request parameters
+- **404 Not Found**: Pod not found
+- **422 Unprocessable Entity**: Payment or validation errors
+- **500 Internal Server Error**: Server-side errors
+
+**Example Error Response (422):**
+```bash
+curl -X POST http://your-server-ip:8080/pods/spawn \
+  -H "Content-Type: application/json" \
+  -d '{"cashu_token": "invalid_token"}'
+```
+
+**Response:**
+```json
+{
+  "error_type": "invalid_token",
+  "message": "Failed to decode or verify Cashu token",
+  "details": "Token format is invalid or mint verification failed"
+}
 ```
 
 ---

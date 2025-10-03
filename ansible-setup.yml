@@ -124,6 +124,47 @@
         enabled: yes
 
     # ===============================
+    # Configure Firewall (Before Kubernetes)
+    # ===============================
+    - name: Install ufw
+      apt:
+        name: ufw
+        state: present
+
+    - name: Allow SSH
+      ufw:
+        rule: allow
+        port: '{{ ansible_ssh_port | default(22) }}'
+        proto: tcp
+
+    - name: Allow Kubernetes API
+      ufw:
+        rule: allow
+        port: '6443'
+        proto: tcp
+
+    - name: Allow NodePort range
+      ufw:
+        rule: allow
+        port: '30000:32767'
+        proto: tcp
+
+    - name: Allow Paygress SSH pods
+      ufw:
+        rule: allow
+        port: '{{ ssh_port_start }}:{{ ssh_port_end }}'
+        proto: tcp
+
+    - name: Allow all traffic from localhost
+      ufw:
+        rule: allow
+        from_ip: '127.0.0.1'
+
+    - name: Enable firewall
+      ufw:
+        state: enabled
+
+    # ===============================
     # Kubernetes Cluster Setup
     # ===============================
     - name: Disable swap
@@ -160,9 +201,24 @@
     - name: Apply sysctl settings
       shell: sysctl --system
 
+    # ===============================
+    # Ensure Kubernetes Services are Running
+    # ===============================
+    - name: Ensure containerd is running
+      systemd:
+        name: containerd
+        state: started
+        enabled: yes
+
+    - name: Ensure kubelet is running
+      systemd:
+        name: kubelet
+        state: started
+        enabled: yes
+
     - name: Initialize Kubernetes cluster
       shell: |
-        kubeadm init --pod-network-cidr=10.244.0.0/16 --apiserver-advertise-address={{ public_ip }} || true
+        kubeadm init --pod-network-cidr=10.244.0.0/16 || true
       register: kubeadm_init
       ignore_errors: yes
 
@@ -184,9 +240,56 @@
     # ===============================
     # Install CNI (Flannel)
     # ===============================
+    - name: Check if API server is accessible
+      shell: kubectl cluster-info --request-timeout=3s
+      register: api_check
+      ignore_errors: yes
+      become_user: "{{ paygress_user }}"
+
+    - name: Reset Kubernetes if API not accessible
+      shell: kubeadm reset --force
+      when: api_check.rc != 0
+
+    - name: Reinitialize Kubernetes cluster if needed
+      shell: |
+        kubeadm init --pod-network-cidr=10.244.0.0/16
+      when: api_check.rc != 0
+      ignore_errors: yes
+
+    - name: Recreate .kube directory if needed
+      file:
+        path: "/home/{{ paygress_user }}/.kube"
+        state: directory
+        owner: "{{ paygress_user }}"
+        group: "{{ paygress_user }}"
+      when: api_check.rc != 0
+
+    - name: Copy kubeconfig if reinitialized
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: "/home/{{ paygress_user }}/.kube/config"
+        owner: "{{ paygress_user }}"
+        group: "{{ paygress_user }}"
+        remote_src: yes
+      when: api_check.rc != 0
+
+    - name: Wait for API server after reset
+      shell: kubectl cluster-info --request-timeout=5s
+      register: api_ready
+      retries: 12
+      delay: 10
+      until: api_ready.rc == 0
+      ignore_errors: yes
+      become_user: "{{ paygress_user }}"
+      when: api_check.rc != 0
+
     - name: Install Flannel CNI
       become_user: "{{ paygress_user }}"
       shell: kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+
+    - name: Wait a bit for Flannel to initialize
+      pause:
+        seconds: 30
 
     - name: Remove taint from control-plane (single node setup)
       become_user: "{{ paygress_user }}"
@@ -291,6 +394,41 @@
         regexp: 'SSH_PORT_RANGE_END=.*'
         replace: 'SSH_PORT_RANGE_END={{ ssh_port_end }}'
 
+    - name: Update interface configuration - Nostr
+      become_user: "{{ paygress_user }}"
+      replace:
+        path: "{{ paygress_dir }}/.env"
+        regexp: 'ENABLE_NOSTR=.*'
+        replace: 'ENABLE_NOSTR={{ enable_nostr }}'
+
+    - name: Update interface configuration - MCP
+      become_user: "{{ paygress_user }}"
+      replace:
+        path: "{{ paygress_dir }}/.env"
+        regexp: 'ENABLE_MCP=.*'
+        replace: 'ENABLE_MCP={{ enable_mcp }}'
+
+    - name: Update interface configuration - HTTP
+      become_user: "{{ paygress_user }}"
+      replace:
+        path: "{{ paygress_dir }}/.env"
+        regexp: 'ENABLE_HTTP=.*'
+        replace: 'ENABLE_HTTP={{ enable_http }}'
+
+    - name: Update HTTP port configuration
+      become_user: "{{ paygress_user }}"
+      replace:
+        path: "{{ paygress_dir }}/.env"
+        regexp: 'HTTP_PORT=.*'
+        replace: 'HTTP_PORT={{ http_port }}'
+
+    - name: Update HTTP bind address configuration
+      become_user: "{{ paygress_user }}"
+      replace:
+        path: "{{ paygress_dir }}/.env"
+        regexp: 'HTTP_BIND_ADDR=.*'
+        replace: 'HTTP_BIND_ADDR={{ http_bind_addr }}'
+
     # ===============================
     # Build and Deploy Paygress
     # ===============================
@@ -350,40 +488,6 @@
         state: started
 
 
-    # ===============================
-    # Configure Firewall
-    # ===============================
-    - name: Install ufw
-      apt:
-        name: ufw
-        state: present
-
-    - name: Configure firewall for SSH
-      ufw:
-        rule: allow
-        port: '22'
-        proto: tcp
-
-    - name: Configure firewall for Kubernetes API
-      ufw:
-        rule: allow
-        port: '6443'
-        proto: tcp
-
-    - name: Configure firewall for Paygress service and SSH pods
-      ufw:
-        rule: allow
-        port: '{{ ssh_port_start }}:{{ ssh_port_end }}'
-        proto: tcp
-
-    - name: Allow traffic from public IP
-      ufw:
-        rule: allow
-        src: '{{ public_ip }}'
-
-    - name: Enable firewall
-      ufw:
-        state: enabled
 
     # ===============================
     # Final Setup Instructions
@@ -431,6 +535,83 @@
         owner: "{{ paygress_user }}"
         group: "{{ paygress_user }}"
 
+    # ===============================
+    # Context VM Gateway Setup
+    # ===============================
+    - name: Install Node.js and npm (for gateway-cli)
+      apt:
+        name:
+          - nodejs
+          - npm
+        state: present
+
+    - name: Install gateway-cli globally
+      npm:
+        name: "@contextvm/gateway-cli"
+        global: yes
+      ignore_errors: yes
+
+    - name: Create Context VM startup script
+      copy:
+        dest: "/home/{{ paygress_user }}/start-contextvm.sh"
+        content: |
+          #!/bin/bash
+          cd /home/{{ paygress_user }}/paygress
+          
+          # Check if gateway-cli is available
+          if ! command -v gateway-cli &> /dev/null; then
+              echo "Installing gateway-cli..."
+              npm install -g @contextvm/gateway-cli
+          fi
+          
+          # Start Context VM with Paygress
+          gateway-cli \
+            --private-key "5747e39e96339baf8484d9a503286c302aff8ee88c796812839e2dccf9b75dfe" \
+            --relays "wss://relay.contextvm.org" \
+            --server ./start-paygress.sh
+        owner: "{{ paygress_user }}"
+        group: "{{ paygress_user }}"
+        mode: '0755'
+
+    - name: Create systemd service for Context VM
+      copy:
+        dest: /etc/systemd/system/contextvm.service
+        content: |
+          [Unit]
+          Description=Context VM Gateway for Paygress
+          After=paygress.service
+          Wants=paygress.service
+
+          [Service]
+          Type=simple
+          User={{ paygress_user }}
+          WorkingDirectory=/home/{{ paygress_user }}/paygress
+          ExecStart=/home/{{ paygress_user }}/start-contextvm.sh
+          Restart=always
+          RestartSec=10
+          Environment=NODE_ENV=production
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd daemon for Context VM
+      systemd:
+        daemon_reload: yes
+
+    - name: Enable and start Context VM service
+      systemd:
+        name: contextvm
+        enabled: yes
+        state: started
+
+    - name: Show Context VM service status
+      shell: systemctl status contextvm --no-pager || true
+      register: contextvm_status
+
+    - name: Display Context VM status
+      debug:
+        msg: "{{ contextvm_status.stdout_lines }}"
+
   handlers:
     - name: restart paygress
       systemd:
@@ -446,3 +627,27 @@
       systemd:
         name: kubelet
         state: restarted
+
+    # ===============================
+    # Final Kubernetes Health Check
+    # ===============================
+    - name: Final check - Ensure Kubernetes is running
+      shell: kubectl cluster-info --request-timeout=10s
+      register: final_k8s_check
+      ignore_errors: yes
+      become_user: "{{ paygress_user }}"
+
+    - name: Show Kubernetes status
+      debug:
+        msg: "Kubernetes cluster status: {{ final_k8s_check.stdout if final_k8s_check.rc == 0 else 'NOT RUNNING' }}"
+
+    - name: Show Kubernetes nodes
+      shell: kubectl get nodes
+      register: k8s_nodes
+      ignore_errors: yes
+      become_user: "{{ paygress_user }}"
+
+    - name: Display Kubernetes nodes
+      debug:
+        msg: "{{ k8s_nodes.stdout_lines }}"
+      when: k8s_nodes.rc == 0
