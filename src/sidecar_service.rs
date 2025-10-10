@@ -17,7 +17,7 @@ use k8s_openapi::api::core::v1::Pod;
 // Using NIP-17 private direct messages - no manual encryption needed
 use std::sync::Mutex;
 
-use crate::{cashu, nostr};
+use crate::nostr;
 use crate::cashu::initialize_cashu;
 
 // Configuration for the sidecar service
@@ -888,21 +888,9 @@ async fn auth_check(
     // Calculate duration based on payment
     let duration_seconds = state.calculate_duration_from_payment(payment_amount_msats);
 
-    // Verify Cashu token validity (not amount, just validity)
-    match cashu::verify_cashu_token(&token, 1, &state.config.whitelisted_mints).await {
-        Ok(true) => {
-            info!("✅ Payment verified: {} msats → {} seconds", payment_amount_msats, duration_seconds);
-            StatusCode::OK.into_response()
-        },
-        Ok(false) => {
-            warn!("❌ Token verification failed");
-            StatusCode::PAYMENT_REQUIRED.into_response()
-        },
-        Err(e) => {
-            error!("💥 Payment verification error: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
-    }
+    // Token verification handled by ngx_l402 at nginx layer
+    info!("✅ Payment verified by ngx_l402: {} msats → {} seconds", payment_amount_msats, duration_seconds);
+    StatusCode::OK.into_response()
 }
 
 // Simple test handler
@@ -952,26 +940,8 @@ async fn spawn_pod_handler(
 
     info!("💰 Payment: {} msats → ⏱️ Duration: {} seconds", payment_amount_msats, duration_seconds);
 
-    // Verify payment (now we just need to verify the token is valid, not check amount)
-    match cashu::verify_cashu_token(&request.cashu_token, 1, &state.config.whitelisted_mints).await { // Just verify with 1 msat to check validity
-        Ok(false) => {
-            return (StatusCode::PAYMENT_REQUIRED, Json(SpawnPodResponse {
-                success: false,
-                message: "Cashu token verification failed - invalid token".to_string(),
-                pod_info: None,
-            })).into_response();
-        },
-        Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(SpawnPodResponse {
-                success: false,
-                message: format!("Payment verification error: {}", e),
-                pod_info: None,
-            })).into_response();
-        },
-        Ok(true) => {
-            info!("✅ Payment verified: {} msats for {} seconds", payment_amount_msats, duration_seconds);
-        }
-    }
+    // Token verification handled by ngx_l402 at nginx layer
+    info!("✅ Token verified by ngx_l402, proceeding with pod creation");
 
     // Generate NPUB first and use it as pod name
     let pod_keys = nostr_sdk::Keys::generate();
@@ -1219,28 +1189,8 @@ pub async fn top_up_pod_handler(
 
     info!("💰 Top-up payment: {} msats → ⏱️ Additional duration: {} seconds", payment_amount_msats, additional_duration_seconds);
 
-    // Verify payment token validity
-    match cashu::verify_cashu_token(&request.cashu_token, 1, &state.config.whitelisted_mints).await {
-        Ok(false) => {
-            return (StatusCode::PAYMENT_REQUIRED, Json(TopUpPodResponse {
-                success: false,
-                message: "Cashu token verification failed - invalid token".to_string(),
-                pod_info: None,
-                extended_duration_seconds: None,
-            })).into_response();
-        },
-        Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(TopUpPodResponse {
-                success: false,
-                message: format!("Payment verification error: {}", e),
-                pod_info: None,
-                extended_duration_seconds: None,
-            })).into_response();
-        },
-        Ok(true) => {
-            info!("✅ Top-up payment verified: {} msats for {} additional seconds", payment_amount_msats, additional_duration_seconds);
-        }
-    }
+    // Token verification handled by ngx_l402 at nginx layer
+    info!("✅ Top-up token verified by ngx_l402, proceeding with extension");
 
     // Update the pod's activeDeadlineSeconds in Kubernetes
     if let Err(e) = state.k8s_client.extend_pod_deadline(&state.config.pod_namespace, &pod_name, additional_duration_seconds).await {

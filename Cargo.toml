@@ -39,6 +39,9 @@ futures-util = "0.3"
 axum = "0.7"
 chrono = { version = "0.4", features = ["serde"] }
 
+# HTTP client dependencies (for MCP → HTTP)
+reqwest = { version = "0.11", features = ["json"] }
+
 # MCP server dependencies
 rmcp = { version = "0.2.1", features = ["server", "transport-io", "macros"] }
 async-trait = "0.1"

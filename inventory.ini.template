@@ -41,3 +41,44 @@ http_bind_addr=0.0.0.0:8080
 static_ip_enabled=false
 static_ip_config_url=https://your-vpn-provider.com
 static_ip_cashu_token=YOUR_CASHU_TOKEN_HERE
+
+# Nginx L402 Paywall Configuration
+# Lightning Network Client - Choose ONE: LNURL, LND, CLN, or NWC
+ln_client_type=LNURL
+lnurl_address=https://your-lnurl-server.com
+l402_root_key=your-root-key-change-me
+
+# For LND:
+# ln_client_type=LND
+# lnd_address=https://127.0.0.1:10009
+# lnd_macaroon_path=/path/to/admin.macaroon
+# lnd_cert_path=/path/to/tls.cert
+
+# For CLN:
+# ln_client_type=CLN
+# cln_rpc_path=/path/to/lightning-rpc
+
+# For NWC (Nostr Wallet Connect):
+# ln_client_type=NWC
+# nwc_uri=nostr+walletconnect://pubkey?relay=relay_url&secret=secret
+
+# Redis for dynamic pricing (optional)
+redis_url=redis://127.0.0.1:6379
+
+# Cashu L402 settings
+cashu_ecash_support=true
+cashu_l402_db_path=/var/lib/nginx/cashu_tokens.db
+cashu_l402_wallet_secret=CHANGE-ME-USE-openssl-rand-hex-32
+cashu_redeem_on_lightning=true
+cashu_redemption_interval=3600
+cashu_melt_min_balance=10
+cashu_melt_fee_percent=1
+cashu_melt_min_fee=4
+cashu_max_proofs_per_melt=1000
+
+# Cashu P2PK mode (optimized verification)
+cashu_p2pk_mode=false
+cashu_p2pk_private_key=CHANGE-ME-USE-openssl-rand-hex-32
+
+# Nginx logging
+nginx_rust_log=info

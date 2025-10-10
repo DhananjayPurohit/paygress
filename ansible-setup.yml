@@ -316,6 +316,13 @@
         comment: "Paygress HTTP API"
       when: enable_http | default(true)
 
+    - name: Allow Nginx HTTP port in firewall
+      ufw:
+        rule: allow
+        port: "80"
+        proto: tcp
+        comment: "Nginx reverse proxy with L402 paywall"
+
     - name: Allow WireGuard port in firewall
       ufw:
         rule: allow
@@ -814,6 +821,264 @@
       ignore_errors: yes
 
     # ===============================
+    # Install Nginx with L402 Module
+    # ===============================
+    - name: Install nginx and build dependencies
+      apt:
+        name:
+          - nginx
+          - libpcre3
+          - libpcre3-dev
+          - zlib1g
+          - zlib1g-dev
+          - libssl-dev
+          - build-essential
+          - git
+          - cmake
+          - libcurl4-openssl-dev
+        state: present
+
+    - name: Download ngx_l402 prebuilt module archive from release
+      get_url:
+        url: https://github.com/DhananjayPurohit/ngx_l402/releases/download/v1.1.1/ngx_l402-1.1.1.tar.gz
+        dest: /tmp/ngx_l402-1.1.1.tar.gz
+        mode: '0644'
+
+    - name: Clean old extraction directory
+      file:
+        path: /tmp/ngx_l402-extract
+        state: absent
+
+    - name: Create extraction directory
+      file:
+        path: /tmp/ngx_l402-extract
+        state: directory
+
+    - name: Extract ngx_l402 module archive
+      unarchive:
+        src: /tmp/ngx_l402-1.1.1.tar.gz
+        dest: /tmp/ngx_l402-extract/
+        remote_src: yes
+
+    - name: Create nginx modules directory
+      file:
+        path: /usr/lib/nginx/modules
+        state: directory
+        mode: '0755'
+
+    - name: Find and install ngx_l402 module
+      shell: |
+        MODULE_FILE=$(find /tmp/ngx_l402-extract -name "ngx_http_l402_module.so" -o -name "*.so" | grep -v ".so." | head -1)
+        if [ -n "$MODULE_FILE" ]; then
+          cp "$MODULE_FILE" /usr/lib/nginx/modules/ngx_http_l402_module.so
+          chmod 755 /usr/lib/nginx/modules/ngx_http_l402_module.so
+          echo "Installed: $MODULE_FILE"
+        else
+          echo "ERROR: Module .so file not found in archive"
+          ls -la /tmp/ngx_l402-extract/
+          exit 1
+        fi
+
+    - name: Load ngx_l402 module in nginx
+      lineinfile:
+        path: /etc/nginx/nginx.conf
+        line: 'load_module /usr/lib/nginx/modules/ngx_http_l402_module.so;'
+        insertbefore: BOF
+        create: no
+
+    - name: Create nginx L402 environment config directory
+      file:
+        path: /etc/systemd/system/nginx.service.d
+        state: directory
+        mode: '0755'
+
+    - name: Configure nginx L402 environment variables
+      copy:
+        content: |
+          [Service]
+          # Lightning Network Client Configuration
+          # Choose ONE of the following client types: LNURL, LND, CLN, or NWC
+          
+          # Option 1: LNURL
+          Environment=LN_CLIENT_TYPE={{ ln_client_type | default('LNURL') }}
+          Environment=LNURL_ADDRESS={{ lnurl_address | default('https://your-lnurl-server.com') }}
+          Environment=ROOT_KEY={{ l402_root_key | default('your-root-key-change-me') }}
+          
+          # Option 2: LND (uncomment if using)
+          # Environment=LN_CLIENT_TYPE=LND
+          # Environment=LND_ADDRESS={{ lnd_address | default('https://127.0.0.1:10009') }}
+          # Environment=MACAROON_FILE_PATH={{ lnd_macaroon_path | default('/path/to/admin.macaroon') }}
+          # Environment=CERT_FILE_PATH={{ lnd_cert_path | default('/path/to/tls.cert') }}
+          # Environment=ROOT_KEY={{ l402_root_key | default('your-root-key-change-me') }}
+          
+          # Option 3: CLN (uncomment if using)
+          # Environment=LN_CLIENT_TYPE=CLN
+          # Environment=CLN_LIGHTNING_RPC_FILE_PATH={{ cln_rpc_path | default('/path/to/lightning-rpc') }}
+          # Environment=ROOT_KEY={{ l402_root_key | default('your-root-key-change-me') }}
+          
+          # Option 4: NWC - Nostr Wallet Connect (uncomment if using)
+          # Environment=LN_CLIENT_TYPE=NWC
+          # Environment=NWC_URI={{ nwc_uri | default('nostr+walletconnect://pubkey?relay=relay_url&secret=secret') }}
+          # Environment=ROOT_KEY={{ l402_root_key | default('your-root-key-change-me') }}
+          
+          # Redis for dynamic pricing (optional)
+          Environment=REDIS_URL={{ redis_url | default('redis://127.0.0.1:6379') }}
+          
+          # Cashu Ecash Support
+          Environment=CASHU_ECASH_SUPPORT={{ cashu_ecash_support | default('true') }}
+          Environment=CASHU_DB_PATH={{ cashu_l402_db_path | default('/var/lib/nginx/cashu_tokens.db') }}
+          Environment=CASHU_WALLET_SECRET={{ cashu_l402_wallet_secret | default('CHANGE-ME-USE-openssl-rand-hex-32') }}
+          Environment=CASHU_WHITELISTED_MINTS={{ whitelisted_mints }}
+          
+          # Cashu automatic Lightning redemption
+          Environment=CASHU_REDEEM_ON_LIGHTNING={{ cashu_redeem_on_lightning | default('true') }}
+          Environment=CASHU_REDEMPTION_INTERVAL_SECS={{ cashu_redemption_interval | default('3600') }}
+          
+          # Cashu melt/redemption fee configuration
+          Environment=CASHU_MELT_MIN_BALANCE_SATS={{ cashu_melt_min_balance | default('10') }}
+          Environment=CASHU_MELT_FEE_RESERVE_PERCENT={{ cashu_melt_fee_percent | default('1') }}
+          Environment=CASHU_MELT_MIN_FEE_RESERVE_SATS={{ cashu_melt_min_fee | default('4') }}
+          Environment=CASHU_MAX_PROOFS_PER_MELT={{ cashu_max_proofs_per_melt | default('1000') }}
+          
+          # Cashu P2PK mode (optimized verification)
+          Environment=CASHU_P2PK_MODE={{ cashu_p2pk_mode | default('false') }}
+          Environment=CASHU_P2PK_PRIVATE_KEY={{ cashu_p2pk_private_key | default('CHANGE-ME-USE-openssl-rand-hex-32') }}
+          
+          # Logging
+          Environment=RUST_LOG={{ nginx_rust_log | default('info') }}
+        dest: /etc/systemd/system/nginx.service.d/l402-environment.conf
+        mode: '0644'
+
+    - name: Create nginx L402 data directory
+      file:
+        path: /var/lib/nginx
+        state: directory
+        owner: www-data
+        group: www-data
+        mode: '0755'
+
+    - name: Create nginx reverse proxy configuration for Paygress
+      copy:
+        content: |
+          # Paygress HTTP API with L402 Paywall
+          upstream paygress_backend {
+              server 127.0.0.1:8080;
+          }
+
+          server {
+              listen 80;
+              server_name _;
+
+              # Health check endpoint (no paywall)
+              location /health {
+                  proxy_pass http://paygress_backend;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Real-IP $remote_addr;
+              }
+
+              # Public read endpoint (no paywall)
+              location /offers {
+                  proxy_pass http://paygress_backend;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Real-IP $remote_addr;
+              }
+
+              # Paywalled endpoint: Spawn Pod
+              location /pods/spawn {
+                  # L402 Cashu payment enforcement
+                  l402 on;
+                  l402_price 100;  # Minimum price in satoshis
+                  l402_memo "Spawn Kubernetes Pod";
+                  l402_invoice_expiry 3600;
+                  
+                  # Pass validated payment info to backend
+                  proxy_pass http://paygress_backend;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-L402-Payment-Amount $l402_payment_amount;
+                  proxy_set_header X-L402-Payment-Token $l402_payment_token;
+              }
+
+              # Paywalled endpoint: Topup Pod
+              location /pods/topup {
+                  # L402 Cashu payment enforcement
+                  l402 on;
+                  l402_price 100;  # Minimum price in satoshis
+                  l402_memo "Topup Kubernetes Pod";
+                  l402_invoice_expiry 3600;
+                  
+                  # Pass validated payment info to backend
+                  proxy_pass http://paygress_backend;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-L402-Payment-Amount $l402_payment_amount;
+                  proxy_set_header X-L402-Payment-Token $l402_payment_token;
+              }
+
+              # Paywalled endpoint: Pod Status
+              # location /pods/status {
+              #     # L402 configuration (uncomment when ngx_l402 module is installed)
+              #     # l402 on;
+              #     # l402_price 100;  # Cheaper for status check
+              #     # l402_memo "Pod Status - Paygress";
+              #     # l402_invoice_expiry 3600;
+              #
+              #     proxy_pass http://paygress_backend;
+              #     proxy_set_header Host $host;
+              #     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              #     proxy_set_header X-Real-IP $remote_addr;
+              # }
+
+              # Default: proxy all other requests (no paywall for now)
+              location / {
+                  proxy_pass http://paygress_backend;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Real-IP $remote_addr;
+              }
+          }
+        dest: /etc/nginx/sites-available/paygress-l402
+        mode: '0644'
+
+    - name: Enable Paygress nginx site
+      file:
+        src: /etc/nginx/sites-available/paygress-l402
+        dest: /etc/nginx/sites-enabled/paygress-l402
+        state: link
+
+    - name: Remove default nginx site
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: Test nginx configuration
+      shell: nginx -t
+      register: nginx_test
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Reload systemd daemon for nginx
+      systemd:
+        daemon_reload: yes
+
+    - name: Enable and start nginx
+      systemd:
+        name: nginx
+        enabled: yes
+        state: started
+      when: nginx_test.rc == 0
+
+    - name: Restart nginx if config changed
+      systemd:
+        name: nginx
+        state: restarted
+      when: nginx_test.rc == 0
+
+    # ===============================
     # Install Rust
     # ===============================
     - name: Download Rust installer
@@ -873,33 +1138,34 @@
       args:
         chdir: "{{ paygress_dir }}"
 
-    - name: Update .env with static IP (WireGuard or fallback)
+    - name: Update .env with public IP for external SSH access
       become_user: "{{ paygress_user }}"
       replace:
         path: "{{ paygress_dir }}/.env"
         regexp: 'SSH_HOST=.*'
-        replace: 'SSH_HOST={{ static_ip }}'
+        replace: 'SSH_HOST={{ public_ip }}'
 
-    - name: Configure main service - Disable MCP (will use separate contextvm service)
+    - name: Configure main service - Enable MCP (calls HTTP internally)
       become_user: "{{ paygress_user }}"
       lineinfile:
         path: "{{ paygress_dir }}/.env"
         regexp: '^ENABLE_MCP=.*'
-        line: 'ENABLE_MCP=false'
+        line: 'ENABLE_MCP=true'
 
-    - name: Configure main service - Enable HTTP
+    - name: Configure main service - Enable HTTP (provides paywalled endpoints)
       become_user: "{{ paygress_user }}"
       lineinfile:
         path: "{{ paygress_dir }}/.env"
         regexp: '^ENABLE_HTTP=.*'
         line: 'ENABLE_HTTP=true'
 
-    - name: Configure main service - Enable Nostr
+    - name: Configure main service - HTTP Base URL for MCP
       become_user: "{{ paygress_user }}"
       lineinfile:
         path: "{{ paygress_dir }}/.env"
-        regexp: '^ENABLE_NOSTR=.*'
-        line: 'ENABLE_NOSTR=true'
+        regexp: '^HTTP_BASE_URL=.*'
+        line: 'HTTP_BASE_URL=http://localhost:8080'
+        create: yes
 
     - name: Update paygress.env with correct data path
       become_user: "{{ paygress_user }}"
@@ -908,19 +1174,6 @@
         regexp: 'CASHU_DB_PATH=.*'
         replace: 'CASHU_DB_PATH={{ paygress_dir }}/data/cashu.db'
 
-    - name: Update paygress.env with Nostr relays
-      become_user: "{{ paygress_user }}"
-      replace:
-        path: "{{ paygress_dir }}/.env"
-        regexp: 'NOSTR_RELAYS=.*'
-        replace: 'NOSTR_RELAYS={{ nostr_relays }}'
-
-    - name: Update paygress.env with Nostr private key
-      become_user: "{{ paygress_user }}"
-      replace:
-        path: "{{ paygress_dir }}/.env"
-        regexp: 'NOSTR_PRIVATE_KEY=.*'
-        replace: 'NOSTR_PRIVATE_KEY={{ nostr_private_key }}'
 
     - name: Update paygress.env with whitelisted mints
       become_user: "{{ paygress_user }}"
@@ -943,12 +1196,6 @@
         regexp: 'SSH_PORT_RANGE_END=.*'
         replace: 'SSH_PORT_RANGE_END={{ ssh_port_end }}'
 
-    - name: Update interface configuration - Nostr
-      become_user: "{{ paygress_user }}"
-      replace:
-        path: "{{ paygress_dir }}/.env"
-        regexp: 'ENABLE_NOSTR=.*'
-        replace: 'ENABLE_NOSTR={{ enable_nostr }}'
 
     # ===============================
     # Create separate .env for Context VM
@@ -971,19 +1218,20 @@
         regexp: '^ENABLE_HTTP=.*'
         line: 'ENABLE_HTTP=false'
 
-    - name: Configure Context VM - Disable Nostr
+    - name: Configure Context VM - HTTP Base URL (points to main service)
       become_user: "{{ paygress_user }}"
       lineinfile:
         path: "{{ paygress_dir }}/.env.contextvm"
-        regexp: '^ENABLE_NOSTR=.*'
-        line: 'ENABLE_NOSTR=false'
+        regexp: '^HTTP_BASE_URL=.*'
+        line: 'HTTP_BASE_URL=http://localhost:8080'
+        create: yes
 
-    - name: Update .env.contextvm with static IP (WireGuard or fallback)
+    - name: Update .env.contextvm with public IP for external SSH access
       become_user: "{{ paygress_user }}"
       replace:
         path: "{{ paygress_dir }}/.env.contextvm"
         regexp: 'SSH_HOST=.*'
-        replace: 'SSH_HOST={{ static_ip }}'
+        replace: 'SSH_HOST={{ public_ip }}'
 
     - name: Update interface configuration - MCP
       become_user: "{{ paygress_user }}"
@@ -1013,6 +1261,14 @@
         regexp: 'HTTP_BIND_ADDR=.*'
         replace: 'HTTP_BIND_ADDR={{ http_bind_addr }}'
 
+    - name: Enable HTTP L402 mode
+      become_user: "{{ paygress_user }}"
+      lineinfile:
+        path: "{{ paygress_dir }}/.env"
+        regexp: '^HTTP_L402_MODE=.*'
+        line: 'HTTP_L402_MODE={{ http_l402_mode | default("true") }}'
+        create: yes
+
     # ===============================
     # Build and Deploy Paygress
     # ===============================
@@ -1039,7 +1295,7 @@
       copy:
         content: |
           [Unit]
-          Description=Paygress Unified Service (Nostr + MCP + HTTP)
+          Description=Paygress Service (HTTP + MCP)
           After=network.target docker.service
           Requires=docker.service
 
@@ -1083,23 +1339,18 @@
           echo "🎉 Paygress setup completed!"
           echo ""
           echo "=========================================="
-          echo "🚀 TWO SERVICES ARE NOW RUNNING"
+          echo "🚀 PAYGRESS SERVICE ARCHITECTURE"
           echo "=========================================="
           echo ""
-          echo "1️⃣  Main Service: paygress.service"
-          echo "   Interfaces: HTTP + Nostr"
-          echo "   Status: sudo systemctl status paygress"
-          echo "   Logs:   sudo journalctl -u paygress -f"
-          echo "   Config: {{ paygress_dir }}/.env"
-          echo ""
-          echo "2️⃣  Context VM Service: contextvm.service"
-          echo "   Interface: MCP (via gateway-cli)"
-          echo "   Status: sudo systemctl status contextvm"
-          echo "   Logs:   sudo journalctl -u contextvm -f"
-          echo "   Config: {{ paygress_dir }}/.env.contextvm"
+          echo "📊 **Service:** paygress.service"
+          echo "   - Interfaces: HTTP + MCP"
+          echo "   - Architecture: MCP → HTTP (L402 Paywall)"
+          echo "   - Status: sudo systemctl status paygress"
+          echo "   - Logs:   sudo journalctl -u paygress -f"
+          echo "   - Config: {{ paygress_dir }}/.env"
           echo ""
           echo "=========================================="
-          echo "🌐 HTTP API (paygress.service)"
+          echo "🌐 HTTP API Endpoints"
           echo "=========================================="
           echo "   - Health check: http://{{ public_ip }}:8080/health"
           echo "   - Get offers: http://{{ public_ip }}:8080/offers"
@@ -1107,27 +1358,26 @@
           echo "   - Spawn pod: POST http://{{ public_ip }}:8080/pods/spawn"
           echo "   - Topup pod: POST http://{{ public_ip }}:8080/pods/topup"
           echo ""
-          echo "=========================================="
-          echo "📡 Nostr Interface (paygress.service)"
-          echo "=========================================="
-          echo "   - Listens for NIP-17 encrypted messages"
-          echo "   - Relays: {{ nostr_relays }}"
-          echo "   - Service public key in logs: sudo journalctl -u paygress -f"
+          echo "   ⚡ Nginx reverse proxy configured (L402 paywall ready)"
+          echo "   📝 L402 environment: /etc/systemd/system/nginx.service.d/l402-environment.conf"
+          echo "   📝 Nginx config: /etc/nginx/sites-available/paygress-l402"
+          echo "   💡 To enable L402 paywall, install ngx_l402 module and uncomment location blocks"
           echo ""
           echo "=========================================="
-          echo "🤖 Context VM / MCP (contextvm.service)"
+          echo "🤖 MCP Interface (Model Context Protocol)"
           echo "=========================================="
-          echo "   - MCP server running via gateway-cli"
+          echo "   - MCP server calls HTTP endpoints internally"
+          echo "   - Supports L402 paywalled endpoints"
           echo "   - Available tools: spawn_pod, topup_pod, get_offers, get_pod_status"
-          echo "   - Connects to: wss://relay.contextvm.org"
+          echo "   - Use with Context VM / gateway-cli"
           echo ""
           echo "=========================================="
           echo "🔧 Management Commands"
           echo "=========================================="
-          echo "   Restart main service:  sudo systemctl restart paygress"
-          echo "   Restart Context VM:    sudo systemctl restart contextvm"
-          echo "   Stop all services:     sudo systemctl stop paygress contextvm"
-          echo "   Start all services:    sudo systemctl start paygress contextvm"
+          echo "   Restart service:       sudo systemctl restart paygress"
+          echo "   Stop service:          sudo systemctl stop paygress"
+          echo "   Start service:         sudo systemctl start paygress"
+          echo "   View logs:             sudo journalctl -u paygress -f"
           echo "   Firewall status:       sudo ufw status"
           echo ""
           echo "=========================================="
@@ -1136,8 +1386,9 @@
           echo "   Open ports:"
           echo "   - {{ machine_ssh_port }}/tcp    (Machine SSH)"
           echo "   - {{ ssh_port_start }}-{{ ssh_port_end }}/tcp  (Pod SSH range)"
+          echo "   - 80/tcp         (Nginx reverse proxy with L402)"
           {% if enable_http | default(true) %}
-          echo "   - {{ http_port }}/tcp      (HTTP API)"
+          echo "   - {{ http_port }}/tcp      (Backend HTTP API)"
           {% endif %}
           {% if static_ip_enabled | default(false) %}
           echo "   - 51820/udp      (WireGuard VPN)"
@@ -1224,7 +1475,8 @@
         dest: "{{ paygress_dir }}/start-paygress-mcp.sh"
         content: |
           #!/bin/bash
-          # Start script for Paygress MCP-only Service (for Context VM)
+          # Start script for Paygress MCP Service (for Context VM)
+          # This MCP server calls HTTP endpoints (with optional L402 paywall support)
           
           # Get the directory where this script is located
           BASEDIR=$(dirname "$0")
@@ -1234,7 +1486,7 @@
           
           # Load environment variables from .env.contextvm file
           if [ -f ".env.contextvm" ]; then
-              echo "📋 Loading MCP-only environment variables..."
+              echo "📋 Loading MCP environment variables..."
               set -a  # automatically export all variables
               source .env.contextvm
               set +a
@@ -1247,9 +1499,17 @@
           # Set default logging level if not set
           export RUST_LOG="${RUST_LOG:-info}"
           
-          # Create necessary directories
-          mkdir -p data
-          mkdir -p "$(dirname "${CASHU_DB_PATH:-./cashu.db}")"
+          # Configure MCP to call HTTP endpoints
+          export ENABLE_MCP=true
+          export ENABLE_HTTP=false
+          export HTTP_BASE_URL="${HTTP_BASE_URL:-http://localhost:8080}"
+          
+          # Optional L402 token for paywalled endpoints
+          if [ -n "${HTTP_L402_TOKEN}" ]; then
+              echo "✅ L402 token configured for paywalled endpoints"
+          else
+              echo "⚠️  No L402 token - endpoints may require payment"
+          fi
           
           # Check if binary exists (prefer release build)
           if [ -f "./target/release/paygress" ]; then
@@ -1262,15 +1522,13 @@
           fi
           
           # Display configuration
-          echo "🤖 Starting Paygress MCP-only Service (for Context VM)"
+          echo "🤖 Starting Paygress MCP Service (HTTP Client Mode)"
           echo "===================================="
-          echo "Interfaces enabled:"
-          echo "  - MCP:   true (stdio)"
-          echo "  - Nostr: false"
-          echo "  - HTTP:  false"
+          echo "Architecture: MCP → HTTP (L402 Paywall Support)"
+          echo "HTTP Base URL: ${HTTP_BASE_URL}"
           echo ""
           
-          # Run the MCP-only service
+          # Run the MCP service
           exec "$BINARY_PATH" "$@"
         owner: "{{ paygress_user }}"
         group: "{{ paygress_user }}"

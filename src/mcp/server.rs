@@ -2,25 +2,28 @@
 //
 // This module contains the main MCP server that handles JSON-RPC communication
 // over stdio transport for the Model Context Protocol (MCP).
+//
+// This version calls HTTP endpoints (with L402 paywall support) instead of
+// directly calling the PodProvisioningService.
 
 use anyhow::Result;
 use serde_json::{json, Value};
-use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{info, error};
 
-use crate::pod_provisioning::PodProvisioningService;
 use crate::mcp::protocol::*;
+use crate::mcp::http_client::PaywalledHttpClient;
 
 /// MCP Server for handling Model Context Protocol requests
 pub struct MCPServer {
-    service: Arc<PodProvisioningService>,
+    http_client: PaywalledHttpClient,
 }
 
 impl MCPServer {
-    /// Create a new MCP server instance
-    pub fn new(service: Arc<PodProvisioningService>) -> Self {
-        Self { service }
+    /// Create a new MCP server instance that calls HTTP endpoints
+    pub fn new(base_url: String, l402_token: Option<String>) -> Self {
+        let http_client = PaywalledHttpClient::new(base_url, l402_token);
+        Self { http_client }
     }
 
     /// Run the MCP server with stdio transport
@@ -72,7 +75,7 @@ impl MCPServer {
         let response = match method {
             "initialize" => handle_initialize(&request),
             "tools/list" => handle_tools_list(&request),
-            "tools/call" => handle_tools_call(&self.service, &request).await,
+            "tools/call" => handle_tools_call_http(&self.http_client, &request).await,
             "notifications/cancelled" => {
                 // This is a notification, no response needed
                 info!("Received cancellation notification");

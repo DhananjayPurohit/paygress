@@ -1,11 +1,13 @@
 // Unified Paygress Service Interfaces
 //
-// This module contains all the interface implementations (Nostr, MCP, HTTP)
-// that share a single PodProvisioningService instance to prevent race conditions.
+// This module contains the interface implementations (MCP, HTTP).
+// 
+// MCP interface calls HTTP endpoints (with L402 paywall support).
+// HTTP interface provides the actual paywalled endpoints.
 
-pub mod nostr;
 pub mod mcp;
 pub mod http;
+pub mod http_l402;
 
 use anyhow::Result;
 use std::sync::Arc;
@@ -18,36 +20,41 @@ pub async fn run_all_interfaces(service: Arc<PodProvisioningService>) -> Result<
     let mut tasks = Vec::new();
 
     // Check which interfaces are enabled via environment variables
-    if is_interface_enabled("NOSTR") {
-        info!("Starting Nostr interface...");
-        let nostr_service = Arc::clone(&service);
-        tasks.push(tokio::spawn(async move {
-            nostr::run_nostr_interface(nostr_service).await
-        }));
-    }
-
     if is_interface_enabled("MCP") {
-        info!("Starting MCP interface...");
-        let mcp_service = Arc::clone(&service);
+        info!("Starting MCP interface (HTTP client mode)...");
         tasks.push(tokio::spawn(async move {
-            mcp::run_mcp_interface(mcp_service).await
+            mcp::run_mcp_interface().await
         }));
     }
 
     if is_interface_enabled("HTTP") {
-        info!("Starting HTTP interface...");
-        let http_service = Arc::clone(&service);
-        tasks.push(tokio::spawn(async move {
-            http::run_http_interface(http_service).await
-        }));
+        // Check if L402 mode is enabled
+        let use_l402 = std::env::var("HTTP_L402_MODE")
+            .unwrap_or_else(|_| "false".to_string())
+            .to_lowercase() == "true";
+        
+        if use_l402 {
+            info!("Starting HTTP interface with L402 support...");
+            let http_service = Arc::clone(&service);
+            tasks.push(tokio::spawn(async move {
+                http_l402::run_http_l402_interface(http_service).await
+            }));
+        } else {
+            info!("Starting HTTP interface...");
+            let http_service = Arc::clone(&service);
+            tasks.push(tokio::spawn(async move {
+                http::run_http_interface(http_service).await
+            }));
+        }
     }
 
     if tasks.is_empty() {
-        error!("No interfaces enabled! Set ENABLE_NOSTR, ENABLE_MCP, or ENABLE_HTTP environment variables.");
+        error!("No interfaces enabled! Set ENABLE_MCP or ENABLE_HTTP environment variables.");
         return Err(anyhow::anyhow!("No interfaces enabled"));
     }
 
     info!("Running {} interface(s) concurrently", tasks.len());
+    info!("Architecture: MCP → HTTP (with L402 paywall)");
 
     // Wait for all interfaces to complete (they should run forever)
     tokio::select! {
@@ -76,9 +83,11 @@ fn is_interface_enabled(interface: &str) -> bool {
 /// Get interface-specific configuration
 pub fn get_interface_config() -> InterfaceConfig {
     InterfaceConfig {
-        nostr_enabled: is_interface_enabled("NOSTR"),
         mcp_enabled: is_interface_enabled("MCP"),
         http_enabled: is_interface_enabled("HTTP"),
+        http_l402_enabled: std::env::var("HTTP_L402_MODE")
+            .unwrap_or_else(|_| "false".to_string())
+            .to_lowercase() == "true",
         http_port: std::env::var("HTTP_PORT")
             .unwrap_or_else(|_| "8080".to_string())
             .parse()
@@ -90,9 +99,9 @@ pub fn get_interface_config() -> InterfaceConfig {
 
 #[derive(Debug, Clone)]
 pub struct InterfaceConfig {
-    pub nostr_enabled: bool,
     pub mcp_enabled: bool,
     pub http_enabled: bool,
+    pub http_l402_enabled: bool,
     pub http_port: u16,
     pub http_bind_addr: String,
 }

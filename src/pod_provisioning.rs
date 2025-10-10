@@ -5,7 +5,6 @@ use tracing::{info, error};
 
 use crate::sidecar_service::{SidecarState, SidecarConfig, PodInfo, extract_token_value};
 use crate::nostr::{EncryptedSpawnPodRequest, EncryptedTopUpPodRequest, PodSpec};
-use crate::cashu::verify_cashu_token;
 
 /// Request for spawning a new pod
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -376,44 +375,8 @@ impl PodProvisioningService {
         // Calculate duration based on payment and selected spec rate
         let duration_seconds = payment_amount_msats / pod_spec.rate_msats_per_sec;
 
-        // Verify token validity (1 msat sanity)
-        match verify_cashu_token(&request.cashu_token, 1, &self.state.config.whitelisted_mints).await {
-            Ok(true) => {}
-            Ok(false) => {
-                return Ok(SpawnPodResponse {
-                    success: false,
-                    message: "Cashu token verification failed".to_string(),
-                    pod_npub: None,
-                    ssh_host: None,
-                    ssh_port: None,
-                    ssh_username: None,
-                    ssh_password: None,
-                    expires_at: None,
-                    pod_spec_name: Some(pod_spec.name.clone()),
-                    instructions: vec!["Token is invalid or not from a whitelisted mint".to_string()],
-                });
-            }
-            Err(e) => {
-                let message = if e.contains("already been used") {
-                    "Cashu token has already been used".to_string()
-                } else {
-                    "Failed to verify Cashu token".to_string()
-                };
-                
-                return Ok(SpawnPodResponse {
-                    success: false,
-                    message,
-                    pod_npub: None,
-                    ssh_host: None,
-                    ssh_port: None,
-                    ssh_username: None,
-                    ssh_password: None,
-                    expires_at: None,
-                    pod_spec_name: Some(pod_spec.name.clone()),
-                    instructions: vec![format!("Verification error: {}", e)],
-                });
-            }
-        }
+        // Token verification handled by ngx_l402 at nginx layer
+        info!("✅ Using payment: {} msats for {} seconds (verified by ngx_l402)", payment_amount_msats, duration_seconds);
 
         // Generate NPUB first and use it as pod name
         let pod_keys = Keys::generate();
@@ -631,30 +594,8 @@ impl PodProvisioningService {
             });
         }
 
-        // Verify payment token validity
-        match verify_cashu_token(&request.cashu_token, 1, &self.state.config.whitelisted_mints).await {
-            Ok(false) => {
-                return Ok(TopUpPodResponse {
-                    success: false,
-                    message: "Cashu token verification failed - invalid token".to_string(),
-                    pod_npub: request.pod_npub,
-                    extended_duration_seconds: None,
-                    new_expires_at: None,
-                });
-            },
-            Err(e) => {
-                return Ok(TopUpPodResponse {
-                    success: false,
-                    message: format!("Payment verification error: {}", e),
-                    pod_npub: request.pod_npub,
-                    extended_duration_seconds: None,
-                    new_expires_at: None,
-                });
-            },
-            Ok(true) => {
-                info!("✅ Top-up payment verified: {} msats for {} additional seconds", payment_amount_msats, additional_duration_seconds);
-            }
-        }
+        // Token verification handled by ngx_l402 at nginx layer
+        info!("✅ Top-up payment: {} msats for {} additional seconds (verified by ngx_l402)", payment_amount_msats, additional_duration_seconds);
 
         // Get current pod configuration before restarting
         

@@ -1,7 +1,8 @@
 // Unified Paygress Service
 //
-// Single binary that runs all interfaces (Nostr, MCP, HTTP) concurrently
-// using a shared PodProvisioningService instance to prevent race conditions.
+// Single binary that runs MCP and HTTP interfaces concurrently.
+// MCP interface calls HTTP endpoints (with L402 paywall support).
+// HTTP interface provides the actual paywalled endpoints.
 
 use anyhow::Result;
 use std::sync::Arc;
@@ -11,7 +12,7 @@ mod interfaces;
 mod pod_provisioning;
 mod mcp;
 mod cashu;
-mod nostr;
+mod nostr; // Still used for PodSpec type
 mod sidecar_service;
 
 use crate::pod_provisioning::PodProvisioningService;
@@ -26,8 +27,8 @@ async fn main() -> Result<()> {
     // Initialize tracing
     init_tracing()?;
 
-    tracing::info!("🚀 Starting Paygress Unified Service");
-    tracing::info!("   Interfaces: Nostr + MCP + HTTP");
+    tracing::info!("🚀 Starting Paygress Service");
+    tracing::info!("   Architecture: MCP → HTTP (L402 Paywall)");
 
     // Load configuration
     let config = get_sidecar_config();

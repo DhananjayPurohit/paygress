@@ -5,6 +5,7 @@
 
 use serde_json::Value;
 use crate::pod_provisioning::PodProvisioningService;
+use crate::mcp::http_client::{PaywalledHttpClient, SpawnPodRequest};
 
 /// Handle MCP initialization request
 pub fn handle_initialize(request: &Value) -> Value {
@@ -381,4 +382,272 @@ async fn call_get_pod_status(service: &PodProvisioningService, arguments: &Value
             })
         }
     }
+}
+
+/// Handle MCP tools/call request using HTTP client (with L402 paywall support)
+pub async fn handle_tools_call_http(http_client: &PaywalledHttpClient, request: &Value) -> Value {
+    use serde_json::json;
+    use tracing::{info, error};
+    
+    let params = &request["params"];
+    let tool_name = params["name"].as_str().unwrap_or("");
+    let arguments = &params["arguments"];
+
+    info!("🔧 MCP tool call (via HTTP): {}", tool_name);
+
+    let result = match tool_name {
+        "spawn_pod" => {
+            let spawn_request = SpawnPodRequest {
+                cashu_token: arguments["cashu_token"].as_str().unwrap_or("").to_string(),
+                pod_spec_id: arguments["pod_spec_id"].as_str().map(|s| s.to_string()),
+                pod_image: arguments["pod_image"].as_str().unwrap_or("").to_string(),
+                ssh_username: arguments["ssh_username"].as_str().unwrap_or("").to_string(),
+                ssh_password: arguments["ssh_password"].as_str().unwrap_or("").to_string(),
+                user_pubkey: arguments["user_pubkey"].as_str().map(|s| s.to_string()),
+            };
+
+            match http_client.spawn_pod(spawn_request).await {
+                Ok(response) => {
+                    if response["success"].as_bool().unwrap_or(false) {
+                        let pod_npub = response["pod_npub"].as_str().unwrap_or("N/A");
+                        let ssh_host = response["ssh_host"].as_str().unwrap_or("N/A");
+                        let ssh_port = response["ssh_port"].as_u64().unwrap_or(0);
+                        let ssh_username = response["ssh_username"].as_str().unwrap_or("N/A");
+                        let ssh_password = response["ssh_password"].as_str().unwrap_or("N/A");
+                        let expires_at = response["expires_at"].as_str().unwrap_or("N/A");
+                        let pod_spec_name = response["pod_spec_name"].as_str().unwrap_or("N/A");
+                        let instructions = response["instructions"].as_str().unwrap_or("N/A");
+
+                        json!({
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": format!(
+                                        "✅ **Pod Spawned Successfully!**\n\n\
+                                        **Pod Details:**\n\
+                                        - **Pod ID (NPUB):** `{}`\n\
+                                        - **Spec:** {}\n\
+                                        - **Expires:** {}\n\n\
+                                        **SSH Access:**\n\
+                                        ```bash\n\
+                                        ssh {}@{} -p {}\n\
+                                        Password: {}\n\
+                                        ```\n\n\
+                                        {}",
+                                        pod_npub, pod_spec_name, expires_at,
+                                        ssh_username, ssh_host, ssh_port, ssh_password, instructions
+                                    )
+                                }
+                            ],
+                            "isError": false
+                        })
+                    } else {
+                        let message = response["message"].as_str().unwrap_or("Unknown error");
+                        json!({
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": format!("❌ Failed to spawn pod: {}", message)
+                                }
+                            ],
+                            "isError": true
+                        })
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to spawn pod via HTTP: {}", e);
+                    json!({
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": format!("❌ HTTP request failed: {}\n\nThis might be due to L402 payment requirement. Check logs for details.", e)
+                            }
+                        ],
+                        "isError": true
+                    })
+                }
+            }
+        }
+        "topup_pod" => {
+            let pod_npub = arguments["pod_npub"].as_str().unwrap_or("").to_string();
+            let cashu_token = arguments["cashu_token"].as_str().unwrap_or("").to_string();
+
+            match http_client.topup_pod(pod_npub, cashu_token).await {
+                Ok(response) => {
+                    if response["success"].as_bool().unwrap_or(false) {
+                        let extended_duration = response["extended_duration_seconds"].as_u64().unwrap_or(0);
+                        let new_expires_at = response["new_expires_at"].as_str().unwrap_or("N/A");
+
+                        json!({
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": format!(
+                                        "✅ **Pod Topped Up Successfully!**\n\n\
+                                        - **Extended by:** {} seconds\n\
+                                        - **New expiration:** {}",
+                                        extended_duration, new_expires_at
+                                    )
+                                }
+                            ],
+                            "isError": false
+                        })
+                    } else {
+                        let message = response["message"].as_str().unwrap_or("Unknown error");
+                        json!({
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": format!("❌ Failed to topup pod: {}", message)
+                                }
+                            ],
+                            "isError": true
+                        })
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to topup pod via HTTP: {}", e);
+                    json!({
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": format!("❌ HTTP request failed: {}", e)
+                            }
+                        ],
+                        "isError": true
+                    })
+                }
+            }
+        }
+        "get_offers" => {
+            match http_client.get_offers().await {
+                Ok(response) => {
+                    let min_duration = response["minimum_duration_seconds"].as_u64().unwrap_or(0);
+                    let whitelisted_mints = response["whitelisted_mints"].as_array()
+                        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", "))
+                        .unwrap_or_else(|| "None".to_string());
+                    
+                    let empty_vec = vec![];
+                    let pod_specs = response["pod_specs"].as_array().unwrap_or(&empty_vec);
+                    let mut specs_text = String::new();
+                    
+                    for spec in pod_specs {
+                        let name = spec["name"].as_str().unwrap_or("Unknown");
+                        let cpu = spec["cpu_millicores"].as_u64().unwrap_or(0);
+                        let memory = spec["memory_mb"].as_u64().unwrap_or(0);
+                        let rate = spec["rate_msats_per_sec"].as_u64().unwrap_or(0);
+                        let description = spec["description"].as_str().unwrap_or("");
+                        
+                        specs_text.push_str(&format!(
+                            "\n### {}\n{}\n- **CPU:** {} millicores\n- **Memory:** {} MB\n- **Rate:** {} msats/sec\n",
+                            name, description, cpu, memory, rate
+                        ));
+                    }
+
+                    json!({
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": format!(
+                                    "📦 **Available Pod Offerings**\n\n\
+                                    **Minimum Duration:** {} seconds\n\
+                                    **Whitelisted Mints:** {}\n\
+                                    {}", 
+                                    min_duration, whitelisted_mints, specs_text
+                                )
+                            }
+                        ],
+                        "isError": false
+                    })
+                }
+                Err(e) => {
+                    error!("Failed to get offers via HTTP: {}", e);
+                    json!({
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": format!("❌ HTTP request failed: {}", e)
+                            }
+                        ],
+                        "isError": true
+                    })
+                }
+            }
+        }
+        "get_pod_status" => {
+            let pod_npub = arguments["pod_npub"].as_str().unwrap_or("").to_string();
+
+            match http_client.get_pod_status(pod_npub).await {
+                Ok(response) => {
+                    if response["found"].as_bool().unwrap_or(false) {
+                        let pod_npub = response["pod_npub"].as_str().unwrap_or("N/A");
+                        let status = response["status"].as_str().unwrap_or("unknown");
+                        let time_remaining = response["time_remaining_seconds"].as_i64().unwrap_or(0);
+                        let expires_at = response["expires_at"].as_str().unwrap_or("N/A");
+                        let pod_spec_name = response["pod_spec_name"].as_str().unwrap_or("N/A");
+                        let cpu = response["cpu_millicores"].as_u64().unwrap_or(0);
+                        let memory = response["memory_mb"].as_u64().unwrap_or(0);
+
+                        json!({
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": format!(
+                                        "📊 **Pod Status**\n\n\
+                                        - **Pod NPUB:** `{}`\n\
+                                        - **Status:** {}\n\
+                                        - **Spec:** {}\n\
+                                        - **Resources:** {} millicores CPU, {} MB RAM\n\
+                                        - **Time Remaining:** {} seconds\n\
+                                        - **Expires At:** {}",
+                                        pod_npub, status, pod_spec_name, cpu, memory, time_remaining, expires_at
+                                    )
+                                }
+                            ],
+                            "isError": false
+                        })
+                    } else {
+                        json!({
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "❌ Pod not found or expired"
+                                }
+                            ],
+                            "isError": false
+                        })
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to get pod status via HTTP: {}", e);
+                    json!({
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": format!("❌ HTTP request failed: {}", e)
+                            }
+                        ],
+                        "isError": true
+                    })
+                }
+            }
+        }
+        _ => {
+            json!({
+                "content": [
+                    {
+                        "type": "text",
+                        "text": format!("❌ Unknown tool: {}", tool_name)
+                    }
+                ],
+                "isError": true
+            })
+        }
+    };
+
+    json!({
+        "jsonrpc": "2.0",
+        "id": request["id"],
+        "result": result
+    })
 }
