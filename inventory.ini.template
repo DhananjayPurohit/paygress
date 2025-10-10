@@ -5,9 +5,18 @@ production ansible_host=YOUR-SERVER-IP ansible_user=YOUR-USERNAME ansible_ssh_pa
 [paygress_servers:vars]
 ansible_python_interpreter=/usr/bin/python3
 ansible_ssh_common_args='-o StrictHostKeyChecking=no'
-# Set your server public IP here
+ansible_remote_tmp=/tmp/.ansible/tmp
+
+# Network Configuration
+# Note: If static_ip_enabled=true, these values will be automatically
+# extracted from the downloaded config file (if present in config)
 public_ip=YOUR-SERVER-IP
-# SSH port range for Paygress pods
+
+# SSH Port Configuration
+# - Machine SSH port is automatically calculated as: ssh_port_start + 22
+#   Example: if ssh_port_start=1000, machine SSH will be on port 1022
+#   Example: if ssh_port_start=3000, machine SSH will be on port 3022
+# - Pod SSH ports use the full range: ssh_port_start to ssh_port_end
 ssh_port_start=1000
 ssh_port_end=1999
 main_service_port=1000
@@ -27,3 +36,8 @@ enable_http=true
 # HTTP Settings (Only required if enable_http=true)
 http_port=8080
 http_bind_addr=0.0.0.0:8080
+
+# Static IP Configuration (Optional)
+static_ip_enabled=false
+static_ip_config_url=https://your-vpn-provider.com
+static_ip_cashu_token=YOUR_CASHU_TOKEN_HERE

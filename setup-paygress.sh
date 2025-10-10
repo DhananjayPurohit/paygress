@@ -1,12 +1,12 @@
 #!/bin/bash
-
-# Paygress Ansible Setup Script
-# This script runs the Ansible playbook to deploy Paygress
+# Paygress Deployment Script
+# Deploys all three interfaces: HTTP, Nostr, and MCP (Context VM)
 
 set -e
 
-echo "🚀 Running Paygress Ansible Setup"
-echo "=================================="
+echo "🚀 Paygress Deployment"
+echo "======================"
+echo ""
 
 # Check if Ansible is installed
 if ! command -v ansible-playbook &> /dev/null; then
@@ -17,20 +17,34 @@ fi
 
 # Check if inventory file exists
 if [ ! -f "inventory.ini" ]; then
-    echo "❌ Error: inventory.ini file not found!"
-    echo "Please create inventory.ini with your server details."
+    echo "❌ Error: inventory.ini not found"
+    echo ""
+    echo "Create it from template:"
+    echo "  cp inventory.ini.template inventory.ini"
+    echo "  nano inventory.ini"
+    echo ""
     exit 1
 fi
 
 # Check if playbook exists
 if [ ! -f "ansible-setup.yml" ]; then
-    echo "❌ Error: ansible-setup.yml file not found!"
+    echo "❌ Error: ansible-setup.yml not found"
     exit 1
 fi
 
-echo "✅ Files found, starting deployment..."
+echo "✅ Running deployment..."
+echo ""
 
 # Run the Ansible playbook
-ansible-playbook -i inventory.ini ansible-setup.yml -v
+ansible-playbook -i inventory.ini ansible-setup.yml
 
-echo "🎉 Ansible setup completed!"
+echo ""
+echo "🎉 Deployment complete!"
+echo ""
+echo "Services status:"
+echo "  sudo systemctl status paygress contextvm"
+echo ""
+echo "View logs:"
+echo "  sudo journalctl -u paygress -f"
+echo "  sudo journalctl -u contextvm -f"
+echo ""

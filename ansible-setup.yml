@@ -2,6 +2,7 @@
 - name: Setup Ubuntu machine with Docker, Kubernetes, and Paygress
   hosts: all
   become: yes
+  gather_facts: no
   vars:
     kubernetes_version: "1.28"
     containerd_version: "1.6.24"
@@ -12,12 +13,34 @@
     
   tasks:
     # ===============================
+    # Create Home Directory First
+    # ===============================
+    - name: Ensure home directory exists
+      file:
+        path: "/home/{{ paygress_user }}"
+        state: directory
+        owner: "{{ paygress_user }}"
+        mode: '0755'
+      ignore_errors: yes
+
+    - name: Gather facts now that home directory exists
+      setup:
+
+    # ===============================
     # System Prerequisites
     # ===============================
     - name: Update apt cache
       apt:
         update_cache: yes
         cache_valid_time: 3600
+
+    - name: Install ufw firewall
+      apt:
+        name: 
+          - ufw
+          - netcat-openbsd
+          - net-tools
+        state: present
 
     - name: Install required packages
       apt:
@@ -33,7 +56,407 @@
           - pkg-config
           - libssl-dev
           - unzip
+          - wireguard
+          - wireguard-tools
         state: present
+
+    # ===============================
+    # Static IP Configuration
+    # ===============================
+    - name: Create WireGuard directory
+      file:
+        path: /etc/wireguard
+        state: directory
+        mode: '0700'
+
+    - name: Create Paygress config directory
+      file:
+        path: /etc/paygress
+        state: directory
+        mode: '0755'
+
+    - name: Check if WireGuard config already exists
+      stat:
+        path: "/etc/wireguard/wg0.conf"
+      register: wg_config_exists
+      when: static_ip_enabled | default(false)
+
+    - name: Download static IP configuration with Cashu token
+      shell: |
+        curl -s \
+          -H "Authorization: Cashu {{ static_ip_cashu_token }}" \
+          -H "Accept: application/json" \
+          -H "User-Agent: Paygress-StaticIP-Client/1.0" \
+          "{{ static_ip_config_url }}" \
+          -o "/etc/wireguard/wg0.conf"
+      when: static_ip_enabled | default(false) and not wg_config_exists.stat.exists
+      ignore_errors: yes
+      register: static_ip_download_result
+
+    - name: Display message if config already exists
+      debug:
+        msg: "✅ WireGuard config already exists at /etc/wireguard/wg0.conf - skipping download"
+      when: static_ip_enabled | default(false) and wg_config_exists.stat.exists
+
+    - name: Set proper permissions on static IP config
+      file:
+        path: "/etc/wireguard/wg0.conf"
+        mode: '0600'
+        owner: root
+        group: root
+      when: static_ip_enabled | default(false)
+
+    - name: Validate downloaded config is not HTML
+      shell: |
+        if [ -f "/etc/wireguard/wg0.conf" ]; then
+          if grep -q "<html>" "/etc/wireguard/wg0.conf"; then
+            echo "INVALID"
+          elif grep -q "\[Interface\]" "/etc/wireguard/wg0.conf"; then
+            echo "VALID"
+          else
+            echo "INVALID"
+          fi
+        else
+          echo "MISSING"
+        fi
+      when: static_ip_enabled | default(false)
+      register: config_validation
+      ignore_errors: yes
+
+    - name: Display config validation result
+      debug:
+        msg: "Static IP config validation: {{ config_validation.stdout }}"
+      when: static_ip_enabled | default(false)
+
+    - name: Extract VPN IP and port range from configuration
+      shell: |
+        if [ -f "/etc/wireguard/wg0.conf" ]; then
+          # Extract VPN IP from Address field (e.g., 10.254.11.1/30 -> 10.254.11.1)
+          vpn_ip=$(grep -E "^Address\s*=" "/etc/wireguard/wg0.conf" | head -1 | sed 's/.*=\s*//' | sed 's/\/.*//' | tr -d ' ')
+          
+          # Try to extract port range from comments (e.g., "# Public Ports: PUBLIC_IP:11000-11999")
+          port_range_comment=$(grep -E "^#.*Public Ports:.*:[0-9]+-[0-9]+" "/etc/wireguard/wg0.conf" | head -1)
+          
+          if [ -n "$port_range_comment" ]; then
+            # Extract port range from comment: "PUBLIC_IP:11000-11999" -> "11000-11999"
+            port_range=$(echo "$port_range_comment" | sed -E 's/.*:([0-9]+-[0-9]+).*/\1/')
+            port_start=$(echo "$port_range" | cut -d'-' -f1)
+            port_end=$(echo "$port_range" | cut -d'-' -f2)
+          else
+            # Fallback: Calculate from VPN IP third octet
+            # Extract the third octet from the VPN IP (e.g., 10.254.11.1 -> 11)
+            third_octet=$(echo "$vpn_ip" | cut -d'.' -f3)
+            port_start="${third_octet}000"
+            port_end="${third_octet}999"
+          fi
+          
+          echo "VPN_IP:$vpn_ip"
+          echo "PORT_START:$port_start"
+          echo "PORT_END:$port_end"
+        else
+          echo "VPN_IP:{{ public_ip }}"
+          echo "PORT_START:{{ ssh_port_start }}"
+          echo "PORT_END:{{ ssh_port_end }}"
+        fi
+      when: static_ip_enabled | default(false) and config_validation.stdout == "VALID"
+      register: extracted_vpn_config
+      ignore_errors: yes
+
+    - name: Parse extracted VPN configuration
+      set_fact:
+        extracted_static_ip: "{{ extracted_vpn_config.stdout | regex_search('VPN_IP:([^\\n]+)', '\\1') | first }}"
+        extracted_ssh_port_start: "{{ extracted_vpn_config.stdout | regex_search('PORT_START:([^\\n]+)', '\\1') | first }}"
+        extracted_ssh_port_end: "{{ extracted_vpn_config.stdout | regex_search('PORT_END:([^\\n]+)', '\\1') | first }}"
+      when: static_ip_enabled | default(false) and config_validation.stdout == "VALID" and extracted_vpn_config.stdout is defined
+
+    - name: Extract public IP from WireGuard Endpoint
+      shell: |
+        if [ -f "/etc/wireguard/wg0.conf" ]; then
+          # Extract public IP from Endpoint field (e.g., PUBLIC_IP:51820 -> PUBLIC_IP)
+          grep -E "^Endpoint\s*=" "/etc/wireguard/wg0.conf" | head -1 | sed 's/.*=\s*//' | sed 's/:.*//' | tr -d ' '
+        else
+          echo "{{ public_ip }}"
+        fi
+      when: static_ip_enabled | default(false) and config_validation.stdout == "VALID"
+      register: extracted_public_ip
+      ignore_errors: yes
+
+    - name: Display static IP download result
+      debug:
+        msg: "{{ static_ip_download_result.stdout_lines }}"
+      when: static_ip_enabled | default(false) and static_ip_download_result is defined and not static_ip_download_result.skipped | default(false)
+
+    - name: Check if WireGuard interface is already running
+      shell: wg show wg0 2>/dev/null
+      register: wg_interface_check
+      when: static_ip_enabled | default(false) and config_validation.stdout == "VALID"
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Start static IP interface
+      shell: |
+        wg-quick up wg0
+      when: static_ip_enabled | default(false) and config_validation.stdout == "VALID" and wg_interface_check.rc != 0
+      ignore_errors: yes
+      register: static_ip_start_result
+
+    - name: Display message if interface already running
+      debug:
+        msg: "✅ WireGuard interface wg0 already running - skipping startup"
+      when: static_ip_enabled | default(false) and config_validation.stdout == "VALID" and wg_interface_check.rc == 0
+
+    - name: Check systemd status for wg-quick
+      shell: systemctl is-active wg-quick@wg0 || echo "not-active"
+      register: wg_systemd_status
+      when: static_ip_enabled | default(false) and config_validation.stdout == "VALID"
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Enable static IP interface on boot
+      systemd:
+        name: "wg-quick@wg0"
+        enabled: yes
+      when: static_ip_enabled | default(false) and config_validation.stdout == "VALID"
+      ignore_errors: yes
+
+    - name: Display WireGuard status
+      debug:
+        msg: "WireGuard interface status: {{ wg_systemd_status.stdout if wg_systemd_status.stdout is defined else 'unknown' }}"
+      when: static_ip_enabled | default(false)
+
+    - name: Save extracted configuration to files
+      shell: |
+        echo "{{ extracted_static_ip | default('') }}" > /etc/paygress/static_ip
+        echo "{{ extracted_public_ip.stdout | default(public_ip) }}" > /etc/paygress/public_ip
+        echo "{{ extracted_ssh_port_start | default(ssh_port_start) }}" > /etc/paygress/ssh_port_start
+        echo "{{ extracted_ssh_port_end | default(ssh_port_end) }}" > /etc/paygress/ssh_port_end
+        chmod 644 /etc/paygress/*
+      when: static_ip_enabled | default(false) and config_validation.stdout == "VALID" and extracted_static_ip is defined
+      ignore_errors: yes
+
+    - name: Set facts from extracted configuration (enabled and valid)
+      set_fact:
+        static_ip: "{{ extracted_static_ip | default(public_ip) }}"
+        public_ip: "{{ extracted_public_ip.stdout | default(public_ip) }}"
+        ssh_port_start: "{{ extracted_ssh_port_start | default(ssh_port_start) }}"
+        ssh_port_end: "{{ extracted_ssh_port_end | default(ssh_port_end) }}"
+      when: static_ip_enabled | default(false) and config_validation.stdout == "VALID"
+
+    - name: Display final IP configuration
+      debug:
+        msg: |
+          ========================================
+          IP Configuration Summary
+          ========================================
+          Static IP (WireGuard VPN): {{ static_ip }}
+            └─ Use this for pod SSH access via VPN
+          Public IP (Your Network): {{ public_ip }}
+            └─ Use this for machine SSH access (requires port forwarding)
+          SSH Port Range: {{ ssh_port_start }}-{{ ssh_port_end }}
+          ========================================
+      when: static_ip_enabled | default(false)
+
+    - name: Set facts from inventory (disabled or invalid config)
+      set_fact:
+        static_ip: "{{ public_ip }}"
+      when: not (static_ip_enabled | default(false)) or (static_ip_enabled | default(false) and config_validation.stdout != "VALID")
+
+    - name: Warn if static IP config is invalid
+      debug:
+        msg: "⚠️  WARNING: Static IP config is invalid ({{ config_validation.stdout }}). Using inventory.ini values. Check your Cashu token or config URL."
+      when: static_ip_enabled | default(false) and config_validation.stdout != "VALID"
+
+    # ===============================
+    # Firewall Configuration
+    # ===============================
+    - name: Calculate SSH port based on range (start + 22)
+      set_fact:
+        machine_ssh_port: "{{ (ssh_port_start | int) + 22 }}"
+
+    - name: Display calculated SSH port
+      debug:
+        msg: "SSH port for machine access: {{ machine_ssh_port }}"
+
+    - name: Get current SSH port before changes
+      shell: grep "^Port " /etc/ssh/sshd_config | head -1 | awk '{print $2}' || echo "22"
+      register: current_ssh_port_firewall
+      changed_when: false
+
+    - name: Display current SSH port
+      debug:
+        msg: "Current SSH port: {{ current_ssh_port_firewall.stdout }}"
+
+    - name: Allow current SSH port in firewall (preserve existing access)
+      ufw:
+        rule: allow
+        port: "{{ current_ssh_port_firewall.stdout | trim }}"
+        proto: tcp
+        comment: "Current SSH port"
+      when: current_ssh_port_firewall.stdout != "" and current_ssh_port_firewall.stdout != machine_ssh_port
+
+    - name: Allow new SSH port in firewall
+      ufw:
+        rule: allow
+        port: "{{ machine_ssh_port }}"
+        proto: tcp
+        comment: "New SSH access to machine"
+
+    - name: Allow pod SSH port range in firewall
+      ufw:
+        rule: allow
+        port: "{{ ssh_port_start }}:{{ ssh_port_end }}"
+        proto: tcp
+        comment: "SSH access to Paygress pods"
+
+    - name: Allow HTTP port in firewall
+      ufw:
+        rule: allow
+        port: "{{ http_port }}"
+        proto: tcp
+        comment: "Paygress HTTP API"
+      when: enable_http | default(true)
+
+    - name: Allow WireGuard port in firewall
+      ufw:
+        rule: allow
+        port: "51820"
+        proto: udp
+        comment: "WireGuard VPN"
+      when: static_ip_enabled | default(false)
+
+    - name: Set default firewall policies
+      ufw:
+        direction: "{{ item.direction }}"
+        policy: "{{ item.policy }}"
+      loop:
+        - { direction: 'incoming', policy: 'deny' }
+        - { direction: 'outgoing', policy: 'allow' }
+
+    - name: Enable firewall
+      ufw:
+        state: enabled
+
+    - name: Display firewall status
+      shell: ufw status numbered
+      register: firewall_status
+      changed_when: false
+
+    - name: Show firewall rules
+      debug:
+        msg: "{{ firewall_status.stdout_lines }}"
+
+    - name: Backup SSH config before changes
+      copy:
+        src: /etc/ssh/sshd_config
+        dest: /etc/ssh/sshd_config.ansible_backup
+        remote_src: yes
+        backup: no
+
+    - name: Get current SSH port
+      shell: grep "^Port " /etc/ssh/sshd_config | head -1 | awk '{print $2}' || echo "22"
+      register: current_ssh_port
+      changed_when: false
+
+    - name: Display current and new SSH ports
+      debug:
+        msg: "Current SSH port: {{ current_ssh_port.stdout }}, New SSH port: {{ machine_ssh_port }}"
+
+    - name: Remove all existing Port lines from SSH config
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^Port '
+        state: absent
+
+    - name: Configure SSH to listen on BOTH ports (safe migration)
+      blockinfile:
+        path: /etc/ssh/sshd_config
+        marker: "# {mark} ANSIBLE MANAGED SSH PORTS"
+        insertafter: "^#Port"
+        block: |
+          Port {{ current_ssh_port.stdout }}
+          Port {{ machine_ssh_port }}
+      register: ssh_dual_ports_configured
+
+    - name: Optimize SSH for faster connections
+      blockinfile:
+        path: /etc/ssh/sshd_config
+        marker: "# {mark} ANSIBLE MANAGED SSH OPTIMIZATIONS"
+        block: |
+          UseDNS no
+          GSSAPIAuthentication no
+        insertbefore: EOF
+
+    - name: Verify SSH config syntax
+      shell: sshd -t 2>&1
+      register: ssh_config_test
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Display SSH config test result
+      debug:
+        msg: "SSH config validation: {{ 'VALID ✅' if ssh_config_test.rc == 0 else 'INVALID ❌' }}"
+
+    - name: Show SSH config errors if invalid
+      debug:
+        msg: "{{ ssh_config_test.stderr_lines }}"
+      when: ssh_config_test.rc != 0
+
+    - name: Restore SSH config if invalid
+      copy:
+        src: /etc/ssh/sshd_config.ansible_backup
+        dest: /etc/ssh/sshd_config
+        remote_src: yes
+      when: ssh_config_test.rc != 0
+
+    - name: Reload SSH service (graceful - doesn't drop connections)
+      systemd:
+        name: sshd
+        state: reloaded
+      when: ssh_dual_ports_configured.changed and ssh_config_test.rc == 0
+      ignore_errors: yes
+
+    - name: Ensure SSH is enabled and running
+      systemd:
+        name: sshd
+        enabled: yes
+        state: started
+
+    - name: Verify SSH is listening on correct port
+      shell: netstat -tlnp | grep :{{ machine_ssh_port }} || ss -tlnp | grep :{{ machine_ssh_port }}
+      register: ssh_listening
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Display SSH listening status
+      debug:
+        msg: "{{ ssh_listening.stdout_lines }}"
+      when: ssh_listening.stdout != ""
+
+    - name: Test SSH is listening on the machine
+      shell: |
+        ss -tlnp | grep :{{ machine_ssh_port }} && echo "LISTENING" || echo "NOT_LISTENING"
+      register: ssh_test_local
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Display SSH connectivity test
+      debug:
+        msg: |
+          ========================================
+          SSH Configuration Complete
+          ========================================
+          SSH is now listening on BOTH ports:
+            - Port {{ current_ssh_port.stdout }} (old port - STILL WORKS)
+            - Port {{ machine_ssh_port }} (new port - for Paygress)
+          
+          Status: {{ 'LISTENING ✅' if ssh_test_local.stdout is defined and 'LISTENING' in ssh_test_local.stdout else 'CHECK NEEDED' }}
+          
+          SSH Access Methods:
+          1. Local network:  ssh {{ paygress_user }}@{{ ansible_host }} -p {{ machine_ssh_port }}
+          2. Public IP:      ssh {{ paygress_user }}@{{ public_ip }} -p {{ machine_ssh_port }}
+          
+          Your current connection port ({{ current_ssh_port.stdout }}) still works:
+             ssh {{ paygress_user }}@{{ public_ip }} -p {{ current_ssh_port.stdout }}
 
     # ===============================
     # Docker Installation
@@ -90,6 +513,8 @@
           - kubeadm
           - kubectl
         state: present
+        update_cache: yes
+        force: yes
 
     - name: Hold Kubernetes packages
       dpkg_selections:
@@ -99,6 +524,64 @@
         - kubelet
         - kubeadm
         - kubectl
+
+    - name: Verify kubectl is actually installed
+      shell: dpkg -l | grep kubectl
+      register: kubectl_installed
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Display kubectl package info
+      debug:
+        msg: "{{ kubectl_installed.stdout_lines }}"
+
+    - name: Find kubectl binary
+      shell: |
+        if [ -f /usr/bin/kubectl ]; then
+          echo "/usr/bin/kubectl"
+        elif [ -f /snap/bin/kubectl ]; then
+          echo "/snap/bin/kubectl"
+        else
+          which kubectl 2>/dev/null || echo "NOT_FOUND"
+        fi
+      register: kubectl_location
+      changed_when: false
+
+    - name: Install kubectl via snap if apt failed
+      snap:
+        name: kubectl
+        classic: yes
+      when: kubectl_location.stdout == "NOT_FOUND"
+      ignore_errors: yes
+
+    - name: Find kubectl again after snap install
+      shell: |
+        if [ -f /usr/bin/kubectl ]; then
+          echo "/usr/bin/kubectl"
+        elif [ -f /snap/bin/kubectl ]; then
+          echo "/snap/bin/kubectl"
+        else
+          echo "/usr/bin/kubectl"
+        fi
+      register: kubectl_location_final
+      changed_when: false
+
+    - name: Set kubectl path fact
+      set_fact:
+        kubectl_path: "{{ kubectl_location_final.stdout }}"
+
+    - name: Display final kubectl location
+      debug:
+        msg: "kubectl will be used from: {{ kubectl_path }}"
+
+    - name: Ensure kubectl is in PATH
+      file:
+        src: "{{ kubectl_path }}"
+        dest: /usr/local/bin/kubectl
+        state: link
+        force: yes
+      when: kubectl_path != "NOT_FOUND"
+      ignore_errors: yes
 
     # ===============================
     # Configure containerd
@@ -216,10 +699,16 @@
         state: started
         enabled: yes
 
+    - name: Check if Kubernetes is already initialized
+      stat:
+        path: /etc/kubernetes/manifests/kube-apiserver.yaml
+      register: k8s_initialized
+
     - name: Initialize Kubernetes cluster
       shell: |
-        kubeadm init --pod-network-cidr=10.244.0.0/16 || true
+        kubeadm init --pod-network-cidr=10.244.0.0/16 --ignore-preflight-errors=Port-6443
       register: kubeadm_init
+      when: not k8s_initialized.stat.exists
       ignore_errors: yes
 
     - name: Create .kube directory
@@ -229,6 +718,11 @@
         owner: "{{ paygress_user }}"
         group: "{{ paygress_user }}"
 
+    - name: Check if kubeconfig exists
+      stat:
+        path: /etc/kubernetes/admin.conf
+      register: kubeconfig_check
+
     - name: Copy kubeconfig
       copy:
         src: /etc/kubernetes/admin.conf
@@ -236,25 +730,44 @@
         owner: "{{ paygress_user }}"
         group: "{{ paygress_user }}"
         remote_src: yes
+      when: kubeconfig_check.stat.exists
 
     # ===============================
     # Install CNI (Flannel)
     # ===============================
     - name: Check if API server is accessible
-      shell: kubectl cluster-info --request-timeout=3s
+      shell: "{{ kubectl_path }} cluster-info --request-timeout=3s 2>/dev/null || echo 'API not accessible'"
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
       register: api_check
       ignore_errors: yes
-      become_user: "{{ paygress_user }}"
+      changed_when: false
 
     - name: Reset Kubernetes if API not accessible
-      shell: kubeadm reset --force
+      shell: |
+        kubeadm reset --force
+        rm -rf /etc/cni/net.d
+        rm -rf $HOME/.kube
+        iptables -F && iptables -t nat -F && iptables -t mangle -F && iptables -X
+      when: api_check.rc != 0
+      ignore_errors: yes
+
+    - name: Wait after reset
+      pause:
+        seconds: 5
       when: api_check.rc != 0
 
     - name: Reinitialize Kubernetes cluster if needed
       shell: |
-        kubeadm init --pod-network-cidr=10.244.0.0/16
+        kubeadm init --pod-network-cidr=10.244.0.0/16 --ignore-preflight-errors=Port-6443
       when: api_check.rc != 0
+      register: kubeadm_reinit
       ignore_errors: yes
+
+    - name: Display reinit result
+      debug:
+        msg: "{{ kubeadm_reinit.stdout_lines }}"
+      when: api_check.rc != 0 and kubeadm_reinit is defined and not kubeadm_reinit.skipped | default(false)
 
     - name: Recreate .kube directory if needed
       file:
@@ -271,29 +784,34 @@
         owner: "{{ paygress_user }}"
         group: "{{ paygress_user }}"
         remote_src: yes
-      when: api_check.rc != 0
+      when: api_check.rc != 0 and kubeconfig_check.stat.exists
 
     - name: Wait for API server after reset
-      shell: kubectl cluster-info --request-timeout=5s
+      shell: "{{ kubectl_path }} cluster-info --request-timeout=5s"
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
       register: api_ready
       retries: 12
       delay: 10
       until: api_ready.rc == 0
       ignore_errors: yes
-      become_user: "{{ paygress_user }}"
       when: api_check.rc != 0
 
     - name: Install Flannel CNI
-      become_user: "{{ paygress_user }}"
-      shell: kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+      shell: "{{ kubectl_path }} apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml"
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      ignore_errors: yes
 
     - name: Wait a bit for Flannel to initialize
       pause:
         seconds: 30
 
     - name: Remove taint from control-plane (single node setup)
-      become_user: "{{ paygress_user }}"
-      shell: kubectl taint nodes --all node-role.kubernetes.io/control-plane- || true
+      shell: "{{ kubectl_path }} taint nodes --all node-role.kubernetes.io/control-plane- || true"
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      ignore_errors: yes
 
     # ===============================
     # Install Rust
@@ -308,10 +826,19 @@
       become_user: "{{ paygress_user }}"
       shell: /tmp/rust-installer.sh -y
 
+    - name: Ensure .bashrc exists
+      file:
+        path: "/home/{{ paygress_user }}/.bashrc"
+        state: touch
+        owner: "{{ paygress_user }}"
+        group: "{{ paygress_user }}"
+        mode: '0644'
+
     - name: Add Rust to PATH
       lineinfile:
         path: "/home/{{ paygress_user }}/.bashrc"
         line: 'export PATH="$HOME/.cargo/bin:$PATH"'
+        create: yes
 
     # ===============================
     # Clone and Setup Paygress
@@ -329,12 +856,13 @@
         version: feat/nip04
 
     - name: Create user-workloads namespace
-      become_user: "{{ paygress_user }}"
       shell: |
-        . ~/.cargo/env
-        kubectl create namespace user-workloads || true
+        {{ kubectl_path }} create namespace user-workloads || true
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
       args:
         chdir: "{{ paygress_dir }}"
+      ignore_errors: yes
 
     # ===============================
     # Configure Paygress Environment
@@ -345,12 +873,33 @@
       args:
         chdir: "{{ paygress_dir }}"
 
-    - name: Update .env with server IP
+    - name: Update .env with static IP (WireGuard or fallback)
       become_user: "{{ paygress_user }}"
       replace:
         path: "{{ paygress_dir }}/.env"
         regexp: 'SSH_HOST=.*'
-        replace: 'SSH_HOST={{ public_ip }}'
+        replace: 'SSH_HOST={{ static_ip }}'
+
+    - name: Configure main service - Disable MCP (will use separate contextvm service)
+      become_user: "{{ paygress_user }}"
+      lineinfile:
+        path: "{{ paygress_dir }}/.env"
+        regexp: '^ENABLE_MCP=.*'
+        line: 'ENABLE_MCP=false'
+
+    - name: Configure main service - Enable HTTP
+      become_user: "{{ paygress_user }}"
+      lineinfile:
+        path: "{{ paygress_dir }}/.env"
+        regexp: '^ENABLE_HTTP=.*'
+        line: 'ENABLE_HTTP=true'
+
+    - name: Configure main service - Enable Nostr
+      become_user: "{{ paygress_user }}"
+      lineinfile:
+        path: "{{ paygress_dir }}/.env"
+        regexp: '^ENABLE_NOSTR=.*'
+        line: 'ENABLE_NOSTR=true'
 
     - name: Update paygress.env with correct data path
       become_user: "{{ paygress_user }}"
@@ -400,6 +949,41 @@
         path: "{{ paygress_dir }}/.env"
         regexp: 'ENABLE_NOSTR=.*'
         replace: 'ENABLE_NOSTR={{ enable_nostr }}'
+
+    # ===============================
+    # Create separate .env for Context VM
+    # ===============================
+    - name: Create .env.contextvm for MCP-only service
+      become_user: "{{ paygress_user }}"
+      shell: "cp {{ paygress_dir }}/.env {{ paygress_dir }}/.env.contextvm && chmod 600 {{ paygress_dir }}/.env.contextvm"
+
+    - name: Configure Context VM - Enable ONLY MCP
+      become_user: "{{ paygress_user }}"
+      lineinfile:
+        path: "{{ paygress_dir }}/.env.contextvm"
+        regexp: '^ENABLE_MCP=.*'
+        line: 'ENABLE_MCP=true'
+
+    - name: Configure Context VM - Disable HTTP
+      become_user: "{{ paygress_user }}"
+      lineinfile:
+        path: "{{ paygress_dir }}/.env.contextvm"
+        regexp: '^ENABLE_HTTP=.*'
+        line: 'ENABLE_HTTP=false'
+
+    - name: Configure Context VM - Disable Nostr
+      become_user: "{{ paygress_user }}"
+      lineinfile:
+        path: "{{ paygress_dir }}/.env.contextvm"
+        regexp: '^ENABLE_NOSTR=.*'
+        line: 'ENABLE_NOSTR=false'
+
+    - name: Update .env.contextvm with static IP (WireGuard or fallback)
+      become_user: "{{ paygress_user }}"
+      replace:
+        path: "{{ paygress_dir }}/.env.contextvm"
+        regexp: 'SSH_HOST=.*'
+        replace: 'SSH_HOST={{ static_ip }}'
 
     - name: Update interface configuration - MCP
       become_user: "{{ paygress_user }}"
@@ -498,38 +1082,122 @@
           #!/bin/bash
           echo "🎉 Paygress setup completed!"
           echo ""
-          echo "📋 Next steps:"
-          echo "1. Configure your settings in inventory.ini:"
-          echo "   - Set nostr_private_key to your actual private key"
-          echo "   - Verify nostr_relays and whitelisted_mints"
-          echo "   - Update public_ip with your server public IP"
-          echo "2. Re-run ansible-playbook ansible-setup.yml to apply changes"
-          echo "3. Check service status: sudo systemctl status paygress"
-          echo "4. View logs: sudo journalctl -u paygress -f"
+          echo "=========================================="
+          echo "🚀 TWO SERVICES ARE NOW RUNNING"
+          echo "=========================================="
           echo ""
-          echo "🌐 Unified service running:"
-          echo "   - Nostr interface: Listen for NIP-17 encrypted messages on configured relays"
-          echo "   - MCP interface: Context VM integration via Model Context Protocol"
-          echo "   - HTTP interface: REST API endpoints for pod provisioning"
-          echo "   - Service public key available in logs: sudo journalctl -u paygress -f"
+          echo "1️⃣  Main Service: paygress.service"
+          echo "   Interfaces: HTTP + Nostr"
+          echo "   Status: sudo systemctl status paygress"
+          echo "   Logs:   sudo journalctl -u paygress -f"
+          echo "   Config: {{ paygress_dir }}/.env"
           echo ""
-          echo "🤖 Context VM Integration:"
-          echo "   - MCP interface running on stdio transport"
-          echo "   - Available tools: spawn_pod, topup_pod, list_pods, get_offers"
-          echo "   - Use gateway-cli to connect: gateway-cli --server ./start-paygress-context-vm.sh"
+          echo "2️⃣  Context VM Service: contextvm.service"
+          echo "   Interface: MCP (via gateway-cli)"
+          echo "   Status: sudo systemctl status contextvm"
+          echo "   Logs:   sudo journalctl -u contextvm -f"
+          echo "   Config: {{ paygress_dir }}/.env.contextvm"
           echo ""
-          echo "🌐 HTTP API Endpoints:"
+          echo "=========================================="
+          echo "🌐 HTTP API (paygress.service)"
+          echo "=========================================="
           echo "   - Health check: http://{{ public_ip }}:8080/health"
           echo "   - Get offers: http://{{ public_ip }}:8080/offers"
-          echo "   - List pods: http://{{ public_ip }}:8080/pods"
+          echo "   - Get pod status: POST http://{{ public_ip }}:8080/pods/status"
           echo "   - Spawn pod: POST http://{{ public_ip }}:8080/pods/spawn"
           echo "   - Topup pod: POST http://{{ public_ip }}:8080/pods/topup"
           echo ""
-          echo "🔐 SSH pods will be accessible at:"
-          echo "   ssh user@{{ public_ip }} -p <allocated-port>"
+          echo "=========================================="
+          echo "📡 Nostr Interface (paygress.service)"
+          echo "=========================================="
+          echo "   - Listens for NIP-17 encrypted messages"
+          echo "   - Relays: {{ nostr_relays }}"
+          echo "   - Service public key in logs: sudo journalctl -u paygress -f"
           echo ""
-          echo "📁 Paygress directory: {{ paygress_dir }}"
-          echo "⚙️  Configuration file: {{ paygress_dir }}/.env"
+          echo "=========================================="
+          echo "🤖 Context VM / MCP (contextvm.service)"
+          echo "=========================================="
+          echo "   - MCP server running via gateway-cli"
+          echo "   - Available tools: spawn_pod, topup_pod, get_offers, get_pod_status"
+          echo "   - Connects to: wss://relay.contextvm.org"
+          echo ""
+          echo "=========================================="
+          echo "🔧 Management Commands"
+          echo "=========================================="
+          echo "   Restart main service:  sudo systemctl restart paygress"
+          echo "   Restart Context VM:    sudo systemctl restart contextvm"
+          echo "   Stop all services:     sudo systemctl stop paygress contextvm"
+          echo "   Start all services:    sudo systemctl start paygress contextvm"
+          echo "   Firewall status:       sudo ufw status"
+          echo ""
+          echo "=========================================="
+          echo "🔥 Firewall Configuration"
+          echo "=========================================="
+          echo "   Open ports:"
+          echo "   - {{ machine_ssh_port }}/tcp    (Machine SSH)"
+          echo "   - {{ ssh_port_start }}-{{ ssh_port_end }}/tcp  (Pod SSH range)"
+          {% if enable_http | default(true) %}
+          echo "   - {{ http_port }}/tcp      (HTTP API)"
+          {% endif %}
+          {% if static_ip_enabled | default(false) %}
+          echo "   - 51820/udp      (WireGuard VPN)"
+          {% endif %}
+          echo ""
+          {% if static_ip_enabled | default(false) %}
+          echo "=========================================="
+          echo "🌐 Static IP Configuration"
+          echo "=========================================="
+          echo "   - Static IP enabled: YES"
+          echo "   - Static IP: {{ static_ip }}"
+          echo "   - Public IP: {{ public_ip }}"
+          echo "   - SSH Port Range: {{ ssh_port_start }}-{{ ssh_port_end }}"
+          echo "   - Interface: wg0"
+          echo "   - Config: /etc/wireguard/wg0.conf"
+          echo "   - Status: sudo wg show"
+          echo "   - Restart: sudo systemctl restart wg-quick@wg0"
+          echo ""
+          echo "=========================================="
+          echo "🔐 SSH Access"
+          echo "=========================================="
+          echo "   Machine SSH (LOCAL NETWORK):"
+          echo "      ssh {{ paygress_user }}@{{ ansible_host }} -p {{ machine_ssh_port }}"
+          echo ""
+          echo "   Machine SSH (PUBLIC - requires port forwarding):"
+          echo "      ssh {{ paygress_user }}@{{ public_ip }} -p {{ machine_ssh_port }}"
+          echo "      ⚠️  You need to configure port forwarding on your router:"
+          echo "         {{ public_ip }}:{{ machine_ssh_port }} → {{ ansible_host }}:{{ machine_ssh_port }}"
+          echo ""
+          echo "   Pod SSH (via static IP):"
+          echo "      ssh user@{{ static_ip }} -p <allocated-port>"
+          echo "      Port range: {{ ssh_port_start }}-{{ ssh_port_end }}"
+          {% else %}
+          echo "=========================================="
+          echo "🔐 SSH Access"
+          echo "=========================================="
+          echo "   Machine SSH (LOCAL NETWORK):"
+          echo "      ssh {{ paygress_user }}@{{ ansible_host }} -p {{ machine_ssh_port }}"
+          echo ""
+          echo "   Machine SSH (PUBLIC - requires port forwarding):"
+          echo "      ssh {{ paygress_user }}@{{ public_ip }} -p {{ machine_ssh_port }}"
+          echo "      ⚠️  You need to configure port forwarding on your router:"
+          echo "         {{ public_ip }}:{{ machine_ssh_port }} → {{ ansible_host }}:{{ machine_ssh_port }}"
+          echo ""
+          echo "   Pod SSH (via public IP - requires port forwarding):"
+          echo "      ssh user@{{ public_ip }} -p <allocated-port>"
+          echo "      Port range: {{ ssh_port_start }}-{{ ssh_port_end }}"
+          echo "      ⚠️  Forward ports {{ ssh_port_start }}-{{ ssh_port_end }} to {{ ansible_host }}"
+          {% endif %}
+          echo ""
+          echo "📁 Files:"
+          echo "   - Paygress directory: {{ paygress_dir }}"
+          echo "   - Main config:        {{ paygress_dir }}/.env"
+          echo "   - Context VM config:  {{ paygress_dir }}/.env.contextvm"
+          echo "   - Pod specs:          {{ paygress_dir }}/pod-specs.json"
+          {% if static_ip_enabled | default(false) %}
+          echo "   - Static IP config:   /etc/wireguard/wg0.conf"
+          echo "   - Extracted values:   /etc/paygress/ (static_ip, public_ip, ssh_port_start, ssh_port_end)"
+          {% endif %}
+          echo ""
         dest: "/home/{{ paygress_user }}/setup-complete.sh"
         mode: '0755'
         owner: "{{ paygress_user }}"
@@ -551,6 +1219,63 @@
         global: yes
       ignore_errors: yes
 
+    - name: Create MCP-specific startup script
+      copy:
+        dest: "{{ paygress_dir }}/start-paygress-mcp.sh"
+        content: |
+          #!/bin/bash
+          # Start script for Paygress MCP-only Service (for Context VM)
+          
+          # Get the directory where this script is located
+          BASEDIR=$(dirname "$0")
+          
+          # Change to the script directory
+          cd "$BASEDIR"
+          
+          # Load environment variables from .env.contextvm file
+          if [ -f ".env.contextvm" ]; then
+              echo "📋 Loading MCP-only environment variables..."
+              set -a  # automatically export all variables
+              source .env.contextvm
+              set +a
+              echo "✅ Environment variables loaded"
+          else
+              echo "❌ Error: .env.contextvm file not found"
+              exit 1
+          fi
+          
+          # Set default logging level if not set
+          export RUST_LOG="${RUST_LOG:-info}"
+          
+          # Create necessary directories
+          mkdir -p data
+          mkdir -p "$(dirname "${CASHU_DB_PATH:-./cashu.db}")"
+          
+          # Check if binary exists (prefer release build)
+          if [ -f "./target/release/paygress" ]; then
+              BINARY_PATH="./target/release/paygress"
+          elif [ -f "./target/debug/paygress" ]; then
+              BINARY_PATH="./target/debug/paygress"
+          else
+              echo "❌ Error: Binary not found"
+              exit 1
+          fi
+          
+          # Display configuration
+          echo "🤖 Starting Paygress MCP-only Service (for Context VM)"
+          echo "===================================="
+          echo "Interfaces enabled:"
+          echo "  - MCP:   true (stdio)"
+          echo "  - Nostr: false"
+          echo "  - HTTP:  false"
+          echo ""
+          
+          # Run the MCP-only service
+          exec "$BINARY_PATH" "$@"
+        owner: "{{ paygress_user }}"
+        group: "{{ paygress_user }}"
+        mode: '0755'
+
     - name: Create Context VM startup script
       copy:
         dest: "/home/{{ paygress_user }}/start-contextvm.sh"
@@ -564,11 +1289,11 @@
               npm install -g @contextvm/gateway-cli
           fi
           
-          # Start Context VM with Paygress
+          # Start Context VM with Paygress MCP-only mode
           gateway-cli \
-            --private-key "5747e39e96339baf8484d9a503286c302aff8ee88c796812839e2dccf9b75dfe" \
+            --private-key "{{ contextvm_private_key | default('5747e39e96339baf8484d9a503286c302aff8ee88c796812839e2dccf9b75dfe') }}" \
             --relays "wss://relay.contextvm.org" \
-            --server ./start-paygress.sh
+            --server ./start-paygress-mcp.sh
         owner: "{{ paygress_user }}"
         group: "{{ paygress_user }}"
         mode: '0755'
@@ -578,9 +1303,11 @@
         dest: /etc/systemd/system/contextvm.service
         content: |
           [Unit]
-          Description=Context VM Gateway for Paygress
-          After=paygress.service
-          Wants=paygress.service
+          Description=Context VM Gateway for Paygress (MCP-only)
+          After=network.target docker.service
+          Requires=docker.service
+          # Note: This service runs independently of paygress.service
+          # It spawns its own paygress instance with MCP-only enabled
 
           [Service]
           Type=simple
@@ -590,6 +1317,7 @@
           Restart=always
           RestartSec=10
           Environment=NODE_ENV=production
+          Environment=PATH=/home/{{ paygress_user }}/.cargo/bin:/usr/local/bin:/usr/bin:/bin
 
           [Install]
           WantedBy=multi-user.target
@@ -628,24 +1356,31 @@
         name: kubelet
         state: restarted
 
+    - name: restart sshd
+      systemd:
+        name: sshd
+        state: restarted
+
     # ===============================
     # Final Kubernetes Health Check
     # ===============================
     - name: Final check - Ensure Kubernetes is running
-      shell: kubectl cluster-info --request-timeout=10s
+      shell: "{{ kubectl_path }} cluster-info --request-timeout=10s"
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
       register: final_k8s_check
       ignore_errors: yes
-      become_user: "{{ paygress_user }}"
 
     - name: Show Kubernetes status
       debug:
         msg: "Kubernetes cluster status: {{ final_k8s_check.stdout if final_k8s_check.rc == 0 else 'NOT RUNNING' }}"
 
     - name: Show Kubernetes nodes
-      shell: kubectl get nodes
+      shell: "{{ kubectl_path }} get nodes"
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
       register: k8s_nodes
       ignore_errors: yes
-      become_user: "{{ paygress_user }}"
 
     - name: Display Kubernetes nodes
       debug:

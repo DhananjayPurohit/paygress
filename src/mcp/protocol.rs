@@ -19,9 +19,14 @@ pub fn handle_initialize(request: &Value) -> Value {
                 "tools": {}
             },
             "serverInfo": {
-                "name": "paygress-mcp-server",
+                "name": "Paygress",
                 "version": "0.1.0"
-            }
+            },
+            "instructions": "Paygress - Lightning-powered VM provisioning service with complete pay-as-you-go model using Cashu payments",
+            "tags": [
+                ["name", "Paygress"], // Optional: Human-readable server name
+                ["about", "Lightning-powered VM provisioning service with complete pay-as-you-go model using Cashu payments"], // Optional: Server description
+            ]
         }
     })
 }
