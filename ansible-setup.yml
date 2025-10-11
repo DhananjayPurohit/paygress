@@ -1345,14 +1345,6 @@
         regexp: 'HTTP_BIND_ADDR=.*'
         replace: 'HTTP_BIND_ADDR=127.0.0.1:8080'
 
-    - name: Enable HTTP L402 mode
-      become_user: "{{ paygress_user }}"
-      lineinfile:
-        path: "{{ paygress_dir }}/.env"
-        regexp: '^HTTP_L402_MODE=.*'
-        line: 'HTTP_L402_MODE={{ http_l402_mode | default("true") }}'
-        create: yes
-
     # ===============================
     # Build and Deploy Paygress
     # ===============================

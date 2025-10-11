@@ -1,12 +1,11 @@
 // Unified Paygress Service Interfaces
 //
-// This module contains the interface implementations (MCP, HTTP).
+// This module contains the interface implementations (MCP, HTTP with L402).
 // 
 // MCP interface calls HTTP endpoints (with L402 paywall support).
-// HTTP interface provides the actual paywalled endpoints.
+// HTTP interface always uses L402 payment validation via ngx_l402.
 
 pub mod mcp;
-pub mod http;
 pub mod http_l402;
 
 use anyhow::Result;
@@ -28,24 +27,11 @@ pub async fn run_all_interfaces(service: Arc<PodProvisioningService>) -> Result<
     }
 
     if is_interface_enabled("HTTP") {
-        // Check if L402 mode is enabled
-        let use_l402 = std::env::var("HTTP_L402_MODE")
-            .unwrap_or_else(|_| "false".to_string())
-            .to_lowercase() == "true";
-        
-        if use_l402 {
-            info!("Starting HTTP interface with L402 support...");
-            let http_service = Arc::clone(&service);
-            tasks.push(tokio::spawn(async move {
-                http_l402::run_http_l402_interface(http_service).await
-            }));
-        } else {
-            info!("Starting HTTP interface...");
-            let http_service = Arc::clone(&service);
-            tasks.push(tokio::spawn(async move {
-                http::run_http_interface(http_service).await
-            }));
-        }
+        info!("Starting HTTP interface with L402 support...");
+        let http_service = Arc::clone(&service);
+        tasks.push(tokio::spawn(async move {
+            http_l402::run_http_l402_interface(http_service).await
+        }));
     }
 
     if tasks.is_empty() {
@@ -85,9 +71,6 @@ pub fn get_interface_config() -> InterfaceConfig {
     InterfaceConfig {
         mcp_enabled: is_interface_enabled("MCP"),
         http_enabled: is_interface_enabled("HTTP"),
-        http_l402_enabled: std::env::var("HTTP_L402_MODE")
-            .unwrap_or_else(|_| "false".to_string())
-            .to_lowercase() == "true",
         http_port: std::env::var("HTTP_PORT")
             .unwrap_or_else(|_| "8080".to_string())
             .parse()
@@ -101,7 +84,6 @@ pub fn get_interface_config() -> InterfaceConfig {
 pub struct InterfaceConfig {
     pub mcp_enabled: bool,
     pub http_enabled: bool,
-    pub http_l402_enabled: bool,
     pub http_port: u16,
     pub http_bind_addr: String,
 }
