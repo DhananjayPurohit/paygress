@@ -1088,8 +1088,8 @@
               location /pods/spawn {
                   # L402 Cashu payment enforcement
                   l402 on;
-                  l402_amount_msat_default 100000;  # 100 sats minimum
-                  l402_macaroon_timeout 3600;
+                  l402_amount_msat_default 6000;  # 6 sats minimum
+                  l402_macaroon_timeout 0;
                   
                   # Pass request to backend
                   proxy_pass http://paygress_backend;
@@ -1102,7 +1102,7 @@
               location /pods/topup {
                   # L402 Cashu payment enforcement
                   l402 on;
-                  l402_amount_msat_default 100000;  # 100 sats minimum
+                  l402_amount_msat_default 6000;  # 100 sats minimum
                   l402_macaroon_timeout 3600;
                   
                   # Pass request to backend
@@ -1279,6 +1279,14 @@
         path: "{{ paygress_dir }}/.env"
         regexp: 'SSH_PORT_RANGE_END=.*'
         replace: 'SSH_PORT_RANGE_END={{ ssh_port_end }}'
+
+    - name: Update minimum pod duration configuration
+      become_user: "{{ paygress_user }}"
+      lineinfile:
+        path: "{{ paygress_dir }}/.env"
+        regexp: '^MINIMUM_POD_DURATION_SECONDS=.*'
+        line: 'MINIMUM_POD_DURATION_SECONDS={{ minimum_pod_duration_seconds }}'
+        create: yes
 
 
     # ===============================

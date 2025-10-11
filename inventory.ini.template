@@ -40,6 +40,9 @@ http_port=11000
 http_backend_port=8080
 http_bind_addr=127.0.0.1:8080
 
+# Pod Configuration
+minimum_pod_duration_seconds=60
+
 # Static IP Configuration (Optional)
 static_ip_enabled=false
 static_ip_config_url=https://your-vpn-provider.com

@@ -123,13 +123,8 @@ async fn get_offers(State(service): State<Arc<PodProvisioningService>>) -> Resul
                 "whitelisted_mints": response.whitelisted_mints,
                 "pod_specs": response.pod_specs,
                 "payment_info": {
-                    "method": "L402",
                     "accepted_tokens": ["cashu"],
-                    "header_format": "Authorization: L402 token=<cashu_token> amount=<msats>",
-                    "alternative_headers": {
-                        "X-Payment-Token": "<cashu_token>",
-                        "X-Payment-Amount": "<msats>"
-                    }
+                    "header_format": "Authorization: Cashu <cashu_token>"
                 }
             });
             Ok(Json(offers_json))
