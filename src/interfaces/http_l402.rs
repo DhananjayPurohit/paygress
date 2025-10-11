@@ -4,17 +4,16 @@
 // 
 // Flow:
 // 1. Client makes request → nginx (with ngx_l402)
-// 2. ngx_l402 validates Cashu payment
-// 3. ngx_l402 forwards request with headers:
-//    - X-Cashu: Cashu <token>  OR  Authorization: L402 <token>
-// 4. This module extracts token from headers
+// 2. ngx_l402 validates Cashu payment and returns 402 if invalid/missing
+// 3. ngx_l402 forwards validated request with header:
+//    - Authorization: Cashu <token>
+// 4. This backend extracts token from header
 // 5. Decodes token to get payment amount in msats
 // 6. Calculates pod duration: amount ÷ tier_rate
 // 7. Creates pod for calculated duration
 //
-// Supported header formats from ngx_l402:
-// - X-Cashu: Cashu cashuAeyJ0b2tlbiI6...
-// - Authorization: L402 cashuAeyJ0b2tlbiI6...
+// Supported header format from ngx_l402:
+// - Authorization: Cashu cashuAeyJ0b2tlbiI6...
 
 use anyhow::Result;
 use std::sync::Arc;
@@ -39,37 +38,19 @@ pub struct L402Payment {
 
 /// Extract Cashu token and decode amount from request headers
 /// 
-/// Supports formats from ngx_l402:
-/// 1. X-Cashu: Cashu <token>
-/// 2. Authorization: L402 <token>
+/// Supports format from ngx_l402:
+/// - Authorization: Cashu <token>
 async fn extract_l402_payment(headers: &HeaderMap) -> Option<L402Payment> {
     use crate::sidecar_service::extract_token_value;
     
     let mut cashu_token: Option<String> = None;
     
-    // Try X-Cashu header: "Cashu <token>"
-    if let Some(cashu_header) = headers.get("x-cashu") {
-        if let Ok(cashu_str) = cashu_header.to_str() {
-            // Extract token after "Cashu " prefix
-            if cashu_str.starts_with("Cashu ") || cashu_str.starts_with("cashu ") {
-                cashu_token = Some(cashu_str[6..].to_string());
-                info!("Found Cashu token in X-Cashu header");
-            } else {
-                // Maybe it's just the token without prefix
-                cashu_token = Some(cashu_str.to_string());
-                info!("Found token in X-Cashu header (no prefix)");
-            }
-        }
-    }
-    
-    // Try Authorization header: "L402 <token>"
-    if cashu_token.is_none() {
-        if let Some(auth_header) = headers.get("authorization") {
-            if let Ok(auth_str) = auth_header.to_str() {
-                if auth_str.starts_with("L402 ") || auth_str.starts_with("l402 ") {
-                    cashu_token = Some(auth_str[5..].trim().to_string());
-                    info!("Found Cashu token in Authorization header");
-                }
+    // Try Authorization header: "Cashu <token>" (ngx_l402 format)
+    if let Some(auth_header) = headers.get("authorization") {
+        if let Ok(auth_str) = auth_header.to_str() {
+            if auth_str.starts_with("Cashu ") || auth_str.starts_with("cashu ") {
+                cashu_token = Some(auth_str[6..].trim().to_string());
+                info!("✅ Found Cashu token in Authorization header");
             }
         }
     }
@@ -78,14 +59,14 @@ async fn extract_l402_payment(headers: &HeaderMap) -> Option<L402Payment> {
     if let Some(token) = cashu_token {
         match extract_token_value(&token).await {
             Ok(amount_msats) => {
-                info!("Decoded Cashu token: {} msats", amount_msats);
+                info!("✅ Decoded Cashu token: {} msats", amount_msats);
                 return Some(L402Payment {
                     token,
                     amount_msats,
                 });
             }
             Err(e) => {
-                warn!("Failed to decode Cashu token: {}", e);
+                error!("❌ Failed to decode Cashu token: {}", e);
                 return None;
             }
         }
@@ -196,6 +177,9 @@ async fn get_pod_status(
 }
 
 /// Spawn a new pod with L402 payment support
+/// 
+/// Note: ngx_l402 validates payment before this endpoint is reached
+/// If this function is called, payment has already been verified by nginx
 async fn spawn_pod_l402(
     State(service): State<Arc<PodProvisioningService>>,
     headers: HeaderMap,
@@ -203,89 +187,26 @@ async fn spawn_pod_l402(
 ) -> Response {
     info!("📨 Received spawn pod request via HTTP+L402");
 
-    // Check if payment token is provided in request body
-    let has_token_in_body = !request.cashu_token.is_empty();
-
-    // Try to extract L402 payment from headers (ngx_l402 provides this)
+    // Extract payment from Authorization: Cashu <token> header
+    // ngx_l402 has already validated this payment
     if let Some(l402_payment) = extract_l402_payment(&headers).await {
-        info!("L402 payment detected: {} msats", l402_payment.amount_msats);
+        info!("✅ L402 payment validated by ngx_l402: {} msats", l402_payment.amount_msats);
         
-        // Override token from header if not in body
-        if !has_token_in_body {
-            request.cashu_token = l402_payment.token.clone();
-        }
-
-        // Validate payment amount matches selected tier (optional)
-        if let Some(pod_spec_id) = &request.pod_spec_id {
-            let pod_spec = service.get_config().pod_specs.iter()
-                .find(|s| &s.id == pod_spec_id);
-            
-            if let Some(spec) = pod_spec {
-                let minimum_for_tier = spec.rate_msats_per_sec 
-                    * service.get_config().minimum_pod_duration_seconds;
-                
-                if l402_payment.amount_msats < minimum_for_tier {
-                    warn!("Insufficient payment for tier {}: {} < {} msats", 
-                        spec.name, l402_payment.amount_msats, minimum_for_tier);
-                    
-                    return (
-                        StatusCode::PAYMENT_REQUIRED,
-                        [(
-                            "WWW-Authenticate",
-                            format!(
-                                "L402 realm=\"paygress\", accept=\"cashu\", \
-                                 minimum=\"{}\", tier=\"{}\", rate=\"{} msats/sec\"",
-                                minimum_for_tier, spec.name, spec.rate_msats_per_sec
-                            )
-                        )],
-                        Json(serde_json::json!({
-                            "error": "Insufficient payment",
-                            "tier": spec.name,
-                            "minimum_required_msats": minimum_for_tier,
-                            "payment_provided_msats": l402_payment.amount_msats,
-                            "rate_msats_per_sec": spec.rate_msats_per_sec
-                        }))
-                    ).into_response();
-                }
-            }
-        }
-    } else if !has_token_in_body {
-        // No payment provided at all - return 402 Payment Required
-        warn!("No payment provided (neither L402 header nor request body)");
-        
-        let config = service.get_config();
-        let basic_spec = config.pod_specs.first();
-        
-        let challenge = if let Some(spec) = basic_spec {
-            format!(
-                "L402 realm=\"paygress\", accept=\"cashu\", \
-                 minimum=\"{}\", rate=\"{} msats/sec\"",
-                spec.rate_msats_per_sec * config.minimum_pod_duration_seconds,
-                spec.rate_msats_per_sec
-            )
-        } else {
-            "L402 realm=\"paygress\", accept=\"cashu\"".to_string()
-        };
-
+        // Use token from header (ngx_l402 validated this)
+        request.cashu_token = l402_payment.token.clone();
+    } else {
+        // This shouldn't happen if ngx_l402 is configured correctly
+        error!("❌ No payment token found in headers - ngx_l402 should have blocked this request");
         return (
-            StatusCode::PAYMENT_REQUIRED,
-            [("WWW-Authenticate", challenge)],
+            StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
-                "error": "Payment Required",
-                "message": "Please provide payment via L402 Authorization header or cashu_token in request body",
-                "available_tiers": config.pod_specs.iter().map(|s| {
-                    serde_json::json!({
-                        "id": s.id,
-                        "name": s.name,
-                        "rate_msats_per_sec": s.rate_msats_per_sec,
-                        "minimum_payment_msats": s.rate_msats_per_sec * config.minimum_pod_duration_seconds
-                    })
-                }).collect::<Vec<_>>()
+                "error": "Payment token missing",
+                "message": "This endpoint requires payment via ngx_l402"
             }))
         ).into_response();
     }
 
-    // Process the spawn request (ngx_l402 already verified payment)
+    // Process the spawn request (payment already verified by ngx_l402)
     let spawn_tool = crate::pod_provisioning::SpawnPodTool {
         cashu_token: request.cashu_token,
         pod_spec_id: request.pod_spec_id,
@@ -297,6 +218,7 @@ async fn spawn_pod_l402(
 
     match service.spawn_pod(spawn_tool).await {
         Ok(response) => {
+            info!("✅ Pod spawned successfully: {}", response.pod_npub.as_deref().unwrap_or("unknown"));
             let response_json = serde_json::json!({
                 "success": response.success,
                 "message": response.message,
@@ -312,7 +234,7 @@ async fn spawn_pod_l402(
             (StatusCode::OK, Json(response_json)).into_response()
         }
         Err(e) => {
-            error!("Failed to spawn pod: {}", e);
+            error!("❌ Failed to spawn pod: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
@@ -325,6 +247,8 @@ async fn spawn_pod_l402(
 }
 
 /// Top up an existing pod with L402 payment support
+/// 
+/// Note: ngx_l402 validates payment before this endpoint is reached
 async fn topup_pod_l402(
     State(service): State<Arc<PodProvisioningService>>,
     headers: HeaderMap,
@@ -332,32 +256,26 @@ async fn topup_pod_l402(
 ) -> Response {
     info!("📨 Received topup pod request via HTTP+L402");
 
-    // Check if payment token is provided in request body
-    let has_token_in_body = !request.cashu_token.is_empty();
-
-    // Try to extract L402 payment from headers (ngx_l402 provides this)
+    // Extract payment from Authorization: Cashu <token> header
+    // ngx_l402 has already validated this payment
     if let Some(l402_payment) = extract_l402_payment(&headers).await {
-        info!("L402 payment detected for top-up: {} msats", l402_payment.amount_msats);
+        info!("✅ L402 payment validated by ngx_l402 for top-up: {} msats", l402_payment.amount_msats);
         
-        // Override token from header if not in body
-        if !has_token_in_body {
-            request.cashu_token = l402_payment.token;
-        }
-    } else if !has_token_in_body {
-        // No payment provided at all - return 402 Payment Required
-        warn!("No payment provided for top-up");
-        
+        // Use token from header (ngx_l402 validated this)
+        request.cashu_token = l402_payment.token;
+    } else {
+        // This shouldn't happen if ngx_l402 is configured correctly
+        error!("❌ No payment token found in headers - ngx_l402 should have blocked this request");
         return (
-            StatusCode::PAYMENT_REQUIRED,
-            [("WWW-Authenticate", "L402 realm=\"paygress\", accept=\"cashu\"")],
+            StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
-                "error": "Payment Required",
-                "message": "Please provide payment via L402 Authorization header or cashu_token in request body"
+                "error": "Payment token missing",
+                "message": "This endpoint requires payment via ngx_l402"
             }))
         ).into_response();
     }
 
-    // Process the topup request (ngx_l402 already verified payment)
+    // Process the topup request (payment already verified by ngx_l402)
     let topup_tool = crate::pod_provisioning::TopUpPodTool {
         pod_npub: request.pod_npub,
         cashu_token: request.cashu_token,
@@ -365,6 +283,7 @@ async fn topup_pod_l402(
 
     match service.topup_pod(topup_tool).await {
         Ok(response) => {
+            info!("✅ Pod topped up successfully: {}", response.pod_npub);
             let response_json = serde_json::json!({
                 "success": response.success,
                 "message": response.message,
@@ -375,7 +294,7 @@ async fn topup_pod_l402(
             (StatusCode::OK, Json(response_json)).into_response()
         }
         Err(e) => {
-            error!("Failed to topup pod: {}", e);
+            error!("❌ Failed to topup pod: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({

@@ -319,9 +319,9 @@
     - name: Allow Nginx HTTP port in firewall
       ufw:
         rule: allow
-        port: "80"
+        port: "{{ http_port }}"
         proto: tcp
-        comment: "Nginx reverse proxy with L402 paywall"
+        comment: "Nginx reverse proxy with L402 paywall on port {{ http_port }}"
 
     - name: Allow WireGuard port in firewall
       ufw:
@@ -821,68 +821,158 @@
       ignore_errors: yes
 
     # ===============================
-    # Install Nginx with L402 Module
+    # Install Nginx 1.28.0+ for ngx_l402 compatibility
     # ===============================
-    - name: Install nginx and build dependencies
+    - name: Gather installed packages
+      package_facts:
+        manager: apt
+      become: yes
+
+    - name: Set current nginx version fact
+      set_fact:
+        nginx_current_version: "{{ (ansible_facts.packages['nginx'][0].version) if ('nginx' in ansible_facts.packages) else '' }}"
+
+    - name: Remove old nginx installation
+      systemd:
+        name: nginx
+        state: stopped
+        enabled: no
+      become: yes
+      ignore_errors: yes
+
+    - name: Remove old nginx packages
       apt:
         name:
           - nginx
-          - libpcre3
-          - libpcre3-dev
-          - zlib1g
-          - zlib1g-dev
-          - libssl-dev
-          - build-essential
-          - git
-          - cmake
-          - libcurl4-openssl-dev
-        state: present
+          - nginx-common
+          - nginx-core
+        state: absent
+        purge: yes
+      become: yes
+      ignore_errors: yes
 
-    - name: Download ngx_l402 prebuilt module archive from release
+    - name: Install prerequisites for nginx repository
+      apt:
+        name:
+          - curl
+          - gnupg2
+          - ca-certificates
+          - lsb-release
+        state: present
+        update_cache: yes
+      become: yes
+
+    - name: Import nginx signing key
+      shell: curl -fsSL https://nginx.org/keys/nginx_signing.key | gpg --dearmor -o /usr/share/keyrings/nginx-archive-keyring.gpg
+      become: yes
+      args:
+        creates: /usr/share/keyrings/nginx-archive-keyring.gpg
+
+    - name: Add nginx repository
+      lineinfile:
+        path: /etc/apt/sources.list.d/nginx.list
+        line: "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] http://nginx.org/packages/ubuntu {{ ansible_distribution_release }} nginx"
+        create: yes
+        mode: '0644'
+      become: yes
+
+    - name: Pin nginx repository to version 1.28.0
+      copy:
+        content: |
+          Package: nginx
+          Pin: version 1.28.0*
+          Pin-Priority: 1001
+          
+          Package: *
+          Pin: origin nginx.org
+          Pin-Priority: 900
+        dest: /etc/apt/preferences.d/99nginx
+        mode: '0644'
+      become: yes
+
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+      become: yes
+
+    - name: Install nginx 1.28.0 from official repository
+      apt:
+        name: nginx=1.28.0-1~{{ ansible_distribution_release }}
+        state: present
+        allow_downgrade: yes
+      become: yes
+
+    - name: Check if nginx is installed
+      command: which nginx
+      register: nginx_installed_check
+      changed_when: false
+      become: yes
+      ignore_errors: yes
+
+    - name: Verify nginx version is 1.28.0
+      command: nginx -v
+      register: nginx_version_check
+      changed_when: false
+      become: yes
+      when: nginx_installed_check.rc == 0
+
+    - name: Display nginx version
+      debug:
+        msg: "Installed nginx version: {{ nginx_version_check.stderr }}"
+      when: nginx_installed_check.rc == 0
+
+    - name: Fail if nginx is not installed
+      fail:
+        msg: "nginx installation failed. Please check the installation logs."
+      when: nginx_installed_check.rc != 0
+
+    - name: Fail if nginx version is not 1.28.0
+      fail:
+        msg: "nginx version must be 1.28.0 for L402 module compatibility. Current version: {{ nginx_version_check.stderr }}"
+      when: nginx_installed_check.rc == 0 and not nginx_version_check.stderr is search('1\\.28\\.0')
+
+    - name: Download ngx_l402 pre-built module
       get_url:
         url: https://github.com/DhananjayPurohit/ngx_l402/releases/download/v1.1.1/ngx_l402-1.1.1.tar.gz
         dest: /tmp/ngx_l402-1.1.1.tar.gz
         mode: '0644'
+      become: yes
 
-    - name: Clean old extraction directory
-      file:
-        path: /tmp/ngx_l402-extract
-        state: absent
-
-    - name: Create extraction directory
-      file:
-        path: /tmp/ngx_l402-extract
-        state: directory
-
-    - name: Extract ngx_l402 module archive
+    - name: Extract ngx_l402 module
       unarchive:
         src: /tmp/ngx_l402-1.1.1.tar.gz
-        dest: /tmp/ngx_l402-extract/
+        dest: /tmp/
         remote_src: yes
+      become: yes
 
     - name: Create nginx modules directory
       file:
-        path: /usr/lib/nginx/modules
+        path: /etc/nginx/modules
         state: directory
         mode: '0755'
 
-    - name: Find and install ngx_l402 module
+    - name: Find and install prebuilt libngx_l402_lib.so
       shell: |
-        MODULE_FILE=$(find /tmp/ngx_l402-extract -name "ngx_http_l402_module.so" -o -name "*.so" | grep -v ".so." | head -1)
-        if [ -n "$MODULE_FILE" ]; then
-          cp "$MODULE_FILE" /usr/lib/nginx/modules/ngx_http_l402_module.so
-          chmod 755 /usr/lib/nginx/modules/ngx_http_l402_module.so
-          echo "Installed: $MODULE_FILE"
+        SO_FILE=$(find /tmp -name "libngx_l402_lib.so" 2>/dev/null | head -1)
+        if [ -n "$SO_FILE" ]; then
+          cp "$SO_FILE" /etc/nginx/modules/libngx_l402_lib.so
+          chmod 755 /etc/nginx/modules/libngx_l402_lib.so
+          echo "Installed: $SO_FILE"
         else
-          echo "ERROR: Module .so file not found in archive"
-          ls -la /tmp/ngx_l402-extract/
+          echo "ERROR: libngx_l402_lib.so not found in release"
           exit 1
         fi
 
-    - name: Load ngx_l402 module in nginx
+    - name: Remove any existing load_module lines for l402 (cleanup duplicates)
       lineinfile:
         path: /etc/nginx/nginx.conf
-        line: 'load_module /usr/lib/nginx/modules/ngx_http_l402_module.so;'
+        regexp: '^load_module.*l402.*'
+        state: absent
+
+    - name: Load ngx_l402 module as first line in nginx config
+      lineinfile:
+        path: /etc/nginx/nginx.conf
+        line: 'load_module /etc/nginx/modules/libngx_l402_lib.so;'
         insertbefore: BOF
         create: no
 
@@ -891,6 +981,11 @@
         path: /etc/systemd/system/nginx.service.d
         state: directory
         mode: '0755'
+
+    - name: Remove old L402 environment config
+      file:
+        path: /etc/systemd/system/nginx.service.d/l402-environment.conf
+        state: absent
 
     - name: Configure nginx L402 environment variables
       copy:
@@ -949,13 +1044,17 @@
         dest: /etc/systemd/system/nginx.service.d/l402-environment.conf
         mode: '0644'
 
-    - name: Create nginx L402 data directory
+    - name: Remove old paygress nginx config (sites-available)
       file:
-        path: /var/lib/nginx
-        state: directory
-        owner: www-data
-        group: www-data
-        mode: '0755'
+        path: /etc/nginx/sites-available/paygress-l402
+        state: absent
+      ignore_errors: yes
+
+    - name: Remove old paygress nginx config (conf.d)
+      file:
+        path: /etc/nginx/conf.d/paygress-l402.conf
+        state: absent
+      ignore_errors: yes
 
     - name: Create nginx reverse proxy configuration for Paygress
       copy:
@@ -966,7 +1065,7 @@
           }
 
           server {
-              listen 80;
+              listen {{ http_port }};
               server_name _;
 
               # Health check endpoint (no paywall)
@@ -989,34 +1088,28 @@
               location /pods/spawn {
                   # L402 Cashu payment enforcement
                   l402 on;
-                  l402_price 100;  # Minimum price in satoshis
-                  l402_memo "Spawn Kubernetes Pod";
-                  l402_invoice_expiry 3600;
+                  l402_amount_msat_default 100000;  # 100 sats minimum
+                  l402_macaroon_timeout 3600;
                   
-                  # Pass validated payment info to backend
+                  # Pass request to backend
                   proxy_pass http://paygress_backend;
                   proxy_set_header Host $host;
                   proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
                   proxy_set_header X-Real-IP $remote_addr;
-                  proxy_set_header X-L402-Payment-Amount $l402_payment_amount;
-                  proxy_set_header X-L402-Payment-Token $l402_payment_token;
               }
 
               # Paywalled endpoint: Topup Pod
               location /pods/topup {
                   # L402 Cashu payment enforcement
                   l402 on;
-                  l402_price 100;  # Minimum price in satoshis
-                  l402_memo "Topup Kubernetes Pod";
-                  l402_invoice_expiry 3600;
+                  l402_amount_msat_default 100000;  # 100 sats minimum
+                  l402_macaroon_timeout 3600;
                   
-                  # Pass validated payment info to backend
+                  # Pass request to backend
                   proxy_pass http://paygress_backend;
                   proxy_set_header Host $host;
                   proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
                   proxy_set_header X-Real-IP $remote_addr;
-                  proxy_set_header X-L402-Payment-Amount $l402_payment_amount;
-                  proxy_set_header X-L402-Payment-Token $l402_payment_token;
               }
 
               # Paywalled endpoint: Pod Status
@@ -1041,42 +1134,32 @@
                   proxy_set_header X-Real-IP $remote_addr;
               }
           }
-        dest: /etc/nginx/sites-available/paygress-l402
+        dest: /etc/nginx/conf.d/paygress-l402.conf
         mode: '0644'
 
-    - name: Enable Paygress nginx site
+    - name: Remove default nginx config (if exists)
       file:
-        src: /etc/nginx/sites-available/paygress-l402
-        dest: /etc/nginx/sites-enabled/paygress-l402
-        state: link
-
-    - name: Remove default nginx site
-      file:
-        path: /etc/nginx/sites-enabled/default
+        path: /etc/nginx/conf.d/default.conf
         state: absent
-
-    - name: Test nginx configuration
-      shell: nginx -t
-      register: nginx_test
       ignore_errors: yes
-      changed_when: false
+
+    - name: Create SQLite database directory for Cashu tokens
+      file:
+        path: /var/lib/nginx
+        state: directory
+        owner: www-data
+        group: www-data
+        mode: '0755'
 
     - name: Reload systemd daemon for nginx
       systemd:
         daemon_reload: yes
 
-    - name: Enable and start nginx
+    - name: Enable and restart nginx
       systemd:
         name: nginx
         enabled: yes
-        state: started
-      when: nginx_test.rc == 0
-
-    - name: Restart nginx if config changed
-      systemd:
-        name: nginx
         state: restarted
-      when: nginx_test.rc == 0
 
     # ===============================
     # Install Rust
@@ -1119,6 +1202,7 @@
         repo: https://github.com/DhananjayPurohit/paygress.git
         dest: "{{ paygress_dir }}"
         version: feat/nip04
+        force: yes
 
     - name: Create user-workloads namespace
       shell: |
@@ -1252,14 +1336,14 @@
       replace:
         path: "{{ paygress_dir }}/.env"
         regexp: 'HTTP_PORT=.*'
-        replace: 'HTTP_PORT={{ http_port }}'
+        replace: 'HTTP_PORT=8080'
 
     - name: Update HTTP bind address configuration
       become_user: "{{ paygress_user }}"
       replace:
         path: "{{ paygress_dir }}/.env"
         regexp: 'HTTP_BIND_ADDR=.*'
-        replace: 'HTTP_BIND_ADDR={{ http_bind_addr }}'
+        replace: 'HTTP_BIND_ADDR=127.0.0.1:8080'
 
     - name: Enable HTTP L402 mode
       become_user: "{{ paygress_user }}"
@@ -1352,11 +1436,11 @@
           echo "=========================================="
           echo "🌐 HTTP API Endpoints"
           echo "=========================================="
-          echo "   - Health check: http://{{ public_ip }}:8080/health"
-          echo "   - Get offers: http://{{ public_ip }}:8080/offers"
-          echo "   - Get pod status: POST http://{{ public_ip }}:8080/pods/status"
-          echo "   - Spawn pod: POST http://{{ public_ip }}:8080/pods/spawn"
-          echo "   - Topup pod: POST http://{{ public_ip }}:8080/pods/topup"
+          echo "   - Health check: http://{{ public_ip }}:{{ http_port }}/health"
+          echo "   - Get offers: http://{{ public_ip }}:{{ http_port }}/offers"
+          echo "   - Get pod status: POST http://{{ public_ip }}:{{ http_port }}/pods/status"
+          echo "   - Spawn pod: POST http://{{ public_ip }}:{{ http_port }}/pods/spawn"
+          echo "   - Topup pod: POST http://{{ public_ip }}:{{ http_port }}/pods/topup"
           echo ""
           echo "   ⚡ Nginx reverse proxy configured (L402 paywall ready)"
           echo "   📝 L402 environment: /etc/systemd/system/nginx.service.d/l402-environment.conf"

@@ -34,8 +34,11 @@ enable_mcp=true
 enable_http=true
 
 # HTTP Settings (Only required if enable_http=true)
-http_port=8080
-http_bind_addr=0.0.0.0:8080
+# Backend runs on port 8080 (internal, localhost only)
+# Nginx listens on http_port (external, public facing) and proxies to backend
+http_port=11000
+http_backend_port=8080
+http_bind_addr=127.0.0.1:8080
 
 # Static IP Configuration (Optional)
 static_ip_enabled=false
