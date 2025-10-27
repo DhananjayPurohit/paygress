@@ -68,6 +68,7 @@ fn init_tracing() -> Result<()> {
         .with_target(true)
         .with_thread_ids(true)
         .with_thread_names(true)
+        .with_writer(std::io::stderr)  // Force all logs to stderr
         .init();
 
     Ok(())

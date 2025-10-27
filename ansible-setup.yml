@@ -226,17 +226,17 @@
 
     - name: Save extracted configuration to files
       shell: |
-        echo "{{ extracted_static_ip | default('') }}" > /etc/paygress/static_ip
+        echo "{{ extracted_public_ip.stdout | default(public_ip) }}" > /etc/paygress/static_ip
         echo "{{ extracted_public_ip.stdout | default(public_ip) }}" > /etc/paygress/public_ip
         echo "{{ extracted_ssh_port_start | default(ssh_port_start) }}" > /etc/paygress/ssh_port_start
         echo "{{ extracted_ssh_port_end | default(ssh_port_end) }}" > /etc/paygress/ssh_port_end
         chmod 644 /etc/paygress/*
-      when: static_ip_enabled | default(false) and config_validation.stdout == "VALID" and extracted_static_ip is defined
+      when: static_ip_enabled | default(false) and config_validation.stdout == "VALID" and extracted_public_ip.stdout is defined
       ignore_errors: yes
 
     - name: Set facts from extracted configuration (enabled and valid)
       set_fact:
-        static_ip: "{{ extracted_static_ip | default(public_ip) }}"
+        static_ip: "{{ extracted_public_ip.stdout | default(public_ip) }}"
         public_ip: "{{ extracted_public_ip.stdout | default(public_ip) }}"
         ssh_port_start: "{{ extracted_ssh_port_start | default(ssh_port_start) }}"
         ssh_port_end: "{{ extracted_ssh_port_end | default(ssh_port_end) }}"
@@ -364,6 +364,10 @@
       register: current_ssh_port
       changed_when: false
 
+    - name: Set default SSH port if empty
+      set_fact:
+        current_ssh_port_fixed: "{{ current_ssh_port.stdout if current_ssh_port.stdout else '22' }}"
+
     - name: Display current and new SSH ports
       debug:
         msg: "Current SSH port: {{ current_ssh_port.stdout }}, New SSH port: {{ machine_ssh_port }}"
@@ -378,9 +382,9 @@
       blockinfile:
         path: /etc/ssh/sshd_config
         marker: "# {mark} ANSIBLE MANAGED SSH PORTS"
-        insertafter: "^#Port"
+        insertbefore: EOF
         block: |
-          Port {{ current_ssh_port.stdout }}
+          Port {{ current_ssh_port_fixed }}
           Port {{ machine_ssh_port }}
       register: ssh_dual_ports_configured
 
@@ -415,16 +419,16 @@
         remote_src: yes
       when: ssh_config_test.rc != 0
 
-    - name: Reload SSH service (graceful - doesn't drop connections)
+    - name: Restart SSH service to apply new ports
       systemd:
-        name: sshd
-        state: reloaded
-      when: ssh_dual_ports_configured.changed and ssh_config_test.rc == 0
+        name: ssh
+        state: restarted
+      when: ssh_dual_ports_configured.changed
       ignore_errors: yes
 
     - name: Ensure SSH is enabled and running
       systemd:
-        name: sshd
+        name: ssh
         enabled: yes
         state: started
 
@@ -1453,7 +1457,20 @@
           echo "   - MCP server calls HTTP endpoints internally"
           echo "   - Supports L402 paywalled endpoints"
           echo "   - Available tools: spawn_pod, topup_pod, get_offers, get_pod_status"
-          echo "   - Use with Context VM / gateway-cli"
+          echo "   - HTTP Base URL: http://localhost:8080"
+          echo ""
+          echo "=========================================="
+          echo "🌐 Context VM Gateway Service"
+          echo "=========================================="
+          echo "   - Service: contextvm.service"
+          echo "   - Status: sudo systemctl status contextvm"
+          echo "   - Logs:   sudo journalctl -u contextvm -f"
+          echo "   - Relays: wss://relay.contextvm.org"
+          echo "   - Enables: Paygress MCP server via Nostr relay"
+          echo "   - Installation: gateway-cli installed via GitHub install script"
+          echo "   - Start:  sudo systemctl start contextvm"
+          echo "   - Troubleshoot: If service fails, check logs above or reinstall:"
+          echo "     curl -fsSL https://raw.githubusercontent.com/contextvm/gateway-cli/main/install.sh | bash"
           echo ""
           echo "=========================================="
           echo "🔧 Management Commands"
@@ -1548,11 +1565,36 @@
           - npm
         state: present
 
-    - name: Install gateway-cli globally
-      npm:
-        name: "@contextvm/gateway-cli"
-        global: yes
+    - name: Verify Node.js installation
+      command: node --version
+      register: node_version
       ignore_errors: yes
+      
+    - name: Display Node.js version
+      debug:
+        msg: "Node.js version: {{ node_version.stdout }}"
+    
+    - name: Install gateway-cli using GitHub install script
+      become_user: "{{ paygress_user }}"
+      shell: |
+        set -e
+        export PATH="$HOME/.local/bin:$PATH"
+        
+        # Download and run the official install script
+        if [ ! -f "$HOME/.local/bin/gateway-cli" ]; then
+          echo "Installing gateway-cli..."
+          curl -fsSL https://raw.githubusercontent.com/contextvm/gateway-cli/main/install.sh | bash
+          export PATH="$HOME/.local/bin:$PATH"
+        else
+          echo "gateway-cli already installed"
+        fi
+        
+        # Verify installation
+        gateway-cli --version || echo "Installation verification skipped"
+      args:
+        executable: /bin/bash
+      ignore_errors: yes
+      timeout: 60
 
     - name: Create MCP-specific startup script
       copy:
@@ -1625,11 +1667,18 @@
           #!/bin/bash
           cd /home/{{ paygress_user }}/paygress
           
-          # Check if gateway-cli is available
+          # Add .local/bin to PATH for gateway-cli
+          export PATH="$HOME/.local/bin:$PATH"
+          
+          # Check if gateway-cli is installed
           if ! command -v gateway-cli &> /dev/null; then
-              echo "Installing gateway-cli..."
-              npm install -g @contextvm/gateway-cli
+              echo "❌ Error: gateway-cli not found"
+              echo "   Please run: curl -fsSL https://raw.githubusercontent.com/contextvm/gateway-cli/main/install.sh | bash"
+              echo "   Or check installation: ls -la $HOME/.local/bin/"
+              exit 1
           fi
+          
+          echo "✅ Using gateway-cli: $(which gateway-cli)"
           
           # Start Context VM with Paygress MCP-only mode
           gateway-cli \
@@ -1659,7 +1708,7 @@
           Restart=always
           RestartSec=10
           Environment=NODE_ENV=production
-          Environment=PATH=/home/{{ paygress_user }}/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+          Environment=PATH=/home/{{ paygress_user }}/.local/bin:/home/{{ paygress_user }}/.cargo/bin:/usr/local/bin:/usr/bin:/bin
 
           [Install]
           WantedBy=multi-user.target
@@ -1668,11 +1717,31 @@
       systemd:
         daemon_reload: yes
 
-    - name: Enable and start Context VM service
+    - name: Enable Context VM service
       systemd:
         name: contextvm
         enabled: yes
         state: started
+        
+    - name: Wait for Context VM service to initialize
+      pause:
+        seconds: 5
+        
+    - name: Check Context VM service status
+      shell: systemctl is-active contextvm || echo "inactive"
+      register: contextvm_status_check
+      ignore_errors: yes
+      
+    - name: Display Context VM installation status
+      debug:
+        msg: |
+          Context VM service status: {{ contextvm_status_check.stdout }}
+          
+          If status is 'inactive' or 'failed':
+          1. Check logs: sudo journalctl -u contextvm -f
+          2. The service uses npx to run @contextvm/gateway-cli
+          3. First run may take time to download the package
+          4. You can manually start: sudo systemctl start contextvm
 
     - name: Show Context VM service status
       shell: systemctl status contextvm --no-pager || true
@@ -1700,7 +1769,7 @@
 
     - name: restart sshd
       systemd:
-        name: sshd
+        name: ssh
         state: restarted
 
     # ===============================
