@@ -1329,6 +1329,12 @@
         regexp: 'SSH_HOST=.*'
         replace: 'SSH_HOST={{ public_ip }}'
 
+    - name: Fix Windows line endings in .env.contextvm
+      become_user: "{{ paygress_user }}"
+      shell: |
+        dos2unix {{ paygress_dir }}/.env.contextvm 2>/dev/null || sed -i 's/\r$//' {{ paygress_dir }}/.env.contextvm
+      ignore_errors: yes
+
     - name: Update interface configuration - MCP
       become_user: "{{ paygress_user }}"
       replace:

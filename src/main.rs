@@ -108,8 +108,8 @@ fn get_sidecar_config() -> crate::sidecar_service::SidecarConfig {
             let mints_str = match std::env::var("WHITELISTED_MINTS") {
                 Ok(mints) => mints,
                 Err(_) => {
-                    eprintln!("❌ Error: WHITELISTED_MINTS environment variable is required");
-                    eprintln!("   Please set WHITELISTED_MINTS with comma-separated mint URLs");
+                    tracing::error!("❌ Error: WHITELISTED_MINTS environment variable is required");
+                    tracing::error!("   Please set WHITELISTED_MINTS with comma-separated mint URLs");
                     std::process::exit(1);
                 }
             };
@@ -136,29 +136,29 @@ fn get_pod_specs_from_env() -> Vec<crate::nostr::PodSpec> {
             match serde_json::from_str::<Vec<crate::nostr::PodSpec>>(&specs_json) {
                 Ok(specs) => {
                     if !specs.is_empty() {
-                        println!("✅ Loaded {} pod specifications from {}", specs.len(), specs_file);
+                        tracing::info!("✅ Loaded {} pod specifications from {}", specs.len(), specs_file);
                         return specs;
                     } else {
-                        eprintln!("❌ Error: Pod specifications file '{}' contains empty array", specs_file);
+                        tracing::error!("❌ Error: Pod specifications file '{}' contains empty array", specs_file);
                     }
                 }
                 Err(e) => {
-                    eprintln!("❌ Error: Failed to parse pod specifications from '{}': {}", specs_file, e);
-                    eprintln!("   Please ensure the JSON file contains valid pod specifications");
+                    tracing::error!("❌ Error: Failed to parse pod specifications from '{}': {}", specs_file, e);
+                    tracing::error!("   Please ensure the JSON file contains valid pod specifications");
                 }
             }
         }
         Err(e) => {
-            eprintln!("❌ Error: Failed to read pod specifications file '{}': {}", specs_file, e);
-            eprintln!("   Please ensure the file exists and is readable");
-            eprintln!("   You can set POD_SPECS_FILE environment variable to specify a different file path");
+            tracing::error!("❌ Error: Failed to read pod specifications file '{}': {}", specs_file, e);
+            tracing::error!("   Please ensure the file exists and is readable");
+            tracing::error!("   You can set POD_SPECS_FILE environment variable to specify a different file path");
         }
     }
     
-    eprintln!("❌ Error: No valid pod specifications found");
-    eprintln!("   Expected file: {}", specs_file);
-    eprintln!("   Example pod-specs.json content:");
-    eprintln!(r#"   [
+    tracing::error!("❌ Error: No valid pod specifications found");
+    tracing::error!("   Expected file: {}", specs_file);
+    tracing::error!("   Example pod-specs.json content:");
+    tracing::error!(r#"   [
      {{
        "id": "basic",
        "name": "Basic",
