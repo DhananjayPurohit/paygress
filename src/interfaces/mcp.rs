@@ -11,7 +11,7 @@ use crate::mcp::MCPServer;
 
 /// Run the MCP interface (calling HTTP endpoints)
 pub async fn run_mcp_interface() -> Result<()> {
-    info!("🤖 Starting MCP interface (HTTP client mode)...");
+    info!("🤖 Starting MCP interface (HTTP client mode)");
 
     // Get HTTP endpoint configuration
     let http_base_url = std::env::var("HTTP_BASE_URL")
@@ -31,10 +31,11 @@ pub async fn run_mcp_interface() -> Result<()> {
     // Create and run the MCP server
     let mcp_server = MCPServer::new(http_base_url, l402_token);
     
+    // MCP server ready - all logs go to stderr, stdio is clean for JSON-RPC
     info!("✅ MCP interface ready - listening on stdio transport");
     info!("   All tool calls will be proxied to HTTP endpoints");
     
-    // Run the MCP server (this blocks forever)
+    // Run the MCP server (this blocks forever and takes over stdio)
     if let Err(e) = mcp_server.run().await {
         error!("❌ MCP interface error: {}", e);
         return Err(e);

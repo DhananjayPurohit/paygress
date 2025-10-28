@@ -24,9 +24,10 @@ async fn main() -> Result<()> {
     // Load environment variables from .env file
     dotenv::dotenv().ok();
     
-    // Initialize tracing
+    // Initialize tracing (all logs go to stderr automatically)
     init_tracing()?;
 
+    // Startup logs (emojis are fine - they go to stderr, not stdout)
     tracing::info!("🚀 Starting Paygress Service");
     tracing::info!("   Architecture: MCP → HTTP (L402 Paywall)");
 
@@ -40,7 +41,7 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    tracing::info!("✅ Loaded {} pod specifications", config.pod_specs.len());
+    tracing::info!("✅ Loaded {} pod specification(s)", config.pod_specs.len());
     for spec in &config.pod_specs {
         tracing::info!("  - {}: {} msats/sec ({} CPU, {} MB)", 
                       spec.name, spec.rate_msats_per_sec, spec.cpu_millicores, spec.memory_mb);
@@ -136,7 +137,7 @@ fn get_pod_specs_from_env() -> Vec<crate::nostr::PodSpec> {
             match serde_json::from_str::<Vec<crate::nostr::PodSpec>>(&specs_json) {
                 Ok(specs) => {
                     if !specs.is_empty() {
-                        tracing::info!("✅ Loaded {} pod specifications from {}", specs.len(), specs_file);
+                        tracing::info!("✅ Loaded {} pod specification(s) from {}", specs.len(), specs_file);
                         return specs;
                     } else {
                         tracing::error!("❌ Error: Pod specifications file '{}' contains empty array", specs_file);

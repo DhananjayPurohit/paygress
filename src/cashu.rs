@@ -15,13 +15,13 @@ pub async fn initialize_cashu(db_path: &str) -> Result<(), String> {
     // Initialize database for compatibility
     match cdk_redb::wallet::WalletRedbDatabase::new(Path::new(db_path)) {
         Ok(db) => {
-            println!("Cashu database initialized successfully");
+            tracing::debug!("Cashu database initialized at: {}", db_path);
             let _ = CASHU_DB.set(Arc::new(db));
             Ok(())
         },
         Err(e) => {
             let error = format!("Failed to create Cashu database: {:?}", e);
-            println!("{}", error);
+            tracing::error!("{}", error);
             Err(error)
         }
     }

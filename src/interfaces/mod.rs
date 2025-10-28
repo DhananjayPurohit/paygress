@@ -20,14 +20,13 @@ pub async fn run_all_interfaces(service: Arc<PodProvisioningService>) -> Result<
 
     // Check which interfaces are enabled via environment variables
     if is_interface_enabled("MCP") {
-        info!("Starting MCP interface (HTTP client mode)...");
         tasks.push(tokio::spawn(async move {
             mcp::run_mcp_interface().await
         }));
     }
 
     if is_interface_enabled("HTTP") {
-        info!("Starting HTTP interface with L402 support...");
+        info!("🌐 Starting HTTP interface with L402 support");
         let http_service = Arc::clone(&service);
         tasks.push(tokio::spawn(async move {
             http_l402::run_http_l402_interface(http_service).await
@@ -35,23 +34,23 @@ pub async fn run_all_interfaces(service: Arc<PodProvisioningService>) -> Result<
     }
 
     if tasks.is_empty() {
-        error!("No interfaces enabled! Set ENABLE_MCP or ENABLE_HTTP environment variables.");
+        error!("❌ No interfaces enabled! Set ENABLE_MCP or ENABLE_HTTP environment variables");
         return Err(anyhow::anyhow!("No interfaces enabled"));
     }
 
-    info!("Running {} interface(s) concurrently", tasks.len());
-    info!("Architecture: MCP → HTTP (with L402 paywall)");
+    info!("✅ Running {} interface(s) concurrently", tasks.len());
+    info!("   Architecture: MCP → HTTP (with L402 paywall)");
 
     // Wait for all interfaces to complete (they should run forever)
     tokio::select! {
         result = async {
             for task in tasks {
                 if let Err(e) = task.await {
-                    error!("Interface task failed: {}", e);
+                    error!("❌ Interface task failed: {}", e);
                 }
             }
         } => {
-            info!("All interfaces stopped");
+            info!("🛑 All interfaces stopped");
         }
     }
 
