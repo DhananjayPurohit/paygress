@@ -416,26 +416,49 @@ pub async fn handle_tools_call_http(http_client: &PaywalledHttpClient, request: 
                         let ssh_password = response["ssh_password"].as_str().unwrap_or("N/A");
                         let expires_at = response["expires_at"].as_str().unwrap_or("N/A");
                         let pod_spec_name = response["pod_spec_name"].as_str().unwrap_or("N/A");
-                        let instructions = response["instructions"].as_str().unwrap_or("N/A");
+                        let cpu = response["cpu_millicores"].as_u64().unwrap_or(0);
+                        let memory = response["memory_mb"].as_u64().unwrap_or(0);
+                        let duration_secs = response["duration_seconds"].as_u64().unwrap_or(0);
+                        
+                        // Format duration
+                        let hours = duration_secs / 3600;
+                        let minutes = (duration_secs % 3600) / 60;
+                        let seconds = duration_secs % 60;
+                        let duration_str = if hours > 0 {
+                            format!("{}h {}m {}s", hours, minutes, seconds)
+                        } else if minutes > 0 {
+                            format!("{}m {}s", minutes, seconds)
+                        } else {
+                            format!("{}s", seconds)
+                        };
 
                         json!({
                             "content": [
                                 {
                                     "type": "text",
                                     "text": format!(
-                                        "✅ **Pod Spawned Successfully!**\n\n\
-                                        **Pod Details:**\n\
-                                        - **Pod ID (NPUB):** `{}`\n\
-                                        - **Spec:** {}\n\
-                                        - **Expires:** {}\n\n\
-                                        **SSH Access:**\n\
+                                        "🎉 **VM Spawned Successfully!**\n\n\
+                                        ╔══════════════════════════════════════════╗\n\
+                                        ║          🔐 SSH ACCESS DETAILS           ║\n\
+                                        ╚══════════════════════════════════════════╝\n\n\
+                                        **Connect Command:**\n\
                                         ```bash\n\
                                         ssh {}@{} -p {}\n\
-                                        Password: {}\n\
                                         ```\n\n\
-                                        {}",
-                                        pod_npub, pod_spec_name, expires_at,
-                                        ssh_username, ssh_host, ssh_port, ssh_password, instructions
+                                        **Password:** `{}`\n\n\
+                                        ───────────────────────────────────────────\n\n\
+                                        📋 **VM Details**\n\
+                                        • Pod ID: `{}`\n\
+                                        • Spec: {} ({} CPU, {} MB RAM)\n\
+                                        • Duration: {}\n\
+                                        • Expires: {}\n\n\
+                                        💡 **Quick Start:** Copy the command above and use the password when prompted.",
+                                        ssh_username, ssh_host, ssh_port,
+                                        ssh_password,
+                                        pod_npub,
+                                        pod_spec_name, cpu, memory,
+                                        duration_str,
+                                        expires_at
                                     )
                                 }
                             ],
@@ -447,7 +470,7 @@ pub async fn handle_tools_call_http(http_client: &PaywalledHttpClient, request: 
                             "content": [
                                 {
                                     "type": "text",
-                                    "text": format!("❌ Failed to spawn pod: {}", message)
+                                    "text": format!("❌ **Failed to Spawn VM**\n\n{}", message)
                                 }
                             ],
                             "isError": true
@@ -460,7 +483,14 @@ pub async fn handle_tools_call_http(http_client: &PaywalledHttpClient, request: 
                         "content": [
                             {
                                 "type": "text",
-                                "text": format!("❌ HTTP request failed: {}\n\nThis might be due to L402 payment requirement. Check logs for details.", e)
+                                "text": format!(
+                                    "❌ **Request Failed**\n\n{}\n\n\
+                                    💡 This might be due to:\n\
+                                    • Invalid or insufficient payment token\n\
+                                    • Network connectivity issues\n\
+                                    • Service temporarily unavailable",
+                                    e
+                                )
                             }
                         ],
                         "isError": true
@@ -477,16 +507,32 @@ pub async fn handle_tools_call_http(http_client: &PaywalledHttpClient, request: 
                     if response["success"].as_bool().unwrap_or(false) {
                         let extended_duration = response["extended_duration_seconds"].as_u64().unwrap_or(0);
                         let new_expires_at = response["new_expires_at"].as_str().unwrap_or("N/A");
+                        
+                        // Format duration
+                        let hours = extended_duration / 3600;
+                        let minutes = (extended_duration % 3600) / 60;
+                        let seconds = extended_duration % 60;
+                        let duration_str = if hours > 0 {
+                            format!("{}h {}m {}s", hours, minutes, seconds)
+                        } else if minutes > 0 {
+                            format!("{}m {}s", minutes, seconds)
+                        } else {
+                            format!("{}s", seconds)
+                        };
 
                         json!({
                             "content": [
                                 {
                                     "type": "text",
                                     "text": format!(
-                                        "✅ **Pod Topped Up Successfully!**\n\n\
-                                        - **Extended by:** {} seconds\n\
-                                        - **New expiration:** {}",
-                                        extended_duration, new_expires_at
+                                        "✅ **VM Extended Successfully!**\n\n\
+                                        ╔══════════════════════════════════════════╗\n\
+                                        ║         ⏰ TIME ADDED TO YOUR VM         ║\n\
+                                        ╚══════════════════════════════════════════╝\n\n\
+                                        ⏱️  **Added:** {}\n\
+                                        📅 **New Expiration:** {}\n\n\
+                                        💡 Your VM will now remain active until the new expiration time.",
+                                        duration_str, new_expires_at
                                     )
                                 }
                             ],
@@ -498,7 +544,7 @@ pub async fn handle_tools_call_http(http_client: &PaywalledHttpClient, request: 
                             "content": [
                                 {
                                     "type": "text",
-                                    "text": format!("❌ Failed to topup pod: {}", message)
+                                    "text": format!("❌ **Failed to Extend VM**\n\n{}", message)
                                 }
                             ],
                             "isError": true
@@ -511,7 +557,7 @@ pub async fn handle_tools_call_http(http_client: &PaywalledHttpClient, request: 
                         "content": [
                             {
                                 "type": "text",
-                                "text": format!("❌ HTTP request failed: {}", e)
+                                "text": format!("❌ **Request Failed**\n\n{}", e)
                             }
                         ],
                         "isError": true
@@ -524,24 +570,34 @@ pub async fn handle_tools_call_http(http_client: &PaywalledHttpClient, request: 
                 Ok(response) => {
                     let min_duration = response["minimum_duration_seconds"].as_u64().unwrap_or(0);
                     let whitelisted_mints = response["whitelisted_mints"].as_array()
-                        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", "))
-                        .unwrap_or_else(|| "None".to_string());
+                        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
+                        .unwrap_or_else(|| vec![]);
                     
                     let empty_vec = vec![];
                     let pod_specs = response["pod_specs"].as_array().unwrap_or(&empty_vec);
                     let mut specs_text = String::new();
                     
-                    for spec in pod_specs {
+                    for (i, spec) in pod_specs.iter().enumerate() {
+                        let id = spec["id"].as_str().unwrap_or("unknown");
                         let name = spec["name"].as_str().unwrap_or("Unknown");
                         let cpu = spec["cpu_millicores"].as_u64().unwrap_or(0);
                         let memory = spec["memory_mb"].as_u64().unwrap_or(0);
                         let rate = spec["rate_msats_per_sec"].as_u64().unwrap_or(0);
                         let description = spec["description"].as_str().unwrap_or("");
                         
+                        // Calculate example pricing
+                        let cost_1_min = rate * 60;
+                        let cost_1_hour = rate * 3600;
+                        
                         specs_text.push_str(&format!(
-                            "\n### {}\n{}\n- **CPU:** {} millicores\n- **Memory:** {} MB\n- **Rate:** {} msats/sec\n",
-                            name, description, cpu, memory, rate
+                            "\n{}. **{}** (`{}`)\n   {}\n   • {} CPU • {} MB RAM\n   • {} msats/sec ({}k msats/min, {}k msats/hour)\n",
+                            i + 1, name, id, description, cpu, memory, rate, cost_1_min/1000, cost_1_hour/1000
                         ));
+                    }
+                    
+                    let mut mints_text = String::new();
+                    for mint in whitelisted_mints {
+                        mints_text.push_str(&format!("   • {}\n", mint));
                     }
 
                     json!({
@@ -549,11 +605,17 @@ pub async fn handle_tools_call_http(http_client: &PaywalledHttpClient, request: 
                             {
                                 "type": "text",
                                 "text": format!(
-                                    "📦 **Available Pod Offerings**\n\n\
-                                    **Minimum Duration:** {} seconds\n\
-                                    **Whitelisted Mints:** {}\n\
-                                    {}", 
-                                    min_duration, whitelisted_mints, specs_text
+                                    "🛒 **Available VM Offerings**\n\n\
+                                    ╔══════════════════════════════════════════╗\n\
+                                    ║        💰 PAY-AS-YOU-GO PRICING          ║\n\
+                                    ╚══════════════════════════════════════════╝\n\
+                                    {}\n\
+                                    ⏱️  **Minimum Duration:** {} seconds\n\n\
+                                    ───────────────────────────────────────────\n\n\
+                                    🏦 **Accepted Mints:**\n\
+                                    {}\n\
+                                    💡 Use these VM specs when spawning a pod for optimal performance!", 
+                                    specs_text, min_duration, mints_text
                                 )
                             }
                         ],
@@ -566,7 +628,7 @@ pub async fn handle_tools_call_http(http_client: &PaywalledHttpClient, request: 
                         "content": [
                             {
                                 "type": "text",
-                                "text": format!("❌ HTTP request failed: {}", e)
+                                "text": format!("❌ **Request Failed**\n\n{}", e)
                             }
                         ],
                         "isError": true
@@ -587,20 +649,48 @@ pub async fn handle_tools_call_http(http_client: &PaywalledHttpClient, request: 
                         let pod_spec_name = response["pod_spec_name"].as_str().unwrap_or("N/A");
                         let cpu = response["cpu_millicores"].as_u64().unwrap_or(0);
                         let memory = response["memory_mb"].as_u64().unwrap_or(0);
+                        
+                        // Format time remaining
+                        let time_str = if time_remaining > 0 {
+                            let hours = time_remaining / 3600;
+                            let minutes = (time_remaining % 3600) / 60;
+                            let seconds = time_remaining % 60;
+                            if hours > 0 {
+                                format!("{}h {}m {}s", hours, minutes, seconds)
+                            } else if minutes > 0 {
+                                format!("{}m {}s", minutes, seconds)
+                            } else {
+                                format!("{}s", seconds)
+                            }
+                        } else {
+                            "Expired ⏰".to_string()
+                        };
+                        
+                        let status_icon = if time_remaining > 0 { "✅" } else { "⏰" };
 
                         json!({
                             "content": [
                                 {
                                     "type": "text",
                                     "text": format!(
-                                        "📊 **Pod Status**\n\n\
-                                        - **Pod NPUB:** `{}`\n\
-                                        - **Status:** {}\n\
-                                        - **Spec:** {}\n\
-                                        - **Resources:** {} millicores CPU, {} MB RAM\n\
-                                        - **Time Remaining:** {} seconds\n\
-                                        - **Expires At:** {}",
-                                        pod_npub, status, pod_spec_name, cpu, memory, time_remaining, expires_at
+                                        "📊 **VM Status**\n\n\
+                                        ╔══════════════════════════════════════════╗\n\
+                                        ║              {} {}{}              ║\n\
+                                        ╚══════════════════════════════════════════╝\n\n\
+                                        **VM Details:**\n\
+                                        • Pod ID: `{}`\n\
+                                        • Spec: {} ({} CPU, {} MB RAM)\n\n\
+                                        **⏰ Time Status:**\n\
+                                        • Remaining: {}\n\
+                                        • Expires: {}\n\n\
+                                        💡 Use `topup_pod` to extend the VM lifetime before it expires.",
+                                        status_icon, 
+                                        status.to_uppercase(),
+                                        " ".repeat(42_usize.saturating_sub(status.len() + 5)),
+                                        pod_npub, 
+                                        pod_spec_name, cpu, memory,
+                                        time_str,
+                                        expires_at
                                     )
                                 }
                             ],
@@ -611,7 +701,7 @@ pub async fn handle_tools_call_http(http_client: &PaywalledHttpClient, request: 
                             "content": [
                                 {
                                     "type": "text",
-                                    "text": "❌ Pod not found or expired"
+                                    "text": "❌ **VM Not Found**\n\nThe VM with this ID was not found. It may have expired or been deleted."
                                 }
                             ],
                             "isError": false
@@ -624,7 +714,7 @@ pub async fn handle_tools_call_http(http_client: &PaywalledHttpClient, request: 
                         "content": [
                             {
                                 "type": "text",
-                                "text": format!("❌ HTTP request failed: {}", e)
+                                "text": format!("❌ **Request Failed**\n\n{}", e)
                             }
                         ],
                         "isError": true
