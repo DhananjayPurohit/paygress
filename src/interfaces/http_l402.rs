@@ -182,21 +182,23 @@ async fn spawn_pod_l402(
 ) -> Response {
     info!("📨 Received spawn pod request via HTTP+L402");
 
-    // Extract payment from Authorization: Cashu <token> header
-    // ngx_l402 has already validated this payment
+    // Extract payment from Authorization: Cashu <token> header (from ngx_l402 or MCP client)
     if let Some(l402_payment) = extract_l402_payment(&headers).await {
-        info!("✅ L402 payment validated by ngx_l402: {} msats", l402_payment.amount_msats);
+        info!("✅ L402 payment from Authorization header: {} msats", l402_payment.amount_msats);
         
-        // Use token from header (ngx_l402 validated this)
+        // Use token from header (validated by ngx_l402 or provided by MCP client)
         request.cashu_token = l402_payment.token.clone();
+    } else if !request.cashu_token.is_empty() {
+        // Fallback: Accept token from request body (for direct MCP calls bypassing nginx)
+        info!("✅ Using Cashu token from request body (direct call, bypassing nginx)");
     } else {
-        // This shouldn't happen if ngx_l402 is configured correctly
-        error!("❌ No payment token found in headers - ngx_l402 should have blocked this request");
+        // No payment token provided at all
+        error!("❌ No payment token found in headers or body");
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "error": "Payment token missing",
-                "message": "This endpoint requires payment via ngx_l402"
+                "message": "Provide payment via Authorization header or cashu_token in body"
             }))
         ).into_response();
     }
@@ -251,21 +253,23 @@ async fn topup_pod_l402(
 ) -> Response {
     info!("📨 Received topup pod request via HTTP+L402");
 
-    // Extract payment from Authorization: Cashu <token> header
-    // ngx_l402 has already validated this payment
+    // Extract payment from Authorization: Cashu <token> header (from ngx_l402 or MCP client)
     if let Some(l402_payment) = extract_l402_payment(&headers).await {
-        info!("✅ L402 payment validated by ngx_l402 for top-up: {} msats", l402_payment.amount_msats);
+        info!("✅ L402 payment from Authorization header for top-up: {} msats", l402_payment.amount_msats);
         
-        // Use token from header (ngx_l402 validated this)
+        // Use token from header (validated by ngx_l402 or provided by MCP client)
         request.cashu_token = l402_payment.token;
+    } else if !request.cashu_token.is_empty() {
+        // Fallback: Accept token from request body (for direct MCP calls bypassing nginx)
+        info!("✅ Using Cashu token from request body for top-up (direct call, bypassing nginx)");
     } else {
-        // This shouldn't happen if ngx_l402 is configured correctly
-        error!("❌ No payment token found in headers - ngx_l402 should have blocked this request");
+        // No payment token provided at all
+        error!("❌ No payment token found in headers or body");
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "error": "Payment token missing",
-                "message": "This endpoint requires payment via ngx_l402"
+                "message": "Provide payment via Authorization header or cashu_token in body"
             }))
         ).into_response();
     }

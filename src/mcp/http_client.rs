@@ -69,9 +69,9 @@ impl PaywalledHttpClient {
             _ => return Err(anyhow!("Unsupported HTTP method: {}", method)),
         };
 
-        // Add L402 token if available
+        // Add L402 token if available (using Cashu format for ngx_l402 compatibility)
         if let Some(token) = &self.l402_token {
-            request_builder = request_builder.header("Authorization", format!("L402 {}", token));
+            request_builder = request_builder.header("Authorization", format!("Cashu {}", token));
         }
 
         // Add body for POST requests
