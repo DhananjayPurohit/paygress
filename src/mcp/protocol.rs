@@ -210,7 +210,7 @@ async fn call_topup_pod(service: &PodProvisioningService, arguments: &Value) -> 
                     "content": [
                         {
                             "type": "text",
-                            "text": format!("✅ Pod successfully topped up!\n\n🔄 **Extension Details:**\n- Pod NPUB: {}\n- Extended Duration: {} seconds\n- New Expires At: {}\n\n📝 **Message:** {}", 
+                            "text": format!("✅ Pod successfully topped up!\n\nExtension Details:\n- Pod NPUB: {}\n- Extended Duration: {} seconds\n- New Expires At: {}\n\nMessage: {}", 
                                 response.pod_npub,
                                 response.extended_duration_seconds.map(|d| d.to_string()).as_deref().unwrap_or("N/A"),
                                 response.new_expires_at.as_deref().unwrap_or("N/A"),
@@ -256,7 +256,7 @@ async fn call_get_offers(service: &PodProvisioningService) -> Value {
     match service.get_offers(request).await {
         Ok(response) => {
             let mut offers_text = format!(
-                "🏪 **Available Pod Specifications:**\n\n⏱️ **Minimum Duration:** {} seconds\n\n💰 **Whitelisted Mints:**\n",
+                "🏪 Available Pod Specifications:\n\nMinimum Duration: {} seconds\n\nWhitelisted Mints:\n",
                 response.minimum_duration_seconds
             );
             
@@ -264,11 +264,11 @@ async fn call_get_offers(service: &PodProvisioningService) -> Value {
                 offers_text.push_str(&format!("- {}\n", mint));
             }
             
-            offers_text.push_str("\n📦 **Pod Specifications:**\n\n");
+            offers_text.push_str("\nPod Specifications:\n\n");
             
             for (i, spec) in response.pod_specs.iter().enumerate() {
                 offers_text.push_str(&format!(
-                    "**{}. {} (ID: {})**\n- Description: {}\n- CPU: {} millicores\n- Memory: {} MB\n- Rate: {} msats/second\n\n",
+                    "{}. {} (ID: {})\n- Description: {}\n- CPU: {} millicores\n- Memory: {} MB\n- Rate: {} msats/second\n\n",
                     i + 1,
                     spec.name,
                     spec.id,
@@ -418,46 +418,25 @@ pub async fn handle_tools_call_http(http_client: &PaywalledHttpClient, request: 
                         let pod_spec_name = response["pod_spec_name"].as_str().unwrap_or("N/A");
                         let cpu = response["cpu_millicores"].as_u64().unwrap_or(0);
                         let memory = response["memory_mb"].as_u64().unwrap_or(0);
-                        let duration_secs = response["duration_seconds"].as_u64().unwrap_or(0);
-                        
-                        // Format duration
-                        let hours = duration_secs / 3600;
-                        let minutes = (duration_secs % 3600) / 60;
-                        let seconds = duration_secs % 60;
-                        let duration_str = if hours > 0 {
-                            format!("{}h {}m {}s", hours, minutes, seconds)
-                        } else if minutes > 0 {
-                            format!("{}m {}s", minutes, seconds)
-                        } else {
-                            format!("{}s", seconds)
-                        };
 
                         json!({
                             "content": [
                                 {
                                     "type": "text",
                                     "text": format!(
-                                        "🎉 **VM Spawned Successfully!**\n\n\
-                                        ╔══════════════════════════════════════════╗\n\
-                                        ║          🔐 SSH ACCESS DETAILS           ║\n\
-                                        ╚══════════════════════════════════════════╝\n\n\
-                                        **Connect Command:**\n\
-                                        ```bash\n\
+                                        "🎉 VM Spawned Successfully!\n\n\
+                                        Connect Command:\n\
                                         ssh {}@{} -p {}\n\
-                                        ```\n\n\
-                                        **Password:** `{}`\n\n\
-                                        ───────────────────────────────────────────\n\n\
-                                        📋 **VM Details**\n\
-                                        • Pod ID: `{}`\n\
+                                        Password: {}\n\n\
+                                        VM Details:\n\
+                                        • Pod ID: {}\n\
                                         • Spec: {} ({} CPU, {} MB RAM)\n\
-                                        • Duration: {}\n\
                                         • Expires: {}\n\n\
-                                        💡 **Quick Start:** Copy the command above and use the password when prompted.",
+                                        Quick Start: Copy the command above and use the password when prompted.",
                                         ssh_username, ssh_host, ssh_port,
                                         ssh_password,
                                         pod_npub,
                                         pod_spec_name, cpu, memory,
-                                        duration_str,
                                         expires_at
                                     )
                                 }
@@ -673,20 +652,16 @@ pub async fn handle_tools_call_http(http_client: &PaywalledHttpClient, request: 
                                 {
                                     "type": "text",
                                     "text": format!(
-                                        "📊 **VM Status**\n\n\
-                                        ╔══════════════════════════════════════════╗\n\
-                                        ║              {} {}{}              ║\n\
-                                        ╚══════════════════════════════════════════╝\n\n\
-                                        **VM Details:**\n\
-                                        • Pod ID: `{}`\n\
+                                        "📊 VM Status: {} {}\n\n\
+                                        VM Details:\n\
+                                        • Pod ID: {}\n\
                                         • Spec: {} ({} CPU, {} MB RAM)\n\n\
-                                        **⏰ Time Status:**\n\
+                                        Time Status:\n\
                                         • Remaining: {}\n\
                                         • Expires: {}\n\n\
-                                        💡 Use `topup_pod` to extend the VM lifetime before it expires.",
+                                        Use topup_pod to extend the VM lifetime before it expires.",
                                         status_icon, 
                                         status.to_uppercase(),
-                                        " ".repeat(42_usize.saturating_sub(status.len() + 5)),
                                         pod_npub, 
                                         pod_spec_name, cpu, memory,
                                         time_str,

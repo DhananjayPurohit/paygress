@@ -47,6 +47,8 @@ pub struct SpawnPodResponse {
     pub ssh_password: Option<String>,
     pub expires_at: Option<String>,
     pub pod_spec_name: Option<String>,
+    pub cpu_millicores: Option<u64>,
+    pub memory_mb: Option<u64>,
     pub instructions: Vec<String>,
 }
 
@@ -131,6 +133,8 @@ impl PodProvisioningService {
                     ssh_password: None,
                     expires_at: None,
                     pod_spec_name: None,
+                    cpu_millicores: None,
+                    memory_mb: None,
                     instructions: vec![],
                 })
             }
@@ -325,6 +329,8 @@ impl PodProvisioningService {
                     ssh_password: None,
                     expires_at: None,
                     pod_spec_name: None,
+                    cpu_millicores: None,
+                    memory_mb: None,
                     instructions: vec!["Please check available specifications in the offer".to_string()],
                 });
             }
@@ -344,6 +350,8 @@ impl PodProvisioningService {
                     ssh_password: None,
                     expires_at: None,
                     pod_spec_name: None,
+                    cpu_millicores: None,
+                    memory_mb: None,
                     instructions: vec![format!("Token decode error: {}", e)],
                 });
             }
@@ -470,6 +478,8 @@ impl PodProvisioningService {
                     ssh_password: Some(password),
                     expires_at: Some(expires_at.to_rfc3339()),
                     pod_spec_name: Some(pod_spec.name.clone()),
+                    cpu_millicores: Some(pod_spec.cpu_millicores),
+                    memory_mb: Some(pod_spec.memory_mb),
                     instructions,
                 })
             }
@@ -484,6 +494,8 @@ impl PodProvisioningService {
                     ssh_password: None,
                     expires_at: None,
                     pod_spec_name: Some(pod_spec.name.clone()),
+                    cpu_millicores: Some(pod_spec.cpu_millicores),
+                    memory_mb: Some(pod_spec.memory_mb),
                     instructions: vec![format!("Pod creation error: {}", e)],
                 })
             }

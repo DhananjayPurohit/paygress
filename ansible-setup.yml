@@ -1728,10 +1728,16 @@
         name: contextvm
         enabled: yes
         state: started
+    
+    - name: Restart Context VM service to use new binary
+      systemd:
+        name: contextvm
+        state: restarted
+      ignore_errors: yes
         
     - name: Wait for Context VM service to initialize
       pause:
-        seconds: 5
+        seconds: 10
         
     - name: Check Context VM service status
       shell: systemctl is-active contextvm || echo "inactive"

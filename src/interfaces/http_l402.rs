@@ -226,6 +226,8 @@ async fn spawn_pod_l402(
                 "ssh_password": response.ssh_password,
                 "expires_at": response.expires_at,
                 "pod_spec_name": response.pod_spec_name,
+                "cpu_millicores": response.cpu_millicores,
+                "memory_mb": response.memory_mb,
                 "instructions": response.instructions
             });
             (StatusCode::OK, Json(response_json)).into_response()
