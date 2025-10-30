@@ -370,6 +370,8 @@ impl PodProvisioningService {
                 ssh_password: None,
                 expires_at: None,
                 pod_spec_name: Some(pod_spec.name.clone()),
+                cpu_millicores: Some(pod_spec.cpu_millicores),
+                memory_mb: Some(pod_spec.memory_mb),
                 instructions: vec![
                     format!("Minimum required: {} msats for {} seconds with {} spec (rate: {} msats/sec)", 
                         minimum_payment,
@@ -409,6 +411,8 @@ impl PodProvisioningService {
                     ssh_password: None,
                     expires_at: None,
                     pod_spec_name: Some(pod_spec.name.clone()),
+                    cpu_millicores: Some(pod_spec.cpu_millicores),
+                    memory_mb: Some(pod_spec.memory_mb),
                     instructions: vec![format!("Port allocation error: {}", e)],
                 });
             }
