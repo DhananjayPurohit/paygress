@@ -314,11 +314,13 @@ impl PodManager {
             }]),
             env: Some(env_vars),
             image_pull_policy: Some("IfNotPresent".to_string()),
-            // Override to configure SSH to listen on the allocated port with hostNetwork
+            // Override entrypoint to set SSH port before init script
+            // linuxserver/openssh-server init script checks /config/sshd_config
+            // We need to create it with Port directive before /init runs
             command: Some(vec![
                 "/bin/bash".to_string(),
                 "-c".to_string(),
-                format!("echo 'Port {}' >> /config/sshd_config && /init", ssh_port),
+                format!("set -e && mkdir -p /config && cat > /config/sshd_config <<EOF\nPort {}\nPermitRootLogin yes\nPasswordAuthentication yes\nPubkeyAuthentication yes\nEOF\n/init", ssh_port),
             ]),
             resources: Some(k8s_openapi::api::core::v1::ResourceRequirements {
                 limits: Some({
