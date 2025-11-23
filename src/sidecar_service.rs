@@ -265,7 +265,7 @@ impl PodManager {
             },
             EnvVar {
                 name: "SSH_PORT".to_string(),
-                value: Some(ssh_port.to_string()), // Container listens on this port with hostNetwork
+                value: Some(ssh_port.to_string()), // SSH should listen on this port with hostNetwork
                 value_from: None,
             },
         ];
@@ -306,7 +306,7 @@ impl PodManager {
             name: "ssh-server".to_string(),
             image: Some(image.to_string()),
             ports: Some(vec![ContainerPort {
-                container_port: ssh_port as i32, // With hostNetwork, container listens directly on the host port
+                container_port: ssh_port as i32, // With hostNetwork, container listens directly on host port
                 host_port: None, // Not needed with hostNetwork: true
                 name: Some("ssh".to_string()),
                 protocol: Some("TCP".to_string()),
@@ -314,6 +314,12 @@ impl PodManager {
             }]),
             env: Some(env_vars),
             image_pull_policy: Some("IfNotPresent".to_string()),
+            // Override to configure SSH to listen on the allocated port with hostNetwork
+            command: Some(vec![
+                "/bin/bash".to_string(),
+                "-c".to_string(),
+                format!("echo 'Port {}' >> /config/sshd_config && /init", ssh_port),
+            ]),
             resources: Some(k8s_openapi::api::core::v1::ResourceRequirements {
                 limits: Some({
                     let mut limits = std::collections::BTreeMap::new();
@@ -346,7 +352,7 @@ impl PodManager {
                 volumes: None,
                 restart_policy: Some("Never".to_string()),
                 active_deadline_seconds: Some(duration_seconds as i64), // Kubernetes will auto-terminate after this time
-                host_network: Some(true), // Use host networking - hostPort doesn't work reliably with Flannel
+                host_network: Some(true), // Use host networking - required for direct port access
                 dns_policy: Some("ClusterFirstWithHostNet".to_string()), // Required when hostNetwork is true
                 ..Default::default()
             }),
