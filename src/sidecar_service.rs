@@ -265,7 +265,7 @@ impl PodManager {
             },
             EnvVar {
                 name: "SSH_PORT".to_string(),
-                value: Some(ssh_port.to_string()),
+                value: Some(ssh_port.to_string()), // Container listens on this port with hostNetwork
                 value_from: None,
             },
         ];
@@ -306,8 +306,8 @@ impl PodManager {
             name: "ssh-server".to_string(),
             image: Some(image.to_string()),
             ports: Some(vec![ContainerPort {
-                container_port: 2222, // SSH listens on port 2222 inside linuxserver/openssh-server container
-                host_port: Some(ssh_port as i32), // Bind directly to unique host port
+                container_port: ssh_port as i32, // With hostNetwork, container listens directly on the host port
+                host_port: None, // Not needed with hostNetwork: true
                 name: Some("ssh".to_string()),
                 protocol: Some("TCP".to_string()),
                 ..Default::default()
@@ -346,8 +346,8 @@ impl PodManager {
                 volumes: None,
                 restart_policy: Some("Never".to_string()),
                 active_deadline_seconds: Some(duration_seconds as i64), // Kubernetes will auto-terminate after this time
-                host_network: Some(false), // Use regular pod networking with hostPort binding
-                dns_policy: Some("ClusterFirst".to_string()), // Standard DNS policy
+                host_network: Some(true), // Use host networking - hostPort doesn't work reliably with Flannel
+                dns_policy: Some("ClusterFirstWithHostNet".to_string()), // Required when hostNetwork is true
                 ..Default::default()
             }),
             ..Default::default()

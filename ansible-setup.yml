@@ -8,6 +8,8 @@
     containerd_version: "1.6.24"
     paygress_user: "{{ ansible_user }}"
     paygress_dir: "/home/{{ paygress_user }}/paygress"
+    pod_network_cidr: "10.244.0.0/16"  # Flannel default pod network
+    service_network_cidr: "10.96.0.0/12"  # Kubernetes default service network
     # All configuration variables are defined in inventory.ini
     # public_ip, ssh_port_start, ssh_port_end, main_service_port
     
@@ -105,6 +107,129 @@
         owner: root
         group: root
       when: static_ip_enabled | default(false)
+
+    - name: Create script to exclude Kubernetes networks from WireGuard routing
+      copy:
+        dest: /usr/local/bin/wg-exclude-k8s-networks.sh
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          # Wait for WireGuard to fully initialize its routing
+          sleep 5
+          
+          # Delete Kubernetes networks from WireGuard routing table if present
+          ip route del {{ pod_network_cidr }} table 51820 2>/dev/null || true
+          ip route del {{ service_network_cidr }} table 51820 2>/dev/null || true
+          
+          # Add route for Kubernetes service network through loopback
+          # This prevents the service network from going through WireGuard
+          ip route add {{ service_network_cidr }} dev lo 2>/dev/null || true
+          
+          # Flush routing cache to force re-evaluation
+          ip route flush cache
+          ip route flush table 51820 cache 2>/dev/null || true
+          
+          # Verify the service network route is in main table
+          if ! ip route show | grep -q "{{ service_network_cidr }}"; then
+            echo "Warning: Kubernetes service route not added to main table" >&2
+            exit 1
+          fi
+          
+          exit 0
+      when: static_ip_enabled | default(false)
+
+    - name: Create systemd service to run after WireGuard starts
+      copy:
+        dest: /etc/systemd/system/wg-exclude-k8s.service
+        content: |
+          [Unit]
+          Description=Exclude Kubernetes networks from WireGuard routing
+          After=wg-quick@wg0.service
+          Requires=wg-quick@wg0.service
+          
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/bin/wg-exclude-k8s-networks.sh
+          RemainAfterExit=yes
+          Restart=on-failure
+          RestartSec=10
+          
+          [Install]
+          WantedBy=multi-user.target
+      when: static_ip_enabled | default(false)
+      register: wg_exclude_service_created
+
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+      when: static_ip_enabled | default(false) and wg_exclude_service_created.changed
+
+    - name: Enable the WireGuard K8s exclusion service
+      systemd:
+        name: wg-exclude-k8s
+        enabled: yes
+      when: static_ip_enabled | default(false)
+
+    - name: Restart WireGuard to apply changes
+      systemd:
+        name: wg-quick@wg0
+        state: restarted
+      when: static_ip_enabled | default(false) and wg_exclude_service_created.changed
+      ignore_errors: yes
+
+    - name: Wait for WireGuard to initialize
+      pause:
+        seconds: 3
+      when: static_ip_enabled | default(false) and wg_exclude_service_created.changed
+
+    - name: Start the WireGuard K8s exclusion service
+      systemd:
+        name: wg-exclude-k8s
+        state: started
+      when: static_ip_enabled | default(false)
+      ignore_errors: yes
+
+    - name: Wait for route exclusion to complete
+      pause:
+        seconds: 2
+      when: static_ip_enabled | default(false)
+
+    - name: Create persistent route configuration for Kubernetes service network
+      copy:
+        dest: /etc/systemd/network/10-k8s-service-route.network
+        content: |
+          [Match]
+          Name=lo
+          
+          [Route]
+          Destination={{ service_network_cidr }}
+      when: static_ip_enabled | default(false)
+      register: k8s_route_config
+
+    - name: Restart systemd-networkd if route config changed
+      systemd:
+        name: systemd-networkd
+        state: restarted
+      when: static_ip_enabled | default(false) and k8s_route_config.changed
+      ignore_errors: yes
+
+    - name: Verify Kubernetes networks are excluded from WireGuard routing
+      shell: |
+        if ip route show table 51820 | grep -E "{{ pod_network_cidr }}|{{ service_network_cidr }}"; then
+          echo "FAILED - Kubernetes networks still in WireGuard routing table"
+          exit 1
+        else
+          echo "SUCCESS - Kubernetes networks excluded from WireGuard routing"
+          exit 0
+        fi
+      when: static_ip_enabled | default(false)
+      register: wg_route_verification
+      ignore_errors: yes
+
+    - name: Display WireGuard route verification result
+      debug:
+        msg: "{{ wg_route_verification.stdout }}"
+      when: static_ip_enabled | default(false) and wg_route_verification.stdout is defined
 
     - name: Validate downloaded config is not HTML
       shell: |
@@ -419,12 +544,42 @@
         remote_src: yes
       when: ssh_config_test.rc != 0
 
-    - name: Restart SSH service to apply new ports
-      systemd:
-        name: ssh
-        state: restarted
-      when: ssh_dual_ports_configured.changed
+    - name: Check if SSH socket activation is enabled
+      shell: systemctl is-enabled ssh.socket 2>/dev/null || echo "disabled"
+      register: ssh_socket_status
+      changed_when: false
       ignore_errors: yes
+
+    - name: Display SSH socket status
+      debug:
+        msg: "SSH socket activation: {{ ssh_socket_status.stdout }}"
+
+    - name: Disable SSH socket activation first (prevents port conflicts)
+      systemd:
+        name: ssh.socket
+        enabled: no
+      when: ssh_socket_status.stdout != "disabled"
+      ignore_errors: yes
+
+    - name: Stop SSH socket if enabled
+      systemd:
+        name: ssh.socket
+        state: stopped
+      when: ssh_socket_status.stdout != "disabled"
+      ignore_errors: yes
+
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+      when: ssh_socket_status.stdout != "disabled"
+
+    - name: Restart SSH service to apply new ports (graceful reload)
+      shell: systemctl reload ssh 2>/dev/null || systemctl restart ssh
+      when: ssh_dual_ports_configured.changed or ssh_socket_status.stdout != "disabled"
+      ignore_errors: yes
+      changed_when: true
+      async: 1
+      poll: 0
 
     - name: Ensure SSH is enabled and running
       systemd:
@@ -637,6 +792,52 @@
         port: '6443'
         proto: tcp
 
+    - name: Allow pod network to communicate with API server
+      ufw:
+        rule: allow
+        from_ip: "{{ pod_network_cidr }}"
+        comment: "Pod network access"
+
+    - name: Allow pod network to access service network
+      ufw:
+        rule: allow
+        from_ip: "{{ pod_network_cidr }}"
+        to_ip: "{{ service_network_cidr }}"
+        comment: "Pod to service network (API server)"
+
+    - name: Allow pod network traffic
+      ufw:
+        rule: allow
+        from_ip: "{{ pod_network_cidr }}"
+        to_ip: "{{ pod_network_cidr }}"
+        comment: "Pod-to-pod communication"
+
+    - name: Configure UFW to allow Kubernetes forwarding (pod network)
+      blockinfile:
+        path: /etc/ufw/before.rules
+        marker: "# {mark} ANSIBLE MANAGED - Kubernetes pod network forwarding"
+        insertafter: "^\\*filter"
+        block: |
+          # Allow Kubernetes pod network forwarding
+          -A ufw-before-forward -s {{ pod_network_cidr }} -j ACCEPT
+          -A ufw-before-forward -d {{ pod_network_cidr }} -j ACCEPT
+          # Allow Kubernetes service network forwarding
+          -A ufw-before-forward -s {{ service_network_cidr }} -j ACCEPT
+          -A ufw-before-forward -d {{ service_network_cidr }} -j ACCEPT
+      register: ufw_before_rules_updated
+
+    - name: Add iptables FORWARD rules for Kubernetes networking
+      shell: |
+        iptables -C FORWARD -s {{ pod_network_cidr }} -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -s {{ pod_network_cidr }} -j ACCEPT
+        iptables -C FORWARD -d {{ pod_network_cidr }} -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -d {{ pod_network_cidr }} -j ACCEPT
+        iptables -C FORWARD -s {{ service_network_cidr }} -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -s {{ service_network_cidr }} -j ACCEPT
+        iptables -C FORWARD -d {{ service_network_cidr }} -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -d {{ service_network_cidr }} -j ACCEPT
+      ignore_errors: yes
+
+    - name: Reload UFW if rules were updated
+      shell: ufw reload
+      when: ufw_before_rules_updated.changed
+
     - name: Allow NodePort range
       ufw:
         rule: allow
@@ -717,7 +918,7 @@
 
     - name: Initialize Kubernetes cluster
       shell: |
-        kubeadm init --pod-network-cidr=10.244.0.0/16 --ignore-preflight-errors=Port-6443
+        kubeadm init --pod-network-cidr={{ pod_network_cidr }} --ignore-preflight-errors=Port-6443
       register: kubeadm_init
       when: not k8s_initialized.stat.exists
       ignore_errors: yes
@@ -770,7 +971,7 @@
 
     - name: Reinitialize Kubernetes cluster if needed
       shell: |
-        kubeadm init --pod-network-cidr=10.244.0.0/16 --ignore-preflight-errors=Port-6443
+        kubeadm init --pod-network-cidr={{ pod_network_cidr }} --ignore-preflight-errors=Port-6443
       when: api_check.rc != 0
       register: kubeadm_reinit
       ignore_errors: yes
@@ -808,15 +1009,98 @@
       ignore_errors: yes
       when: api_check.rc != 0
 
-    - name: Install Flannel CNI
-      shell: "{{ kubectl_path }} apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml"
+    - name: Clean up old CNI configs before Flannel install
+      shell: |
+        rm -rf /etc/cni/net.d/*
+        rm -rf /run/flannel
+        rm -rf /var/lib/cni
+      ignore_errors: yes
+
+    - name: Ensure /run/flannel directory exists
+      file:
+        path: /run/flannel
+        state: directory
+        mode: '0755'
+
+    - name: Delete existing Flannel installation if present
+      shell: "{{ kubectl_path }} delete -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml"
       environment:
         KUBECONFIG: /etc/kubernetes/admin.conf
       ignore_errors: yes
 
-    - name: Wait a bit for Flannel to initialize
+    - name: Wait for Flannel cleanup
       pause:
-        seconds: 30
+        seconds: 10
+
+    - name: Add route for Kubernetes service network to prevent WireGuard routing
+      shell: |
+        # Remove any existing route
+        ip route del {{ service_network_cidr }} 2>/dev/null || true
+        # Add route through loopback device
+        ip route add {{ service_network_cidr }} dev lo
+        # Flush cache
+        ip route flush cache
+      ignore_errors: yes
+      when: static_ip_enabled | default(false)
+
+    - name: Verify Kubernetes service network route
+      shell: "ip route show | grep '{{ service_network_cidr }}'"
+      register: k8s_service_route
+      ignore_errors: yes
+
+    - name: Display Kubernetes service network route
+      debug:
+        msg: "Kubernetes service network route: {{ k8s_service_route.stdout }}"
+      when: k8s_service_route.rc == 0
+
+    - name: Install Flannel CNI
+      shell: "{{ kubectl_path }} apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml"
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: flannel_install
+      retries: 3
+      delay: 10
+      until: flannel_install.rc == 0
+
+    - name: Wait for Flannel DaemonSet to be created
+      shell: "{{ kubectl_path }} get daemonset -n kube-flannel kube-flannel-ds 2>/dev/null"
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: flannel_ds
+      retries: 12
+      delay: 5
+      until: flannel_ds.rc == 0
+      ignore_errors: yes
+
+    - name: Wait for Flannel pods to be ready
+      shell: "{{ kubectl_path }} wait --for=condition=ready pod -l app=flannel -n kube-flannel --timeout=120s"
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: flannel_ready
+      retries: 3
+      delay: 10
+      until: flannel_ready.rc == 0
+      ignore_errors: yes
+
+    - name: Verify Flannel subnet.env file exists
+      stat:
+        path: /run/flannel/subnet.env
+      register: flannel_subnet_file
+
+    - name: Display Flannel status
+      debug:
+        msg: "Flannel subnet.env exists: {{ flannel_subnet_file.stat.exists }}"
+
+    - name: Restart kubelet if Flannel file missing
+      systemd:
+        name: kubelet
+        state: restarted
+      when: not flannel_subnet_file.stat.exists
+
+    - name: Wait for Flannel after kubelet restart
+      pause:
+        seconds: 15
+      when: not flannel_subnet_file.stat.exists
 
     - name: Remove taint from control-plane (single node setup)
       shell: "{{ kubectl_path }} taint nodes --all node-role.kubernetes.io/control-plane- || true"
@@ -1322,6 +1606,14 @@
         line: 'HTTP_BASE_URL=http://localhost:8080'
         create: yes
 
+    - name: Configure Context VM - Disable logging (prevents JSON-RPC errors)
+      become_user: "{{ paygress_user }}"
+      lineinfile:
+        path: "{{ paygress_dir }}/.env.contextvm"
+        regexp: '^RUST_LOG=.*'
+        line: 'RUST_LOG=off'
+        create: yes
+
     - name: Update .env.contextvm with public IP for external SSH access
       become_user: "{{ paygress_user }}"
       replace:
@@ -1581,26 +1873,33 @@
         msg: "Node.js version: {{ node_version.stdout }}"
     
     - name: Install gateway-cli using GitHub install script
-      become_user: "{{ paygress_user }}"
+      become: yes
       shell: |
         set -e
-        export PATH="$HOME/.local/bin:$PATH"
         
-        # Download and run the official install script
-        if [ ! -f "$HOME/.local/bin/gateway-cli" ]; then
-          echo "Installing gateway-cli..."
-          curl -fsSL https://raw.githubusercontent.com/contextvm/gateway-cli/main/install.sh | bash
-          export PATH="$HOME/.local/bin:$PATH"
-        else
+        # Check if already installed
+        if command -v gateway-cli &> /dev/null; then
           echo "gateway-cli already installed"
+          gateway-cli --version
+          exit 0
         fi
         
+        # Download and run the official install script (installs to /usr/local/bin)
+        echo "Installing gateway-cli..."
+        curl -fsSL https://raw.githubusercontent.com/contextvm/gateway-cli/main/install.sh | bash
+        
         # Verify installation
-        gateway-cli --version || echo "Installation verification skipped"
+        gateway-cli --version || echo "Installation verification failed"
       args:
         executable: /bin/bash
       ignore_errors: yes
-      timeout: 60
+      timeout: 300
+      register: gateway_cli_install
+
+    - name: Display gateway-cli installation result
+      debug:
+        msg: "{{ gateway_cli_install.stdout_lines }}"
+      when: gateway_cli_install.stdout_lines is defined
 
     - name: Create MCP-specific startup script
       copy:
@@ -1628,8 +1927,8 @@
               exit 1
           fi
           
-          # Set default logging level if not set
-          export RUST_LOG="${RUST_LOG:-info}"
+          # Disable logging for MCP mode (logs break JSON-RPC over stdio)
+          export RUST_LOG="${RUST_LOG:-off}"
           
           # Configure MCP to call HTTP endpoints
           export ENABLE_MCP=true
