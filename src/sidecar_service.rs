@@ -320,7 +320,7 @@ impl PodManager {
             command: Some(vec![
                 "/bin/bash".to_string(),
                 "-c".to_string(),
-                format!("set -e && mkdir -p /config && cat > /config/sshd_config <<EOF\nPort {}\nPermitRootLogin yes\nPasswordAuthentication yes\nPubkeyAuthentication yes\nEOF\n/init", ssh_port),
+                format!("set -e && mkdir -p /config && cat > /config/sshd_config <<EOF\nPort {}\nListenAddress 0.0.0.0\nPermitRootLogin yes\nPasswordAuthentication yes\nPubkeyAuthentication yes\nUseDNS no\nGSSAPIAuthentication no\nEOF\n/init", ssh_port),
             ]),
             resources: Some(k8s_openapi::api::core::v1::ResourceRequirements {
                 limits: Some({
@@ -369,8 +369,65 @@ impl PodManager {
         // This eliminates the need for separate services per pod
         // Each pod gets a unique port on the host directly
 
-        // Wait for pod to be ready
-        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+        // Wait for pod to be running and SSH to be ready
+        info!("Waiting for pod {} to be ready...", pod_name);
+        let mut attempts = 0;
+        let max_attempts = 30; // 30 attempts * 2 seconds = 60 seconds max wait
+        let mut pod_ready = false;
+        
+        while attempts < max_attempts {
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            attempts += 1;
+            
+            match pods.get(&pod_name).await {
+                Ok(p) => {
+                    if let Some(status) = &p.status {
+                        if let Some(phase) = &status.phase {
+                            if phase == "Running" {
+                                // Check if container is ready
+                                if let Some(container_statuses) = &status.container_statuses {
+                                    if let Some(container_status) = container_statuses.first() {
+                                        if container_status.ready.unwrap_or(false) {
+                                            // Verify SSH is actually listening on the port
+                                            use std::net::TcpStream;
+                                            match TcpStream::connect_timeout(
+                                                &std::net::SocketAddr::new(
+                                                    std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+                                                    ssh_port
+                                                ),
+                                                std::time::Duration::from_secs(1)
+                                            ) {
+                                                Ok(_) => {
+                                                    pod_ready = true;
+                                                    info!("Pod {} is ready and SSH is listening on port {}", pod_name, ssh_port);
+                                                    break;
+                                                }
+                                                Err(_) => {
+                                                    if attempts % 5 == 0 {
+                                                        info!("Pod {} is running but SSH not yet listening on port {} (attempt {}/{})", pod_name, ssh_port, attempts, max_attempts);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            } else if phase == "Failed" || phase == "Succeeded" {
+                                return Err(format!("Pod {} entered {} state", pod_name, phase));
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    if attempts % 5 == 0 {
+                        warn!("Failed to get pod status: {} (attempt {}/{})", e, attempts, max_attempts);
+                    }
+                }
+            }
+        }
+        
+        if !pod_ready {
+            warn!("Pod {} may not be fully ready, but proceeding anyway", pod_name);
+        }
 
         // SSH is directly accessible via hostPort binding
         let node_port = ssh_port; // The allocated port is directly accessible on the host
