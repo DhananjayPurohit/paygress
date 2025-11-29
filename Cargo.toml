@@ -7,9 +7,9 @@ description = "Cashu payment verification and pod provisioning for ingress contr
 license = "MIT"
 
 
-# Binary for sidecar service
+# Unified Paygress service binary
 [[bin]]
-name = "paygress-sidecar"
+name = "paygress"
 path = "src/main.rs"
 
 [dependencies]
@@ -27,7 +27,7 @@ cdk = "0.9.0"
 # Nostr dependencies
 nostr-sdk = { version = "0.33", features = ["nip04", "nip44", "nip59"] }
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Kubernetes dependencies
 kube = { version = "0.93", features = ["runtime", "derive"] }
@@ -38,6 +38,16 @@ futures-util = "0.3"
 # HTTP server dependencies
 axum = "0.7"
 chrono = { version = "0.4", features = ["serde"] }
+
+# HTTP client dependencies (for MCP → HTTP)
+reqwest = { version = "0.11", features = ["json"] }
+
+# MCP server dependencies
+rmcp = { version = "0.2.1", features = ["server", "transport-io", "macros"] }
+async-trait = "0.1"
+
+# Environment file loading
+dotenv = "0.15"
 
 
 [profile.release]

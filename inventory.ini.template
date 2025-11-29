@@ -5,16 +5,86 @@ production ansible_host=YOUR-SERVER-IP ansible_user=YOUR-USERNAME ansible_ssh_pa
 [paygress_servers:vars]
 ansible_python_interpreter=/usr/bin/python3
 ansible_ssh_common_args='-o StrictHostKeyChecking=no'
-# Set your server public IP here
+ansible_remote_tmp=/tmp/.ansible/tmp
+
+# Network Configuration
+# Note: If static_ip_enabled=true, these values will be automatically
+# extracted from the downloaded config file (if present in config)
 public_ip=YOUR-SERVER-IP
-# SSH port range for Paygress pods
+
+# SSH Port Configuration
+# - Machine SSH port is automatically calculated as: ssh_port_start + 22
+#   Example: if ssh_port_start=1000, machine SSH will be on port 1022
+#   Example: if ssh_port_start=3000, machine SSH will be on port 3022
+# - Pod SSH ports use the full range: ssh_port_start to ssh_port_end
 ssh_port_start=1000
 ssh_port_end=1999
 main_service_port=1000
 
 # Nostr Configuration
 nostr_relays=wss://relay.damus.io,wss://nos.lol,wss://relay.nostr.band,wss://nostr.wine,wss://nostr.mom
-nostr_private_key=nsec1...  # Replace with your actual private key
+nostr_private_key=nsec1...  
 
 # Cashu Configuration
 whitelisted_mints=https://nofees.testnut.cashu.space,https://testnut.cashu.space
+
+# Interface Configuration
+enable_nostr=true
+enable_mcp=true
+enable_http=true
+
+# HTTP Settings (Only required if enable_http=true)
+# Backend runs on port 8080 (internal, localhost only)
+# Nginx listens on http_port (external, public facing) and proxies to backend
+http_port=11000
+http_backend_port=8080
+http_bind_addr=127.0.0.1:8080
+
+# Pod Configuration
+minimum_pod_duration_seconds=60
+
+# Static IP Configuration (Optional)
+static_ip_enabled=false
+static_ip_config_url=https://your-vpn-provider.com
+static_ip_cashu_token=YOUR_CASHU_TOKEN_HERE
+
+# Nginx L402 Paywall Configuration
+# Lightning Network Client - Choose ONE: LNURL, LND, CLN, or NWC
+ln_client_type=LNURL
+lnurl_address=https://your-lnurl-server.com
+l402_root_key=your-root-key-change-me
+
+# For LND:
+# ln_client_type=LND
+# lnd_address=https://127.0.0.1:10009
+# lnd_macaroon_path=/path/to/admin.macaroon
+# lnd_cert_path=/path/to/tls.cert
+
+# For CLN:
+# ln_client_type=CLN
+# cln_rpc_path=/path/to/lightning-rpc
+
+# For NWC (Nostr Wallet Connect):
+# ln_client_type=NWC
+# nwc_uri=nostr+walletconnect://pubkey?relay=relay_url&secret=secret
+
+# Redis for dynamic pricing (optional)
+redis_url=redis://127.0.0.1:6379
+
+# Cashu L402 settings
+cashu_ecash_support=true
+cashu_l402_db_path=/var/lib/nginx/cashu_tokens.db
+cashu_l402_wallet_secret=CHANGE-ME-USE-openssl-rand-hex-32
+cashu_redeem_on_lightning=true
+cashu_redemption_interval=3600
+cashu_melt_min_balance=10
+cashu_melt_fee_percent=1
+cashu_melt_min_fee=4
+cashu_max_proofs_per_melt=1000
+
+# Cashu P2PK mode (optimized verification)
+cashu_p2pk_mode=false
+cashu_p2pk_private_key=CHANGE-ME-USE-openssl-rand-hex-32
+
+# Nginx logging
+nginx_rust_log=info

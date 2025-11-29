@@ -17,7 +17,8 @@ use k8s_openapi::api::core::v1::Pod;
 // Using NIP-17 private direct messages - no manual encryption needed
 use std::sync::Mutex;
 
-use crate::{cashu, initialize_cashu, nostr};
+use crate::nostr;
+use crate::cashu::initialize_cashu;
 
 // Configuration for the sidecar service
 #[derive(Clone, Debug)]
@@ -171,7 +172,7 @@ pub struct AuthQuery {
 
 // Pod management service
 pub struct PodManager {
-    client: kube::Client,
+    pub client: kube::Client,
 }
 
 impl PodManager {
@@ -182,7 +183,7 @@ impl PodManager {
 
     pub async fn create_ssh_pod(
         &self,
-        config: &SidecarConfig,
+        _config: &SidecarConfig,
         namespace: &str,
         pod_name: &str,
         pod_npub: &str,        // Add NPUB parameter
@@ -197,7 +198,7 @@ impl PodManager {
         user_pubkey: &str, // User's public key for sending access events
     ) -> Result<u16, String> { // Return only node_port since we have NPUB
         use k8s_openapi::api::core::v1::{
-            Container, Pod, PodSpec, EnvVar, ContainerPort, Service, Volume,
+            Container, Pod, PodSpec, EnvVar, ContainerPort, Volume,
         };
         use kube::api::PostParams;
         use kube::Api;
@@ -264,7 +265,7 @@ impl PodManager {
             },
             EnvVar {
                 name: "SSH_PORT".to_string(),
-                value: Some(ssh_port.to_string()),
+                value: Some(ssh_port.to_string()), // SSH should listen on this port with hostNetwork
                 value_from: None,
             },
         ];
@@ -305,14 +306,22 @@ impl PodManager {
             name: "ssh-server".to_string(),
             image: Some(image.to_string()),
             ports: Some(vec![ContainerPort {
-                container_port: 2222, // SSH listens on port 2222 inside linuxserver/openssh-server container
-                host_port: Some(ssh_port as i32), // Bind directly to unique host port
+                container_port: ssh_port as i32, // With hostNetwork, container listens directly on host port
+                host_port: None, // Not needed with hostNetwork: true
                 name: Some("ssh".to_string()),
                 protocol: Some("TCP".to_string()),
                 ..Default::default()
             }]),
             env: Some(env_vars),
             image_pull_policy: Some("IfNotPresent".to_string()),
+            // Override entrypoint to set SSH port before init script
+            // linuxserver/openssh-server init script checks /config/sshd_config
+            // We need to create it with Port directive before /init runs
+            command: Some(vec![
+                "/bin/bash".to_string(),
+                "-c".to_string(),
+                format!("set -e && mkdir -p /config && cat > /config/sshd_config <<EOF\nPort {}\nListenAddress 0.0.0.0\nPermitRootLogin yes\nPasswordAuthentication yes\nPubkeyAuthentication yes\nUseDNS no\nGSSAPIAuthentication no\nEOF\n/init", ssh_port),
+            ]),
             resources: Some(k8s_openapi::api::core::v1::ResourceRequirements {
                 limits: Some({
                     let mut limits = std::collections::BTreeMap::new();
@@ -345,8 +354,8 @@ impl PodManager {
                 volumes: None,
                 restart_policy: Some("Never".to_string()),
                 active_deadline_seconds: Some(duration_seconds as i64), // Kubernetes will auto-terminate after this time
-                host_network: Some(false), // Use regular pod networking with hostPort binding
-                dns_policy: Some("ClusterFirst".to_string()), // Standard DNS policy
+                host_network: Some(true), // Use host networking - required for direct port access
+                dns_policy: Some("ClusterFirstWithHostNet".to_string()), // Required when hostNetwork is true
                 ..Default::default()
             }),
             ..Default::default()
@@ -360,8 +369,65 @@ impl PodManager {
         // This eliminates the need for separate services per pod
         // Each pod gets a unique port on the host directly
 
-        // Wait for pod to be ready
-        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+        // Wait for pod to be running and SSH to be ready
+        info!("Waiting for pod {} to be ready...", pod_name);
+        let mut attempts = 0;
+        let max_attempts = 30; // 30 attempts * 2 seconds = 60 seconds max wait
+        let mut pod_ready = false;
+        
+        while attempts < max_attempts {
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            attempts += 1;
+            
+            match pods.get(&pod_name).await {
+                Ok(p) => {
+                    if let Some(status) = &p.status {
+                        if let Some(phase) = &status.phase {
+                            if phase == "Running" {
+                                // Check if container is ready
+                                if let Some(container_statuses) = &status.container_statuses {
+                                    if let Some(container_status) = container_statuses.first() {
+                                        if container_status.ready.unwrap_or(false) {
+                                            // Verify SSH is actually listening on the port
+                                            use std::net::TcpStream;
+                                            match TcpStream::connect_timeout(
+                                                &std::net::SocketAddr::new(
+                                                    std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+                                                    ssh_port
+                                                ),
+                                                std::time::Duration::from_secs(1)
+                                            ) {
+                                                Ok(_) => {
+                                                    pod_ready = true;
+                                                    info!("Pod {} is ready and SSH is listening on port {}", pod_name, ssh_port);
+                                                    break;
+                                                }
+                                                Err(_) => {
+                                                    if attempts % 5 == 0 {
+                                                        info!("Pod {} is running but SSH not yet listening on port {} (attempt {}/{})", pod_name, ssh_port, attempts, max_attempts);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            } else if phase == "Failed" || phase == "Succeeded" {
+                                return Err(format!("Pod {} entered {} state", pod_name, phase));
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    if attempts % 5 == 0 {
+                        warn!("Failed to get pod status: {} (attempt {}/{})", e, attempts, max_attempts);
+                    }
+                }
+            }
+        }
+        
+        if !pod_ready {
+            warn!("Pod {} may not be fully ready, but proceeding anyway", pod_name);
+        }
 
         // SSH is directly accessible via hostPort binding
         let node_port = ssh_port; // The allocated port is directly accessible on the host
@@ -887,21 +953,9 @@ async fn auth_check(
     // Calculate duration based on payment
     let duration_seconds = state.calculate_duration_from_payment(payment_amount_msats);
 
-    // Verify Cashu token validity (not amount, just validity)
-    match cashu::verify_cashu_token(&token, 1, &state.config.whitelisted_mints).await {
-        Ok(true) => {
-            info!("✅ Payment verified: {} msats → {} seconds", payment_amount_msats, duration_seconds);
-            StatusCode::OK.into_response()
-        },
-        Ok(false) => {
-            warn!("❌ Token verification failed");
-            StatusCode::PAYMENT_REQUIRED.into_response()
-        },
-        Err(e) => {
-            error!("💥 Payment verification error: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
-    }
+    // Token verification handled by ngx_l402 at nginx layer
+    info!("✅ Payment verified by ngx_l402: {} msats → {} seconds", payment_amount_msats, duration_seconds);
+    StatusCode::OK.into_response()
 }
 
 // Simple test handler
@@ -951,26 +1005,8 @@ async fn spawn_pod_handler(
 
     info!("💰 Payment: {} msats → ⏱️ Duration: {} seconds", payment_amount_msats, duration_seconds);
 
-    // Verify payment (now we just need to verify the token is valid, not check amount)
-    match cashu::verify_cashu_token(&request.cashu_token, 1, &state.config.whitelisted_mints).await { // Just verify with 1 msat to check validity
-        Ok(false) => {
-            return (StatusCode::PAYMENT_REQUIRED, Json(SpawnPodResponse {
-                success: false,
-                message: "Cashu token verification failed - invalid token".to_string(),
-                pod_info: None,
-            })).into_response();
-        },
-        Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(SpawnPodResponse {
-                success: false,
-                message: format!("Payment verification error: {}", e),
-                pod_info: None,
-            })).into_response();
-        },
-        Ok(true) => {
-            info!("✅ Payment verified: {} msats for {} seconds", payment_amount_msats, duration_seconds);
-        }
-    }
+    // Token verification handled by ngx_l402 at nginx layer
+    info!("✅ Token verified by ngx_l402, proceeding with pod creation");
 
     // Generate NPUB first and use it as pod name
     let pod_keys = nostr_sdk::Keys::generate();
@@ -1218,28 +1254,8 @@ pub async fn top_up_pod_handler(
 
     info!("💰 Top-up payment: {} msats → ⏱️ Additional duration: {} seconds", payment_amount_msats, additional_duration_seconds);
 
-    // Verify payment token validity
-    match cashu::verify_cashu_token(&request.cashu_token, 1, &state.config.whitelisted_mints).await {
-        Ok(false) => {
-            return (StatusCode::PAYMENT_REQUIRED, Json(TopUpPodResponse {
-                success: false,
-                message: "Cashu token verification failed - invalid token".to_string(),
-                pod_info: None,
-                extended_duration_seconds: None,
-            })).into_response();
-        },
-        Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(TopUpPodResponse {
-                success: false,
-                message: format!("Payment verification error: {}", e),
-                pod_info: None,
-                extended_duration_seconds: None,
-            })).into_response();
-        },
-        Ok(true) => {
-            info!("✅ Top-up payment verified: {} msats for {} additional seconds", payment_amount_msats, additional_duration_seconds);
-        }
-    }
+    // Token verification handled by ngx_l402 at nginx layer
+    info!("✅ Top-up token verified by ngx_l402, proceeding with extension");
 
     // Update the pod's activeDeadlineSeconds in Kubernetes
     if let Err(e) = state.k8s_client.extend_pod_deadline(&state.config.pod_namespace, &pod_name, additional_duration_seconds).await {

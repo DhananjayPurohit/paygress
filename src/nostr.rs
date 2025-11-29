@@ -1,7 +1,8 @@
 // Nostr client for receiving pod provisioning events with private messaging
 use anyhow::{Context, Result};
-use nostr_sdk::{Client, Keys, Filter, Kind, RelayPoolNotification, Url, EventBuilder, Tag, ToBech32, Event};
+use nostr_sdk::{Client, Keys, Filter, Kind, RelayPoolNotification, Url, EventBuilder, Tag, ToBech32};
 use nostr_sdk::nips::nip59::UnwrappedGift;
+use nostr_sdk::nips::nip04;
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 use std::future::Future;
@@ -22,6 +23,7 @@ pub struct NostrEvent {
     pub tags: Vec<Vec<String>>,
     pub content: String,
     pub sig: String,
+    pub message_type: String, // "nip04" or "nip17" to track which method was used
 }
 
 
@@ -78,62 +80,113 @@ impl NostrRelaySubscriber {
     where
         F: Fn(NostrEvent) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> + Send + Sync + 'static,
     {
-        // Subscribe to NIP-17 Gift Wrap messages for private pod provisioning and top-up requests
-        let filter = Filter::new()
+        // Subscribe to both NIP-04 (Encrypted Direct Messages) and NIP-17 (Gift Wrap) messages
+        let nip04_filter = Filter::new()
+            .kind(Kind::EncryptedDirectMessage)
+            .pubkey(self.keys.public_key())
+            .limit(0);
+
+        let nip17_filter = Filter::new()
             .kind(Kind::GiftWrap)
             .pubkey(self.keys.public_key())
             .limit(0);
 
-        let _ = self.client.subscribe(vec![filter], None).await;
-        info!("Subscribed to NIP-17 Gift Wrap messages for pod provisioning and top-up requests");
+        let _ = self.client.subscribe(vec![nip04_filter, nip17_filter], None).await;
+        info!("Subscribed to NIP-04 (Encrypted Direct Messages) and NIP-17 (Gift Wrap) messages for pod provisioning and top-up requests");
 
         // Handle incoming events
         self.client.handle_notifications(|notification| async {
             if let RelayPoolNotification::Event { relay_url: _, subscription_id: _, event } = notification {
-                // Check if this is a Gift Wrap message
-                if event.kind == Kind::GiftWrap {
-                    info!("Received Gift Wrap message: {}", event.id);
-                    
-                    // Unwrap the Gift Wrap to get the inner message
-                    match self.client.unwrap_gift_wrap(&event).await {
-                        Ok(UnwrappedGift { rumor, sender }) => {
-                            info!("Unwrapped Gift Wrap from sender: {}, rumor kind: {}", sender, rumor.kind);
-                            
-                            // Check if the rumor is a private direct message
-                            if rumor.kind == Kind::PrivateDirectMessage {
-                                info!("Received private direct message content: {}", rumor.content);
+                match event.kind {
+                    Kind::GiftWrap => {
+                        info!("Received NIP-17 Gift Wrap message: {}", event.id);
+                        
+                        // Unwrap the Gift Wrap to get the inner message
+                        match self.client.unwrap_gift_wrap(&event).await {
+                            Ok(UnwrappedGift { rumor, sender }) => {
+                                info!("Unwrapped Gift Wrap from sender: {}, rumor kind: {}", sender, rumor.kind);
                                 
-                                // Create a NostrEvent from the unwrapped rumor
-                                let nostr_event = NostrEvent {
-                                    id: rumor.id.map(|id| id.to_hex()).unwrap_or_else(|| "unknown".to_string()),
-                                    pubkey: rumor.pubkey.to_hex(),
-                                    created_at: rumor.created_at.as_u64(),
-                                    kind: rumor.kind.as_u32(),
-                                    tags: rumor.tags.iter().map(|tag| {
-                                        tag.as_vec().iter().map(|s| s.to_string()).collect()
-                                    }).collect(),
-                                    content: rumor.content,
-                                    sig: "unsigned".to_string(), // UnsignedEvent doesn't have a signature
-                                };
-                                
-                                match handler(nostr_event).await {
-                                    Ok(()) => {
-                                        info!("Successfully processed private message: {}", event.id);
+                                // Check if the rumor is a private direct message
+                                if rumor.kind == Kind::PrivateDirectMessage {
+                                    info!("Received NIP-17 private direct message content: {}", rumor.content);
+                                    
+                                    // Create a NostrEvent from the unwrapped rumor with NIP-17 flag
+                                    let nostr_event = NostrEvent {
+                                        id: rumor.id.map(|id| id.to_hex()).unwrap_or_else(|| "unknown".to_string()),
+                                        pubkey: rumor.pubkey.to_hex(),
+                                        created_at: rumor.created_at.as_u64(),
+                                        kind: rumor.kind.as_u32(),
+                                        tags: rumor.tags.iter().map(|tag| {
+                                            tag.as_vec().iter().map(|s| s.to_string()).collect()
+                                        }).collect(),
+                                        content: rumor.content,
+                                        sig: "unsigned".to_string(), // UnsignedEvent doesn't have a signature
+                                        message_type: "nip17".to_string(), // Flag to indicate NIP-17
+                                    };
+                                    
+                                    match handler(nostr_event).await {
+                                        Ok(()) => {
+                                            info!("Successfully processed NIP-17 private message: {}", event.id);
+                                        }
+                                        Err(e) => {
+                                            error!("Failed to process NIP-17 private message {}: {}", event.id, e);
+                                        }
                                     }
-                                    Err(e) => {
-                                        error!("Failed to process private message {}: {}", event.id, e);
-                                    }
+                                } else {
+                                    info!("Rumor is not a private direct message, kind: {}", rumor.kind);
                                 }
-                            } else {
-                                info!("Rumor is not a private direct message, kind: {}", rumor.kind);
+                            }
+                            Err(e) => {
+                                error!("Failed to unwrap Gift Wrap {}: {}", event.id, e);
                             }
                         }
-                        Err(e) => {
-                            error!("Failed to unwrap Gift Wrap {}: {}", event.id, e);
+                    }
+                    Kind::EncryptedDirectMessage => {
+                        info!("Received NIP-04 Encrypted Direct Message: {}", event.id);
+                        
+                        // Decrypt the NIP-04 message using NIP-04 module
+                        match self.keys.secret_key() {
+                            Ok(secret_key) => {
+                                match nip04::decrypt(&secret_key, &event.pubkey, &event.content) {
+                                    Ok(decrypted_content) => {
+                                        info!("Decrypted NIP-04 message content: {}", decrypted_content);
+                                        
+                                        // Create a NostrEvent from the decrypted message with NIP-04 flag
+                                        let nostr_event = NostrEvent {
+                                            id: event.id.to_hex(),
+                                            pubkey: event.pubkey.to_hex(),
+                                            created_at: event.created_at.as_u64(),
+                                            kind: event.kind.as_u32(),
+                                            tags: event.tags.iter().map(|tag| {
+                                                tag.as_vec().iter().map(|s| s.to_string()).collect()
+                                            }).collect(),
+                                            content: decrypted_content,
+                                            sig: event.sig.to_string(),
+                                            message_type: "nip04".to_string(), // Flag to indicate NIP-04
+                                        };
+                                        
+                                        match handler(nostr_event).await {
+                                            Ok(()) => {
+                                                info!("Successfully processed NIP-04 private message: {}", event.id);
+                                            }
+                                            Err(e) => {
+                                                error!("Failed to process NIP-04 private message {}: {}", event.id, e);
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to decrypt NIP-04 message {}: {}", event.id, e);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to get secret key for NIP-04 decryption: {}", e);
+                            }
                         }
                     }
-                } else {
-                    info!("Received non-Gift Wrap message, ignoring: {}", event.id);
+                    _ => {
+                        info!("Received unsupported event kind: {}", event.kind);
+                    }
                 }
             }
             Ok(false) // Continue listening
@@ -171,55 +224,148 @@ impl NostrRelaySubscriber {
         }
     }
 
-    // NEW: Send access details via private encrypted message (NIP-17 Gift Wrap)
+    // Send access details via private encrypted message (supports both NIP-04 and NIP-17)
     pub async fn send_access_details_private_message(
         &self, 
         request_pubkey: &str,
-        details: AccessDetailsContent
+        details: AccessDetailsContent,
+        message_type: &str
     ) -> Result<String> {
         // Serialize the access details
         let details_json = serde_json::to_string(&details)?;
         
-        // Send as NIP-17 Gift Wrap private message
         let request_pubkey_parsed = nostr_sdk::PublicKey::parse(request_pubkey)?;
-        let event_id = self.client.send_private_msg(request_pubkey_parsed, details_json, None).await?;
         
-        info!("Sent access details via NIP-17 Gift Wrap private message to {}: {:?}", request_pubkey, event_id);
-        Ok(event_id.to_hex())
+        match message_type {
+            "nip04" => {
+                // Send as NIP-04 Encrypted Direct Message
+                match self.keys.secret_key() {
+                    Ok(secret_key) => {
+                        let encrypted_content = nip04::encrypt(&secret_key, &request_pubkey_parsed, &details_json)?;
+                        
+                        // Create proper tags for NIP-04: p tag with receiver's public key hex
+                        let receiver_tag = Tag::public_key(request_pubkey_parsed);
+                        let alt_tag = Tag::parse(&["alt", "Private Message"])?;
+                        
+                        let event_builder = EventBuilder::new(Kind::EncryptedDirectMessage, encrypted_content, [receiver_tag, alt_tag]);
+                        let event = event_builder.to_event(&self.keys)?;
+                        let event_id = self.client.send_event(event).await?;
+                        info!("Sent access details via NIP-04 Encrypted Direct Message to {}: {:?}", request_pubkey, event_id);
+                        Ok(event_id.to_hex())
+                    }
+                    Err(e) => {
+                        error!("Failed to get secret key for NIP-04 encryption: {}", e);
+                        Err(e.into())
+                    }
+                }
+            }
+            "nip17" => {
+                // Send as NIP-17 Gift Wrap private message
+                let event_id = self.client.send_private_msg(request_pubkey_parsed, details_json, None).await?;
+                info!("Sent access details via NIP-17 Gift Wrap private message to {}: {:?}", request_pubkey, event_id);
+                Ok(event_id.to_hex())
+            }
+            _ => {
+                error!("Unsupported message type: {}", message_type);
+                Err(anyhow::anyhow!("Unsupported message type: {}", message_type))
+            }
+        }
     }
 
-    // NEW: Send error response via private encrypted message (NIP-17 Gift Wrap)
+    // Send error response via private encrypted message (supports both NIP-04 and NIP-17)
     pub async fn send_error_response_private_message(
         &self, 
         request_pubkey: &str,
-        error: ErrorResponseContent
+        error: ErrorResponseContent,
+        message_type: &str
     ) -> Result<String> {
         // Serialize the error response
         let error_json = serde_json::to_string(&error)?;
         
-        // Send as NIP-17 Gift Wrap private message
         let request_pubkey_parsed = nostr_sdk::PublicKey::parse(request_pubkey)?;
-        let event_id = self.client.send_private_msg(request_pubkey_parsed, error_json, None).await?;
         
-        info!("Sent error response via NIP-17 Gift Wrap private message to {}: {:?}", request_pubkey, event_id);
-        Ok(event_id.to_hex())
+        match message_type {
+            "nip04" => {
+                // Send as NIP-04 Encrypted Direct Message
+                match self.keys.secret_key() {
+                    Ok(secret_key) => {
+                        let encrypted_content = nip04::encrypt(&secret_key, &request_pubkey_parsed, &error_json)?;
+                        
+                        // Create proper tags for NIP-04: p tag with receiver's public key hex
+                        let receiver_tag = Tag::public_key(request_pubkey_parsed);
+                        let alt_tag = Tag::parse(&["alt", "Private Message"])?;
+                        
+                        let event_builder = EventBuilder::new(Kind::EncryptedDirectMessage, encrypted_content, [receiver_tag, alt_tag]);
+                        let event = event_builder.to_event(&self.keys)?;
+                        let event_id = self.client.send_event(event).await?;
+                        info!("Sent error response via NIP-04 Encrypted Direct Message to {}: {:?}", request_pubkey, event_id);
+                        Ok(event_id.to_hex())
+                    }
+                    Err(e) => {
+                        error!("Failed to get secret key for NIP-04 encryption: {}", e);
+                        Err(e.into())
+                    }
+                }
+            }
+            "nip17" => {
+                // Send as NIP-17 Gift Wrap private message
+                let event_id = self.client.send_private_msg(request_pubkey_parsed, error_json, None).await?;
+                info!("Sent error response via NIP-17 Gift Wrap private message to {}: {:?}", request_pubkey, event_id);
+                Ok(event_id.to_hex())
+            }
+            _ => {
+                error!("Unsupported message type: {}", message_type);
+                Err(anyhow::anyhow!("Unsupported message type: {}", message_type))
+            }
+        }
     }
 
-    // NEW: Send top-up response via private encrypted message (NIP-17 Gift Wrap)
+    // Send top-up response via private encrypted message (supports both NIP-04 and NIP-17)
     pub async fn send_topup_response_private_message(
         &self, 
         request_pubkey: &str,
-        response: TopUpResponseContent
+        response: TopUpResponseContent,
+        message_type: &str
     ) -> Result<String> {
         // Serialize the top-up response
         let response_json = serde_json::to_string(&response)?;
         
-        // Send as NIP-17 Gift Wrap private message
         let request_pubkey_parsed = nostr_sdk::PublicKey::parse(request_pubkey)?;
-        let event_id = self.client.send_private_msg(request_pubkey_parsed, response_json, None).await?;
         
-        info!("Sent top-up response via NIP-17 Gift Wrap private message to {}: {:?}", request_pubkey, event_id);
-        Ok(event_id.to_hex())
+        match message_type {
+            "nip04" => {
+                // Send as NIP-04 Encrypted Direct Message
+                match self.keys.secret_key() {
+                    Ok(secret_key) => {
+                        let encrypted_content = nip04::encrypt(&secret_key, &request_pubkey_parsed, &response_json)?;
+                        
+                        // Create proper tags for NIP-04: p tag with receiver's public key hex
+                        let receiver_tag = Tag::public_key(request_pubkey_parsed);
+                        let alt_tag = Tag::parse(&["alt", "Private Message"])?;
+                        
+                        let event_builder = EventBuilder::new(Kind::EncryptedDirectMessage, encrypted_content, [receiver_tag, alt_tag]);
+                        let event = event_builder.to_event(&self.keys)?;
+                        let event_id = self.client.send_event(event).await?;
+                        info!("Sent top-up response via NIP-04 Encrypted Direct Message to {}: {:?}", request_pubkey, event_id);
+                        Ok(event_id.to_hex())
+                    }
+                    Err(e) => {
+                        error!("Failed to get secret key for NIP-04 encryption: {}", e);
+                        Err(e.into())
+                    }
+                }
+            }
+            "nip17" => {
+                // Send as NIP-17 Gift Wrap private message
+                let event_id = self.client.send_private_msg(request_pubkey_parsed, response_json, None).await?;
+                info!("Sent top-up response via NIP-17 Gift Wrap private message to {}: {:?}", request_pubkey, event_id);
+                Ok(event_id.to_hex())
+            }
+            _ => {
+                error!("Unsupported message type: {}", message_type);
+                Err(anyhow::anyhow!("Unsupported message type: {}", message_type))
+            }
+        }
     }
 
 
@@ -240,6 +386,7 @@ impl NostrRelaySubscriber {
             }).collect(),
             content: event.content.clone(),
             sig: event.sig.to_string(),
+            message_type: "unknown".to_string(), // Default value since this function doesn't know the context
         }
     }
 }

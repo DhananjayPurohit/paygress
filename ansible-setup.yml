@@ -2,15 +2,32 @@
 - name: Setup Ubuntu machine with Docker, Kubernetes, and Paygress
   hosts: all
   become: yes
+  gather_facts: no
   vars:
     kubernetes_version: "1.28"
     containerd_version: "1.6.24"
     paygress_user: "{{ ansible_user }}"
     paygress_dir: "/home/{{ paygress_user }}/paygress"
+    pod_network_cidr: "10.244.0.0/16"  # Flannel default pod network
+    service_network_cidr: "10.96.0.0/12"  # Kubernetes default service network
     # All configuration variables are defined in inventory.ini
     # public_ip, ssh_port_start, ssh_port_end, main_service_port
     
   tasks:
+    # ===============================
+    # Create Home Directory First
+    # ===============================
+    - name: Ensure home directory exists
+      file:
+        path: "/home/{{ paygress_user }}"
+        state: directory
+        owner: "{{ paygress_user }}"
+        mode: '0755'
+      ignore_errors: yes
+
+    - name: Gather facts now that home directory exists
+      setup:
+
     # ===============================
     # System Prerequisites
     # ===============================
@@ -18,6 +35,14 @@
       apt:
         update_cache: yes
         cache_valid_time: 3600
+
+    - name: Install ufw firewall
+      apt:
+        name: 
+          - ufw
+          - netcat-openbsd
+          - net-tools
+        state: present
 
     - name: Install required packages
       apt:
@@ -33,7 +58,571 @@
           - pkg-config
           - libssl-dev
           - unzip
+          - wireguard
+          - wireguard-tools
         state: present
+
+    # ===============================
+    # Static IP Configuration
+    # ===============================
+    - name: Create WireGuard directory
+      file:
+        path: /etc/wireguard
+        state: directory
+        mode: '0700'
+
+    - name: Create Paygress config directory
+      file:
+        path: /etc/paygress
+        state: directory
+        mode: '0755'
+
+    - name: Check if WireGuard config already exists
+      stat:
+        path: "/etc/wireguard/wg0.conf"
+      register: wg_config_exists
+      when: static_ip_enabled | default(false)
+
+    - name: Download static IP configuration with Cashu token
+      shell: |
+        curl -s \
+          -H "Authorization: Cashu {{ static_ip_cashu_token }}" \
+          -H "Accept: application/json" \
+          -H "User-Agent: Paygress-StaticIP-Client/1.0" \
+          "{{ static_ip_config_url }}" \
+          -o "/etc/wireguard/wg0.conf"
+      when: static_ip_enabled | default(false) and not wg_config_exists.stat.exists
+      ignore_errors: yes
+      register: static_ip_download_result
+
+    - name: Display message if config already exists
+      debug:
+        msg: "✅ WireGuard config already exists at /etc/wireguard/wg0.conf - skipping download"
+      when: static_ip_enabled | default(false) and wg_config_exists.stat.exists
+
+    - name: Set proper permissions on static IP config
+      file:
+        path: "/etc/wireguard/wg0.conf"
+        mode: '0600'
+        owner: root
+        group: root
+      when: static_ip_enabled | default(false)
+
+    - name: Create script to exclude Kubernetes networks from WireGuard routing
+      copy:
+        dest: /usr/local/bin/wg-exclude-k8s-networks.sh
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          # Wait for WireGuard to fully initialize its routing
+          sleep 5
+          
+          # Delete Kubernetes networks from WireGuard routing table if present
+          ip route del {{ pod_network_cidr }} table 51820 2>/dev/null || true
+          ip route del {{ service_network_cidr }} table 51820 2>/dev/null || true
+          
+          # Add route for Kubernetes service network through loopback
+          # This prevents the service network from going through WireGuard
+          ip route add {{ service_network_cidr }} dev lo 2>/dev/null || true
+          
+          # Flush routing cache to force re-evaluation
+          ip route flush cache
+          ip route flush table 51820 cache 2>/dev/null || true
+          
+          # Verify the service network route is in main table
+          if ! ip route show | grep -q "{{ service_network_cidr }}"; then
+            echo "Warning: Kubernetes service route not added to main table" >&2
+            exit 1
+          fi
+          
+          exit 0
+      when: static_ip_enabled | default(false)
+
+    - name: Create systemd service to run after WireGuard starts
+      copy:
+        dest: /etc/systemd/system/wg-exclude-k8s.service
+        content: |
+          [Unit]
+          Description=Exclude Kubernetes networks from WireGuard routing
+          After=wg-quick@wg0.service
+          Requires=wg-quick@wg0.service
+          
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/bin/wg-exclude-k8s-networks.sh
+          RemainAfterExit=yes
+          Restart=on-failure
+          RestartSec=10
+          
+          [Install]
+          WantedBy=multi-user.target
+      when: static_ip_enabled | default(false)
+      register: wg_exclude_service_created
+
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+      when: static_ip_enabled | default(false) and wg_exclude_service_created.changed
+
+    - name: Enable the WireGuard K8s exclusion service
+      systemd:
+        name: wg-exclude-k8s
+        enabled: yes
+      when: static_ip_enabled | default(false)
+
+    - name: Restart WireGuard to apply changes
+      systemd:
+        name: wg-quick@wg0
+        state: restarted
+      when: static_ip_enabled | default(false) and wg_exclude_service_created.changed
+      ignore_errors: yes
+
+    - name: Wait for WireGuard to initialize
+      pause:
+        seconds: 3
+      when: static_ip_enabled | default(false) and wg_exclude_service_created.changed
+
+    - name: Start the WireGuard K8s exclusion service
+      systemd:
+        name: wg-exclude-k8s
+        state: started
+      when: static_ip_enabled | default(false)
+      ignore_errors: yes
+
+    - name: Wait for route exclusion to complete
+      pause:
+        seconds: 2
+      when: static_ip_enabled | default(false)
+
+    - name: Create persistent route configuration for Kubernetes service network
+      copy:
+        dest: /etc/systemd/network/10-k8s-service-route.network
+        content: |
+          [Match]
+          Name=lo
+          
+          [Route]
+          Destination={{ service_network_cidr }}
+      when: static_ip_enabled | default(false)
+      register: k8s_route_config
+
+    - name: Restart systemd-networkd if route config changed
+      systemd:
+        name: systemd-networkd
+        state: restarted
+      when: static_ip_enabled | default(false) and k8s_route_config.changed
+      ignore_errors: yes
+
+    - name: Verify Kubernetes networks are excluded from WireGuard routing
+      shell: |
+        if ip route show table 51820 | grep -E "{{ pod_network_cidr }}|{{ service_network_cidr }}"; then
+          echo "FAILED - Kubernetes networks still in WireGuard routing table"
+          exit 1
+        else
+          echo "SUCCESS - Kubernetes networks excluded from WireGuard routing"
+          exit 0
+        fi
+      when: static_ip_enabled | default(false)
+      register: wg_route_verification
+      ignore_errors: yes
+
+    - name: Display WireGuard route verification result
+      debug:
+        msg: "{{ wg_route_verification.stdout }}"
+      when: static_ip_enabled | default(false) and wg_route_verification.stdout is defined
+
+    - name: Validate downloaded config is not HTML
+      shell: |
+        if [ -f "/etc/wireguard/wg0.conf" ]; then
+          if grep -q "<html>" "/etc/wireguard/wg0.conf"; then
+            echo "INVALID"
+          elif grep -q "\[Interface\]" "/etc/wireguard/wg0.conf"; then
+            echo "VALID"
+          else
+            echo "INVALID"
+          fi
+        else
+          echo "MISSING"
+        fi
+      when: static_ip_enabled | default(false)
+      register: config_validation
+      ignore_errors: yes
+
+    - name: Display config validation result
+      debug:
+        msg: "Static IP config validation: {{ config_validation.stdout }}"
+      when: static_ip_enabled | default(false)
+
+    - name: Extract VPN IP and port range from configuration
+      shell: |
+        if [ -f "/etc/wireguard/wg0.conf" ]; then
+          # Extract VPN IP from Address field (e.g., 10.254.11.1/30 -> 10.254.11.1)
+          vpn_ip=$(grep -E "^Address\s*=" "/etc/wireguard/wg0.conf" | head -1 | sed 's/.*=\s*//' | sed 's/\/.*//' | tr -d ' ')
+          
+          # Try to extract port range from comments (e.g., "# Public Ports: PUBLIC_IP:11000-11999")
+          port_range_comment=$(grep -E "^#.*Public Ports:.*:[0-9]+-[0-9]+" "/etc/wireguard/wg0.conf" | head -1)
+          
+          if [ -n "$port_range_comment" ]; then
+            # Extract port range from comment: "PUBLIC_IP:11000-11999" -> "11000-11999"
+            port_range=$(echo "$port_range_comment" | sed -E 's/.*:([0-9]+-[0-9]+).*/\1/')
+            port_start=$(echo "$port_range" | cut -d'-' -f1)
+            port_end=$(echo "$port_range" | cut -d'-' -f2)
+          else
+            # Fallback: Calculate from VPN IP third octet
+            # Extract the third octet from the VPN IP (e.g., 10.254.11.1 -> 11)
+            third_octet=$(echo "$vpn_ip" | cut -d'.' -f3)
+            port_start="${third_octet}000"
+            port_end="${third_octet}999"
+          fi
+          
+          echo "VPN_IP:$vpn_ip"
+          echo "PORT_START:$port_start"
+          echo "PORT_END:$port_end"
+        else
+          echo "VPN_IP:{{ public_ip }}"
+          echo "PORT_START:{{ ssh_port_start }}"
+          echo "PORT_END:{{ ssh_port_end }}"
+        fi
+      when: static_ip_enabled | default(false) and config_validation.stdout == "VALID"
+      register: extracted_vpn_config
+      ignore_errors: yes
+
+    - name: Parse extracted VPN configuration
+      set_fact:
+        extracted_static_ip: "{{ extracted_vpn_config.stdout | regex_search('VPN_IP:([^\\n]+)', '\\1') | first }}"
+        extracted_ssh_port_start: "{{ extracted_vpn_config.stdout | regex_search('PORT_START:([^\\n]+)', '\\1') | first }}"
+        extracted_ssh_port_end: "{{ extracted_vpn_config.stdout | regex_search('PORT_END:([^\\n]+)', '\\1') | first }}"
+      when: static_ip_enabled | default(false) and config_validation.stdout == "VALID" and extracted_vpn_config.stdout is defined
+
+    - name: Extract public IP from WireGuard Endpoint
+      shell: |
+        if [ -f "/etc/wireguard/wg0.conf" ]; then
+          # Extract public IP from Endpoint field (e.g., PUBLIC_IP:51820 -> PUBLIC_IP)
+          grep -E "^Endpoint\s*=" "/etc/wireguard/wg0.conf" | head -1 | sed 's/.*=\s*//' | sed 's/:.*//' | tr -d ' '
+        else
+          echo "{{ public_ip }}"
+        fi
+      when: static_ip_enabled | default(false) and config_validation.stdout == "VALID"
+      register: extracted_public_ip
+      ignore_errors: yes
+
+    - name: Display static IP download result
+      debug:
+        msg: "{{ static_ip_download_result.stdout_lines }}"
+      when: static_ip_enabled | default(false) and static_ip_download_result is defined and not static_ip_download_result.skipped | default(false)
+
+    - name: Check if WireGuard interface is already running
+      shell: wg show wg0 2>/dev/null
+      register: wg_interface_check
+      when: static_ip_enabled | default(false) and config_validation.stdout == "VALID"
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Start static IP interface
+      shell: |
+        wg-quick up wg0
+      when: static_ip_enabled | default(false) and config_validation.stdout == "VALID" and wg_interface_check.rc != 0
+      ignore_errors: yes
+      register: static_ip_start_result
+
+    - name: Display message if interface already running
+      debug:
+        msg: "✅ WireGuard interface wg0 already running - skipping startup"
+      when: static_ip_enabled | default(false) and config_validation.stdout == "VALID" and wg_interface_check.rc == 0
+
+    - name: Check systemd status for wg-quick
+      shell: systemctl is-active wg-quick@wg0 || echo "not-active"
+      register: wg_systemd_status
+      when: static_ip_enabled | default(false) and config_validation.stdout == "VALID"
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Enable static IP interface on boot
+      systemd:
+        name: "wg-quick@wg0"
+        enabled: yes
+      when: static_ip_enabled | default(false) and config_validation.stdout == "VALID"
+      ignore_errors: yes
+
+    - name: Display WireGuard status
+      debug:
+        msg: "WireGuard interface status: {{ wg_systemd_status.stdout if wg_systemd_status.stdout is defined else 'unknown' }}"
+      when: static_ip_enabled | default(false)
+
+    - name: Save extracted configuration to files
+      shell: |
+        echo "{{ extracted_public_ip.stdout | default(public_ip) }}" > /etc/paygress/static_ip
+        echo "{{ extracted_public_ip.stdout | default(public_ip) }}" > /etc/paygress/public_ip
+        echo "{{ extracted_ssh_port_start | default(ssh_port_start) }}" > /etc/paygress/ssh_port_start
+        echo "{{ extracted_ssh_port_end | default(ssh_port_end) }}" > /etc/paygress/ssh_port_end
+        chmod 644 /etc/paygress/*
+      when: static_ip_enabled | default(false) and config_validation.stdout == "VALID" and extracted_public_ip.stdout is defined
+      ignore_errors: yes
+
+    - name: Set facts from extracted configuration (enabled and valid)
+      set_fact:
+        static_ip: "{{ extracted_public_ip.stdout | default(public_ip) }}"
+        public_ip: "{{ extracted_public_ip.stdout | default(public_ip) }}"
+        ssh_port_start: "{{ extracted_ssh_port_start | default(ssh_port_start) }}"
+        ssh_port_end: "{{ extracted_ssh_port_end | default(ssh_port_end) }}"
+      when: static_ip_enabled | default(false) and config_validation.stdout == "VALID"
+
+    - name: Display final IP configuration
+      debug:
+        msg: |
+          ========================================
+          IP Configuration Summary
+          ========================================
+          Static IP (WireGuard VPN): {{ static_ip }}
+            └─ Use this for pod SSH access via VPN
+          Public IP (Your Network): {{ public_ip }}
+            └─ Use this for machine SSH access (requires port forwarding)
+          SSH Port Range: {{ ssh_port_start }}-{{ ssh_port_end }}
+          ========================================
+      when: static_ip_enabled | default(false)
+
+    - name: Set facts from inventory (disabled or invalid config)
+      set_fact:
+        static_ip: "{{ public_ip }}"
+      when: not (static_ip_enabled | default(false)) or (static_ip_enabled | default(false) and config_validation.stdout != "VALID")
+
+    - name: Warn if static IP config is invalid
+      debug:
+        msg: "⚠️  WARNING: Static IP config is invalid ({{ config_validation.stdout }}). Using inventory.ini values. Check your Cashu token or config URL."
+      when: static_ip_enabled | default(false) and config_validation.stdout != "VALID"
+
+    # ===============================
+    # Firewall Configuration
+    # ===============================
+    - name: Calculate SSH port based on range (start + 22)
+      set_fact:
+        machine_ssh_port: "{{ (ssh_port_start | int) + 22 }}"
+
+    - name: Display calculated SSH port
+      debug:
+        msg: "SSH port for machine access: {{ machine_ssh_port }}"
+
+    - name: Get current SSH port before changes
+      shell: grep "^Port " /etc/ssh/sshd_config | head -1 | awk '{print $2}' || echo "22"
+      register: current_ssh_port_firewall
+      changed_when: false
+
+    - name: Display current SSH port
+      debug:
+        msg: "Current SSH port: {{ current_ssh_port_firewall.stdout }}"
+
+    - name: Allow current SSH port in firewall (preserve existing access)
+      ufw:
+        rule: allow
+        port: "{{ current_ssh_port_firewall.stdout | trim }}"
+        proto: tcp
+        comment: "Current SSH port"
+      when: current_ssh_port_firewall.stdout != "" and current_ssh_port_firewall.stdout != machine_ssh_port
+
+    - name: Allow new SSH port in firewall
+      ufw:
+        rule: allow
+        port: "{{ machine_ssh_port }}"
+        proto: tcp
+        comment: "New SSH access to machine"
+
+    - name: Allow pod SSH port range in firewall
+      ufw:
+        rule: allow
+        port: "{{ ssh_port_start }}:{{ ssh_port_end }}"
+        proto: tcp
+        comment: "SSH access to Paygress pods"
+
+    - name: Allow HTTP port in firewall
+      ufw:
+        rule: allow
+        port: "{{ http_port }}"
+        proto: tcp
+        comment: "Paygress HTTP API"
+      when: enable_http | default(true)
+
+    - name: Allow Nginx HTTP port in firewall
+      ufw:
+        rule: allow
+        port: "{{ http_port }}"
+        proto: tcp
+        comment: "Nginx reverse proxy with L402 paywall on port {{ http_port }}"
+
+    - name: Allow WireGuard port in firewall
+      ufw:
+        rule: allow
+        port: "51820"
+        proto: udp
+        comment: "WireGuard VPN"
+      when: static_ip_enabled | default(false)
+
+    - name: Set default firewall policies
+      ufw:
+        direction: "{{ item.direction }}"
+        policy: "{{ item.policy }}"
+      loop:
+        - { direction: 'incoming', policy: 'deny' }
+        - { direction: 'outgoing', policy: 'allow' }
+
+    - name: Enable firewall
+      ufw:
+        state: enabled
+
+    - name: Display firewall status
+      shell: ufw status numbered
+      register: firewall_status
+      changed_when: false
+
+    - name: Show firewall rules
+      debug:
+        msg: "{{ firewall_status.stdout_lines }}"
+
+    - name: Backup SSH config before changes
+      copy:
+        src: /etc/ssh/sshd_config
+        dest: /etc/ssh/sshd_config.ansible_backup
+        remote_src: yes
+        backup: no
+
+    - name: Get current SSH port
+      shell: grep "^Port " /etc/ssh/sshd_config | head -1 | awk '{print $2}' || echo "22"
+      register: current_ssh_port
+      changed_when: false
+
+    - name: Set default SSH port if empty
+      set_fact:
+        current_ssh_port_fixed: "{{ current_ssh_port.stdout if current_ssh_port.stdout else '22' }}"
+
+    - name: Display current and new SSH ports
+      debug:
+        msg: "Current SSH port: {{ current_ssh_port.stdout }}, New SSH port: {{ machine_ssh_port }}"
+
+    - name: Remove all existing Port lines from SSH config
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^Port '
+        state: absent
+
+    - name: Configure SSH to listen on BOTH ports (safe migration)
+      blockinfile:
+        path: /etc/ssh/sshd_config
+        marker: "# {mark} ANSIBLE MANAGED SSH PORTS"
+        insertbefore: EOF
+        block: |
+          Port {{ current_ssh_port_fixed }}
+          Port {{ machine_ssh_port }}
+      register: ssh_dual_ports_configured
+
+    - name: Optimize SSH for faster connections
+      blockinfile:
+        path: /etc/ssh/sshd_config
+        marker: "# {mark} ANSIBLE MANAGED SSH OPTIMIZATIONS"
+        block: |
+          UseDNS no
+          GSSAPIAuthentication no
+        insertbefore: EOF
+
+    - name: Verify SSH config syntax
+      shell: sshd -t 2>&1
+      register: ssh_config_test
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Display SSH config test result
+      debug:
+        msg: "SSH config validation: {{ 'VALID ✅' if ssh_config_test.rc == 0 else 'INVALID ❌' }}"
+
+    - name: Show SSH config errors if invalid
+      debug:
+        msg: "{{ ssh_config_test.stderr_lines }}"
+      when: ssh_config_test.rc != 0
+
+    - name: Restore SSH config if invalid
+      copy:
+        src: /etc/ssh/sshd_config.ansible_backup
+        dest: /etc/ssh/sshd_config
+        remote_src: yes
+      when: ssh_config_test.rc != 0
+
+    - name: Check if SSH socket activation is enabled
+      shell: systemctl is-enabled ssh.socket 2>/dev/null || echo "disabled"
+      register: ssh_socket_status
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Display SSH socket status
+      debug:
+        msg: "SSH socket activation: {{ ssh_socket_status.stdout }}"
+
+    - name: Disable SSH socket activation first (prevents port conflicts)
+      systemd:
+        name: ssh.socket
+        enabled: no
+      when: ssh_socket_status.stdout != "disabled"
+      ignore_errors: yes
+
+    - name: Stop SSH socket if enabled
+      systemd:
+        name: ssh.socket
+        state: stopped
+      when: ssh_socket_status.stdout != "disabled"
+      ignore_errors: yes
+
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+      when: ssh_socket_status.stdout != "disabled"
+
+    - name: Restart SSH service to apply new ports (graceful reload)
+      shell: systemctl reload ssh 2>/dev/null || systemctl restart ssh
+      when: ssh_dual_ports_configured.changed or ssh_socket_status.stdout != "disabled"
+      ignore_errors: yes
+      changed_when: true
+      async: 1
+      poll: 0
+
+    - name: Ensure SSH is enabled and running
+      systemd:
+        name: ssh
+        enabled: yes
+        state: started
+
+    - name: Verify SSH is listening on correct port
+      shell: netstat -tlnp | grep :{{ machine_ssh_port }} || ss -tlnp | grep :{{ machine_ssh_port }}
+      register: ssh_listening
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Display SSH listening status
+      debug:
+        msg: "{{ ssh_listening.stdout_lines }}"
+      when: ssh_listening.stdout != ""
+
+    - name: Test SSH is listening on the machine
+      shell: |
+        ss -tlnp | grep :{{ machine_ssh_port }} && echo "LISTENING" || echo "NOT_LISTENING"
+      register: ssh_test_local
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Display SSH connectivity test
+      debug:
+        msg: |
+          ========================================
+          SSH Configuration Complete
+          ========================================
+          SSH is now listening on BOTH ports:
+            - Port {{ current_ssh_port.stdout }} (old port - STILL WORKS)
+            - Port {{ machine_ssh_port }} (new port - for Paygress)
+          
+          Status: {{ 'LISTENING ✅' if ssh_test_local.stdout is defined and 'LISTENING' in ssh_test_local.stdout else 'CHECK NEEDED' }}
+          
+          SSH Access Methods:
+          1. Local network:  ssh {{ paygress_user }}@{{ ansible_host }} -p {{ machine_ssh_port }}
+          2. Public IP:      ssh {{ paygress_user }}@{{ public_ip }} -p {{ machine_ssh_port }}
+          
+          Your current connection port ({{ current_ssh_port.stdout }}) still works:
+             ssh {{ paygress_user }}@{{ public_ip }} -p {{ current_ssh_port.stdout }}
 
     # ===============================
     # Docker Installation
@@ -90,6 +679,8 @@
           - kubeadm
           - kubectl
         state: present
+        update_cache: yes
+        force: yes
 
     - name: Hold Kubernetes packages
       dpkg_selections:
@@ -99,6 +690,64 @@
         - kubelet
         - kubeadm
         - kubectl
+
+    - name: Verify kubectl is actually installed
+      shell: dpkg -l | grep kubectl
+      register: kubectl_installed
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Display kubectl package info
+      debug:
+        msg: "{{ kubectl_installed.stdout_lines }}"
+
+    - name: Find kubectl binary
+      shell: |
+        if [ -f /usr/bin/kubectl ]; then
+          echo "/usr/bin/kubectl"
+        elif [ -f /snap/bin/kubectl ]; then
+          echo "/snap/bin/kubectl"
+        else
+          which kubectl 2>/dev/null || echo "NOT_FOUND"
+        fi
+      register: kubectl_location
+      changed_when: false
+
+    - name: Install kubectl via snap if apt failed
+      snap:
+        name: kubectl
+        classic: yes
+      when: kubectl_location.stdout == "NOT_FOUND"
+      ignore_errors: yes
+
+    - name: Find kubectl again after snap install
+      shell: |
+        if [ -f /usr/bin/kubectl ]; then
+          echo "/usr/bin/kubectl"
+        elif [ -f /snap/bin/kubectl ]; then
+          echo "/snap/bin/kubectl"
+        else
+          echo "/usr/bin/kubectl"
+        fi
+      register: kubectl_location_final
+      changed_when: false
+
+    - name: Set kubectl path fact
+      set_fact:
+        kubectl_path: "{{ kubectl_location_final.stdout }}"
+
+    - name: Display final kubectl location
+      debug:
+        msg: "kubectl will be used from: {{ kubectl_path }}"
+
+    - name: Ensure kubectl is in PATH
+      file:
+        src: "{{ kubectl_path }}"
+        dest: /usr/local/bin/kubectl
+        state: link
+        force: yes
+      when: kubectl_path != "NOT_FOUND"
+      ignore_errors: yes
 
     # ===============================
     # Configure containerd
@@ -122,6 +771,93 @@
         name: containerd
         state: restarted
         enabled: yes
+
+    # ===============================
+    # Configure Firewall (Before Kubernetes)
+    # ===============================
+    - name: Install ufw
+      apt:
+        name: ufw
+        state: present
+
+    - name: Allow SSH
+      ufw:
+        rule: allow
+        port: '{{ ansible_ssh_port | default(22) }}'
+        proto: tcp
+
+    - name: Allow Kubernetes API
+      ufw:
+        rule: allow
+        port: '6443'
+        proto: tcp
+
+    - name: Allow pod network to communicate with API server
+      ufw:
+        rule: allow
+        from_ip: "{{ pod_network_cidr }}"
+        comment: "Pod network access"
+
+    - name: Allow pod network to access service network
+      ufw:
+        rule: allow
+        from_ip: "{{ pod_network_cidr }}"
+        to_ip: "{{ service_network_cidr }}"
+        comment: "Pod to service network (API server)"
+
+    - name: Allow pod network traffic
+      ufw:
+        rule: allow
+        from_ip: "{{ pod_network_cidr }}"
+        to_ip: "{{ pod_network_cidr }}"
+        comment: "Pod-to-pod communication"
+
+    - name: Configure UFW to allow Kubernetes forwarding (pod network)
+      blockinfile:
+        path: /etc/ufw/before.rules
+        marker: "# {mark} ANSIBLE MANAGED - Kubernetes pod network forwarding"
+        insertafter: "^\\*filter"
+        block: |
+          # Allow Kubernetes pod network forwarding
+          -A ufw-before-forward -s {{ pod_network_cidr }} -j ACCEPT
+          -A ufw-before-forward -d {{ pod_network_cidr }} -j ACCEPT
+          # Allow Kubernetes service network forwarding
+          -A ufw-before-forward -s {{ service_network_cidr }} -j ACCEPT
+          -A ufw-before-forward -d {{ service_network_cidr }} -j ACCEPT
+      register: ufw_before_rules_updated
+
+    - name: Add iptables FORWARD rules for Kubernetes networking
+      shell: |
+        iptables -C FORWARD -s {{ pod_network_cidr }} -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -s {{ pod_network_cidr }} -j ACCEPT
+        iptables -C FORWARD -d {{ pod_network_cidr }} -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -d {{ pod_network_cidr }} -j ACCEPT
+        iptables -C FORWARD -s {{ service_network_cidr }} -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -s {{ service_network_cidr }} -j ACCEPT
+        iptables -C FORWARD -d {{ service_network_cidr }} -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -d {{ service_network_cidr }} -j ACCEPT
+      ignore_errors: yes
+
+    - name: Reload UFW if rules were updated
+      shell: ufw reload
+      when: ufw_before_rules_updated.changed
+
+    - name: Allow NodePort range
+      ufw:
+        rule: allow
+        port: '30000:32767'
+        proto: tcp
+
+    - name: Allow Paygress SSH pods
+      ufw:
+        rule: allow
+        port: '{{ ssh_port_start }}:{{ ssh_port_end }}'
+        proto: tcp
+
+    - name: Allow all traffic from localhost
+      ufw:
+        rule: allow
+        from_ip: '127.0.0.1'
+
+    - name: Enable firewall
+      ufw:
+        state: enabled
 
     # ===============================
     # Kubernetes Cluster Setup
@@ -160,10 +896,31 @@
     - name: Apply sysctl settings
       shell: sysctl --system
 
+    # ===============================
+    # Ensure Kubernetes Services are Running
+    # ===============================
+    - name: Ensure containerd is running
+      systemd:
+        name: containerd
+        state: started
+        enabled: yes
+
+    - name: Ensure kubelet is running
+      systemd:
+        name: kubelet
+        state: started
+        enabled: yes
+
+    - name: Check if Kubernetes is already initialized
+      stat:
+        path: /etc/kubernetes/manifests/kube-apiserver.yaml
+      register: k8s_initialized
+
     - name: Initialize Kubernetes cluster
       shell: |
-        kubeadm init --pod-network-cidr=10.244.0.0/16 --apiserver-advertise-address={{ public_ip }} || true
+        kubeadm init --pod-network-cidr={{ pod_network_cidr }} --ignore-preflight-errors=Port-6443
       register: kubeadm_init
+      when: not k8s_initialized.stat.exists
       ignore_errors: yes
 
     - name: Create .kube directory
@@ -173,6 +930,11 @@
         owner: "{{ paygress_user }}"
         group: "{{ paygress_user }}"
 
+    - name: Check if kubeconfig exists
+      stat:
+        path: /etc/kubernetes/admin.conf
+      register: kubeconfig_check
+
     - name: Copy kubeconfig
       copy:
         src: /etc/kubernetes/admin.conf
@@ -180,17 +942,512 @@
         owner: "{{ paygress_user }}"
         group: "{{ paygress_user }}"
         remote_src: yes
+      when: kubeconfig_check.stat.exists
 
     # ===============================
     # Install CNI (Flannel)
     # ===============================
+    - name: Check if API server is accessible
+      shell: "{{ kubectl_path }} cluster-info --request-timeout=3s 2>/dev/null || echo 'API not accessible'"
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: api_check
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Reset Kubernetes if API not accessible
+      shell: |
+        kubeadm reset --force
+        rm -rf /etc/cni/net.d
+        rm -rf $HOME/.kube
+        iptables -F && iptables -t nat -F && iptables -t mangle -F && iptables -X
+      when: api_check.rc != 0
+      ignore_errors: yes
+
+    - name: Wait after reset
+      pause:
+        seconds: 5
+      when: api_check.rc != 0
+
+    - name: Reinitialize Kubernetes cluster if needed
+      shell: |
+        kubeadm init --pod-network-cidr={{ pod_network_cidr }} --ignore-preflight-errors=Port-6443
+      when: api_check.rc != 0
+      register: kubeadm_reinit
+      ignore_errors: yes
+
+    - name: Display reinit result
+      debug:
+        msg: "{{ kubeadm_reinit.stdout_lines }}"
+      when: api_check.rc != 0 and kubeadm_reinit is defined and not kubeadm_reinit.skipped | default(false)
+
+    - name: Recreate .kube directory if needed
+      file:
+        path: "/home/{{ paygress_user }}/.kube"
+        state: directory
+        owner: "{{ paygress_user }}"
+        group: "{{ paygress_user }}"
+      when: api_check.rc != 0
+
+    - name: Copy kubeconfig if reinitialized
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: "/home/{{ paygress_user }}/.kube/config"
+        owner: "{{ paygress_user }}"
+        group: "{{ paygress_user }}"
+        remote_src: yes
+      when: api_check.rc != 0 and kubeconfig_check.stat.exists
+
+    - name: Wait for API server after reset
+      shell: "{{ kubectl_path }} cluster-info --request-timeout=5s"
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: api_ready
+      retries: 12
+      delay: 10
+      until: api_ready.rc == 0
+      ignore_errors: yes
+      when: api_check.rc != 0
+
+    - name: Clean up old CNI configs before Flannel install
+      shell: |
+        rm -rf /etc/cni/net.d/*
+        rm -rf /run/flannel
+        rm -rf /var/lib/cni
+      ignore_errors: yes
+
+    - name: Ensure /run/flannel directory exists
+      file:
+        path: /run/flannel
+        state: directory
+        mode: '0755'
+
+    - name: Delete existing Flannel installation if present
+      shell: "{{ kubectl_path }} delete -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml"
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      ignore_errors: yes
+
+    - name: Wait for Flannel cleanup
+      pause:
+        seconds: 10
+
+    - name: Add route for Kubernetes service network to prevent WireGuard routing
+      shell: |
+        # Remove any existing route
+        ip route del {{ service_network_cidr }} 2>/dev/null || true
+        # Add route through loopback device
+        ip route add {{ service_network_cidr }} dev lo
+        # Flush cache
+        ip route flush cache
+      ignore_errors: yes
+      when: static_ip_enabled | default(false)
+
+    - name: Verify Kubernetes service network route
+      shell: "ip route show | grep '{{ service_network_cidr }}'"
+      register: k8s_service_route
+      ignore_errors: yes
+
+    - name: Display Kubernetes service network route
+      debug:
+        msg: "Kubernetes service network route: {{ k8s_service_route.stdout }}"
+      when: k8s_service_route.rc == 0
+
     - name: Install Flannel CNI
-      become_user: "{{ paygress_user }}"
-      shell: kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+      shell: "{{ kubectl_path }} apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml"
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: flannel_install
+      retries: 3
+      delay: 10
+      until: flannel_install.rc == 0
+
+    - name: Wait for Flannel DaemonSet to be created
+      shell: "{{ kubectl_path }} get daemonset -n kube-flannel kube-flannel-ds 2>/dev/null"
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: flannel_ds
+      retries: 12
+      delay: 5
+      until: flannel_ds.rc == 0
+      ignore_errors: yes
+
+    - name: Wait for Flannel pods to be ready
+      shell: "{{ kubectl_path }} wait --for=condition=ready pod -l app=flannel -n kube-flannel --timeout=120s"
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: flannel_ready
+      retries: 3
+      delay: 10
+      until: flannel_ready.rc == 0
+      ignore_errors: yes
+
+    - name: Verify Flannel subnet.env file exists
+      stat:
+        path: /run/flannel/subnet.env
+      register: flannel_subnet_file
+
+    - name: Display Flannel status
+      debug:
+        msg: "Flannel subnet.env exists: {{ flannel_subnet_file.stat.exists }}"
+
+    - name: Restart kubelet if Flannel file missing
+      systemd:
+        name: kubelet
+        state: restarted
+      when: not flannel_subnet_file.stat.exists
+
+    - name: Wait for Flannel after kubelet restart
+      pause:
+        seconds: 15
+      when: not flannel_subnet_file.stat.exists
 
     - name: Remove taint from control-plane (single node setup)
-      become_user: "{{ paygress_user }}"
-      shell: kubectl taint nodes --all node-role.kubernetes.io/control-plane- || true
+      shell: "{{ kubectl_path }} taint nodes --all node-role.kubernetes.io/control-plane- || true"
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      ignore_errors: yes
+
+    # ===============================
+    # Install Nginx 1.28.0+ for ngx_l402 compatibility
+    # ===============================
+    - name: Gather installed packages
+      package_facts:
+        manager: apt
+      become: yes
+
+    - name: Set current nginx version fact
+      set_fact:
+        nginx_current_version: "{{ (ansible_facts.packages['nginx'][0].version) if ('nginx' in ansible_facts.packages) else '' }}"
+
+    - name: Remove old nginx installation
+      systemd:
+        name: nginx
+        state: stopped
+        enabled: no
+      become: yes
+      ignore_errors: yes
+
+    - name: Remove old nginx packages
+      apt:
+        name:
+          - nginx
+          - nginx-common
+          - nginx-core
+        state: absent
+        purge: yes
+      become: yes
+      ignore_errors: yes
+
+    - name: Install prerequisites for nginx repository
+      apt:
+        name:
+          - curl
+          - gnupg2
+          - ca-certificates
+          - lsb-release
+        state: present
+        update_cache: yes
+      become: yes
+
+    - name: Import nginx signing key
+      shell: curl -fsSL https://nginx.org/keys/nginx_signing.key | gpg --dearmor -o /usr/share/keyrings/nginx-archive-keyring.gpg
+      become: yes
+      args:
+        creates: /usr/share/keyrings/nginx-archive-keyring.gpg
+
+    - name: Add nginx repository
+      lineinfile:
+        path: /etc/apt/sources.list.d/nginx.list
+        line: "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] http://nginx.org/packages/ubuntu {{ ansible_distribution_release }} nginx"
+        create: yes
+        mode: '0644'
+      become: yes
+
+    - name: Pin nginx repository to version 1.28.0
+      copy:
+        content: |
+          Package: nginx
+          Pin: version 1.28.0*
+          Pin-Priority: 1001
+          
+          Package: *
+          Pin: origin nginx.org
+          Pin-Priority: 900
+        dest: /etc/apt/preferences.d/99nginx
+        mode: '0644'
+      become: yes
+
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+      become: yes
+
+    - name: Install nginx 1.28.0 from official repository
+      apt:
+        name: nginx=1.28.0-1~{{ ansible_distribution_release }}
+        state: present
+        allow_downgrade: yes
+      become: yes
+
+    - name: Check if nginx is installed
+      command: which nginx
+      register: nginx_installed_check
+      changed_when: false
+      become: yes
+      ignore_errors: yes
+
+    - name: Verify nginx version is 1.28.0
+      command: nginx -v
+      register: nginx_version_check
+      changed_when: false
+      become: yes
+      when: nginx_installed_check.rc == 0
+
+    - name: Display nginx version
+      debug:
+        msg: "Installed nginx version: {{ nginx_version_check.stderr }}"
+      when: nginx_installed_check.rc == 0
+
+    - name: Fail if nginx is not installed
+      fail:
+        msg: "nginx installation failed. Please check the installation logs."
+      when: nginx_installed_check.rc != 0
+
+    - name: Fail if nginx version is not 1.28.0
+      fail:
+        msg: "nginx version must be 1.28.0 for L402 module compatibility. Current version: {{ nginx_version_check.stderr }}"
+      when: nginx_installed_check.rc == 0 and not nginx_version_check.stderr is search('1\\.28\\.0')
+
+    - name: Download ngx_l402 pre-built module
+      get_url:
+        url: https://github.com/DhananjayPurohit/ngx_l402/releases/download/v1.1.1/ngx_l402-1.1.1.tar.gz
+        dest: /tmp/ngx_l402-1.1.1.tar.gz
+        mode: '0644'
+      become: yes
+
+    - name: Extract ngx_l402 module
+      unarchive:
+        src: /tmp/ngx_l402-1.1.1.tar.gz
+        dest: /tmp/
+        remote_src: yes
+      become: yes
+
+    - name: Create nginx modules directory
+      file:
+        path: /etc/nginx/modules
+        state: directory
+        mode: '0755'
+
+    - name: Find and install prebuilt libngx_l402_lib.so
+      shell: |
+        SO_FILE=$(find /tmp -name "libngx_l402_lib.so" 2>/dev/null | head -1)
+        if [ -n "$SO_FILE" ]; then
+          cp "$SO_FILE" /etc/nginx/modules/libngx_l402_lib.so
+          chmod 755 /etc/nginx/modules/libngx_l402_lib.so
+          echo "Installed: $SO_FILE"
+        else
+          echo "ERROR: libngx_l402_lib.so not found in release"
+          exit 1
+        fi
+
+    - name: Remove any existing load_module lines for l402 (cleanup duplicates)
+      lineinfile:
+        path: /etc/nginx/nginx.conf
+        regexp: '^load_module.*l402.*'
+        state: absent
+
+    - name: Load ngx_l402 module as first line in nginx config
+      lineinfile:
+        path: /etc/nginx/nginx.conf
+        line: 'load_module /etc/nginx/modules/libngx_l402_lib.so;'
+        insertbefore: BOF
+        create: no
+
+    - name: Create nginx L402 environment config directory
+      file:
+        path: /etc/systemd/system/nginx.service.d
+        state: directory
+        mode: '0755'
+
+    - name: Remove old L402 environment config
+      file:
+        path: /etc/systemd/system/nginx.service.d/l402-environment.conf
+        state: absent
+
+    - name: Configure nginx L402 environment variables
+      copy:
+        content: |
+          [Service]
+          # Lightning Network Client Configuration
+          # Choose ONE of the following client types: LNURL, LND, CLN, or NWC
+          
+          # Option 1: LNURL
+          Environment=LN_CLIENT_TYPE={{ ln_client_type | default('LNURL') }}
+          Environment=LNURL_ADDRESS={{ lnurl_address | default('https://your-lnurl-server.com') }}
+          Environment=ROOT_KEY={{ l402_root_key | default('your-root-key-change-me') }}
+          
+          # Option 2: LND (uncomment if using)
+          # Environment=LN_CLIENT_TYPE=LND
+          # Environment=LND_ADDRESS={{ lnd_address | default('https://127.0.0.1:10009') }}
+          # Environment=MACAROON_FILE_PATH={{ lnd_macaroon_path | default('/path/to/admin.macaroon') }}
+          # Environment=CERT_FILE_PATH={{ lnd_cert_path | default('/path/to/tls.cert') }}
+          # Environment=ROOT_KEY={{ l402_root_key | default('your-root-key-change-me') }}
+          
+          # Option 3: CLN (uncomment if using)
+          # Environment=LN_CLIENT_TYPE=CLN
+          # Environment=CLN_LIGHTNING_RPC_FILE_PATH={{ cln_rpc_path | default('/path/to/lightning-rpc') }}
+          # Environment=ROOT_KEY={{ l402_root_key | default('your-root-key-change-me') }}
+          
+          # Option 4: NWC - Nostr Wallet Connect (uncomment if using)
+          # Environment=LN_CLIENT_TYPE=NWC
+          # Environment=NWC_URI={{ nwc_uri | default('nostr+walletconnect://pubkey?relay=relay_url&secret=secret') }}
+          # Environment=ROOT_KEY={{ l402_root_key | default('your-root-key-change-me') }}
+          
+          # Redis for dynamic pricing (optional)
+          Environment=REDIS_URL={{ redis_url | default('redis://127.0.0.1:6379') }}
+          
+          # Cashu Ecash Support
+          Environment=CASHU_ECASH_SUPPORT={{ cashu_ecash_support | default('true') }}
+          Environment=CASHU_DB_PATH={{ cashu_l402_db_path | default('/var/lib/nginx/cashu_tokens.db') }}
+          Environment=CASHU_WALLET_SECRET={{ cashu_l402_wallet_secret | default('CHANGE-ME-USE-openssl-rand-hex-32') }}
+          Environment=CASHU_WHITELISTED_MINTS={{ whitelisted_mints }}
+          
+          # Cashu automatic Lightning redemption
+          Environment=CASHU_REDEEM_ON_LIGHTNING={{ cashu_redeem_on_lightning | default('true') }}
+          Environment=CASHU_REDEMPTION_INTERVAL_SECS={{ cashu_redemption_interval | default('3600') }}
+          
+          # Cashu melt/redemption fee configuration
+          Environment=CASHU_MELT_MIN_BALANCE_SATS={{ cashu_melt_min_balance | default('10') }}
+          Environment=CASHU_MELT_FEE_RESERVE_PERCENT={{ cashu_melt_fee_percent | default('1') }}
+          Environment=CASHU_MELT_MIN_FEE_RESERVE_SATS={{ cashu_melt_min_fee | default('4') }}
+          Environment=CASHU_MAX_PROOFS_PER_MELT={{ cashu_max_proofs_per_melt | default('1000') }}
+          
+          # Cashu P2PK mode (optimized verification)
+          Environment=CASHU_P2PK_MODE={{ cashu_p2pk_mode | default('false') }}
+          Environment=CASHU_P2PK_PRIVATE_KEY={{ cashu_p2pk_private_key | default('CHANGE-ME-USE-openssl-rand-hex-32') }}
+          
+          # Logging
+          Environment=RUST_LOG={{ nginx_rust_log | default('info') }}
+        dest: /etc/systemd/system/nginx.service.d/l402-environment.conf
+        mode: '0644'
+
+    - name: Remove old paygress nginx config (sites-available)
+      file:
+        path: /etc/nginx/sites-available/paygress-l402
+        state: absent
+      ignore_errors: yes
+
+    - name: Remove old paygress nginx config (conf.d)
+      file:
+        path: /etc/nginx/conf.d/paygress-l402.conf
+        state: absent
+      ignore_errors: yes
+
+    - name: Create nginx reverse proxy configuration for Paygress
+      copy:
+        content: |
+          # Paygress HTTP API with L402 Paywall
+          upstream paygress_backend {
+              server 127.0.0.1:8080;
+          }
+
+          server {
+              listen {{ http_port }};
+              server_name _;
+
+              # Health check endpoint (no paywall)
+              location /health {
+                  proxy_pass http://paygress_backend;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Real-IP $remote_addr;
+              }
+
+              # Public read endpoint (no paywall)
+              location /offers {
+                  proxy_pass http://paygress_backend;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Real-IP $remote_addr;
+              }
+
+              # Paywalled endpoint: Spawn Pod
+              location /pods/spawn {
+                  # L402 Cashu payment enforcement
+                  l402 on;
+                  l402_amount_msat_default 6000;  # 6 sats minimum
+                  l402_macaroon_timeout 0;
+                  
+                  # Pass request to backend
+                  proxy_pass http://paygress_backend;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Real-IP $remote_addr;
+              }
+
+              # Paywalled endpoint: Topup Pod
+              location /pods/topup {
+                  # L402 Cashu payment enforcement
+                  l402 on;
+                  l402_amount_msat_default 6000;  # 100 sats minimum
+                  l402_macaroon_timeout 3600;
+                  
+                  # Pass request to backend
+                  proxy_pass http://paygress_backend;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Real-IP $remote_addr;
+              }
+
+              # Paywalled endpoint: Pod Status
+              # location /pods/status {
+              #     # L402 configuration (uncomment when ngx_l402 module is installed)
+              #     # l402 on;
+              #     # l402_price 100;  # Cheaper for status check
+              #     # l402_memo "Pod Status - Paygress";
+              #     # l402_invoice_expiry 3600;
+              #
+              #     proxy_pass http://paygress_backend;
+              #     proxy_set_header Host $host;
+              #     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              #     proxy_set_header X-Real-IP $remote_addr;
+              # }
+
+              # Default: proxy all other requests (no paywall for now)
+              location / {
+                  proxy_pass http://paygress_backend;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Real-IP $remote_addr;
+              }
+          }
+        dest: /etc/nginx/conf.d/paygress-l402.conf
+        mode: '0644'
+
+    - name: Remove default nginx config (if exists)
+      file:
+        path: /etc/nginx/conf.d/default.conf
+        state: absent
+      ignore_errors: yes
+
+    - name: Create SQLite database directory for Cashu tokens
+      file:
+        path: /var/lib/nginx
+        state: directory
+        owner: www-data
+        group: www-data
+        mode: '0755'
+
+    - name: Reload systemd daemon for nginx
+      systemd:
+        daemon_reload: yes
+
+    - name: Enable and restart nginx
+      systemd:
+        name: nginx
+        enabled: yes
+        state: restarted
 
     # ===============================
     # Install Rust
@@ -205,10 +1462,19 @@
       become_user: "{{ paygress_user }}"
       shell: /tmp/rust-installer.sh -y
 
+    - name: Ensure .bashrc exists
+      file:
+        path: "/home/{{ paygress_user }}/.bashrc"
+        state: touch
+        owner: "{{ paygress_user }}"
+        group: "{{ paygress_user }}"
+        mode: '0644'
+
     - name: Add Rust to PATH
       lineinfile:
         path: "/home/{{ paygress_user }}/.bashrc"
         line: 'export PATH="$HOME/.cargo/bin:$PATH"'
+        create: yes
 
     # ===============================
     # Clone and Setup Paygress
@@ -223,76 +1489,180 @@
       git:
         repo: https://github.com/DhananjayPurohit/paygress.git
         dest: "{{ paygress_dir }}"
-        version: feat/ansible-script-with-port
+        version: feat/nip04
+        force: yes
 
     - name: Create user-workloads namespace
-      become_user: "{{ paygress_user }}"
       shell: |
-        . ~/.cargo/env
-        kubectl create namespace user-workloads || true
+        {{ kubectl_path }} create namespace user-workloads || true
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
       args:
         chdir: "{{ paygress_dir }}"
+      ignore_errors: yes
 
     # ===============================
     # Configure Paygress Environment
     # ===============================
-    - name: Update paygress.env with server IP
+    - name: Copy .env.template to .env
+      become_user: "{{ paygress_user }}"
+      shell: "cp {{ paygress_dir }}/.env.template {{ paygress_dir }}/.env && chmod 600 {{ paygress_dir }}/.env"
+      args:
+        chdir: "{{ paygress_dir }}"
+
+    - name: Update .env with public IP for external SSH access
       become_user: "{{ paygress_user }}"
       replace:
-        path: "{{ paygress_dir }}/paygress.env"
+        path: "{{ paygress_dir }}/.env"
         regexp: 'SSH_HOST=.*'
         replace: 'SSH_HOST={{ public_ip }}'
+
+    - name: Configure main service - Enable MCP (calls HTTP internally)
+      become_user: "{{ paygress_user }}"
+      lineinfile:
+        path: "{{ paygress_dir }}/.env"
+        regexp: '^ENABLE_MCP=.*'
+        line: 'ENABLE_MCP=true'
+
+    - name: Configure main service - Enable HTTP (provides paywalled endpoints)
+      become_user: "{{ paygress_user }}"
+      lineinfile:
+        path: "{{ paygress_dir }}/.env"
+        regexp: '^ENABLE_HTTP=.*'
+        line: 'ENABLE_HTTP=true'
+
+    - name: Configure main service - HTTP Base URL for MCP
+      become_user: "{{ paygress_user }}"
+      lineinfile:
+        path: "{{ paygress_dir }}/.env"
+        regexp: '^HTTP_BASE_URL=.*'
+        line: 'HTTP_BASE_URL=http://localhost:8080'
+        create: yes
 
     - name: Update paygress.env with correct data path
       become_user: "{{ paygress_user }}"
       replace:
-        path: "{{ paygress_dir }}/paygress.env"
+        path: "{{ paygress_dir }}/.env"
         regexp: 'CASHU_DB_PATH=.*'
         replace: 'CASHU_DB_PATH={{ paygress_dir }}/data/cashu.db'
 
-    - name: Update paygress.env with Nostr relays
-      become_user: "{{ paygress_user }}"
-      replace:
-        path: "{{ paygress_dir }}/paygress.env"
-        regexp: 'NOSTR_RELAYS=.*'
-        replace: 'NOSTR_RELAYS={{ nostr_relays }}'
-
-    - name: Update paygress.env with Nostr private key
-      become_user: "{{ paygress_user }}"
-      replace:
-        path: "{{ paygress_dir }}/paygress.env"
-        regexp: 'NOSTR_PRIVATE_KEY=.*'
-        replace: 'NOSTR_PRIVATE_KEY={{ nostr_private_key }}'
 
     - name: Update paygress.env with whitelisted mints
       become_user: "{{ paygress_user }}"
       replace:
-        path: "{{ paygress_dir }}/paygress.env"
+        path: "{{ paygress_dir }}/.env"
         regexp: 'WHITELISTED_MINTS=.*'
         replace: 'WHITELISTED_MINTS={{ whitelisted_mints }}'
 
     - name: Update port range for production
       become_user: "{{ paygress_user }}"
       replace:
-        path: "{{ paygress_dir }}/paygress.env"
+        path: "{{ paygress_dir }}/.env"
         regexp: 'SSH_PORT_RANGE_START=.*'
         replace: 'SSH_PORT_RANGE_START={{ ssh_port_start }}'
 
     - name: Update port range end for production
       become_user: "{{ paygress_user }}"
       replace:
-        path: "{{ paygress_dir }}/paygress.env"
+        path: "{{ paygress_dir }}/.env"
         regexp: 'SSH_PORT_RANGE_END=.*'
         replace: 'SSH_PORT_RANGE_END={{ ssh_port_end }}'
+
+    - name: Update minimum pod duration configuration
+      become_user: "{{ paygress_user }}"
+      lineinfile:
+        path: "{{ paygress_dir }}/.env"
+        regexp: '^MINIMUM_POD_DURATION_SECONDS=.*'
+        line: 'MINIMUM_POD_DURATION_SECONDS={{ minimum_pod_duration_seconds }}'
+        create: yes
+
+
+    # ===============================
+    # Create separate .env for Context VM
+    # ===============================
+    - name: Create .env.contextvm for MCP-only service
+      become_user: "{{ paygress_user }}"
+      shell: "cp {{ paygress_dir }}/.env {{ paygress_dir }}/.env.contextvm && chmod 600 {{ paygress_dir }}/.env.contextvm"
+
+    - name: Configure Context VM - Enable ONLY MCP
+      become_user: "{{ paygress_user }}"
+      lineinfile:
+        path: "{{ paygress_dir }}/.env.contextvm"
+        regexp: '^ENABLE_MCP=.*'
+        line: 'ENABLE_MCP=true'
+
+    - name: Configure Context VM - Disable HTTP
+      become_user: "{{ paygress_user }}"
+      lineinfile:
+        path: "{{ paygress_dir }}/.env.contextvm"
+        regexp: '^ENABLE_HTTP=.*'
+        line: 'ENABLE_HTTP=false'
+
+    - name: Configure Context VM - HTTP Base URL (points to main service)
+      become_user: "{{ paygress_user }}"
+      lineinfile:
+        path: "{{ paygress_dir }}/.env.contextvm"
+        regexp: '^HTTP_BASE_URL=.*'
+        line: 'HTTP_BASE_URL=http://localhost:8080'
+        create: yes
+
+    - name: Configure Context VM - Disable logging (prevents JSON-RPC errors)
+      become_user: "{{ paygress_user }}"
+      lineinfile:
+        path: "{{ paygress_dir }}/.env.contextvm"
+        regexp: '^RUST_LOG=.*'
+        line: 'RUST_LOG=off'
+        create: yes
+
+    - name: Update .env.contextvm with public IP for external SSH access
+      become_user: "{{ paygress_user }}"
+      replace:
+        path: "{{ paygress_dir }}/.env.contextvm"
+        regexp: 'SSH_HOST=.*'
+        replace: 'SSH_HOST={{ public_ip }}'
+
+    - name: Fix Windows line endings in .env.contextvm
+      become_user: "{{ paygress_user }}"
+      shell: |
+        dos2unix {{ paygress_dir }}/.env.contextvm 2>/dev/null || sed -i 's/\r$//' {{ paygress_dir }}/.env.contextvm
+      ignore_errors: yes
+
+    - name: Update interface configuration - MCP
+      become_user: "{{ paygress_user }}"
+      replace:
+        path: "{{ paygress_dir }}/.env"
+        regexp: 'ENABLE_MCP=.*'
+        replace: 'ENABLE_MCP={{ enable_mcp }}'
+
+    - name: Update interface configuration - HTTP
+      become_user: "{{ paygress_user }}"
+      replace:
+        path: "{{ paygress_dir }}/.env"
+        regexp: 'ENABLE_HTTP=.*'
+        replace: 'ENABLE_HTTP={{ enable_http }}'
+
+    - name: Update HTTP port configuration
+      become_user: "{{ paygress_user }}"
+      replace:
+        path: "{{ paygress_dir }}/.env"
+        regexp: 'HTTP_PORT=.*'
+        replace: 'HTTP_PORT=8080'
+
+    - name: Update HTTP bind address configuration
+      become_user: "{{ paygress_user }}"
+      replace:
+        path: "{{ paygress_dir }}/.env"
+        regexp: 'HTTP_BIND_ADDR=.*'
+        replace: 'HTTP_BIND_ADDR=127.0.0.1:8080'
 
     # ===============================
     # Build and Deploy Paygress
     # ===============================
-    - name: Build paygress service
+    - name: Build unified paygress service
       become_user: "{{ paygress_user }}"
       shell: |
         . ~/.cargo/env
-        cargo build --release --bin paygress-sidecar
+        cargo build --release --bin paygress
       args:
         chdir: "{{ paygress_dir }}"
 
@@ -307,11 +1677,11 @@
         group: "{{ paygress_user }}"
         mode: '0755'
 
-    - name: Create paygress systemd service
+    - name: Create unified paygress systemd service
       copy:
         content: |
           [Unit]
-          Description=Paygress Nostr Encrypted Message Pod Provisioning Service
+          Description=Paygress Service (HTTP + MCP)
           After=network.target docker.service
           Requires=docker.service
 
@@ -320,17 +1690,18 @@
           User={{ paygress_user }}
           WorkingDirectory={{ paygress_dir }}
           ExecStartPre=/bin/mkdir -p {{ paygress_dir }}/data
-          ExecStart={{ paygress_dir }}/target/release/paygress-sidecar
+          ExecStart={{ paygress_dir }}/target/release/paygress
           Restart=always
           RestartSec=10
           Environment=PATH=/home/{{ paygress_user }}/.cargo/bin:/usr/local/bin:/usr/bin:/bin
 
           # Load environment variables
-          EnvironmentFile={{ paygress_dir }}/paygress.env
+          EnvironmentFile={{ paygress_dir }}/.env
 
           [Install]
           WantedBy=multi-user.target
         dest: /etc/systemd/system/paygress.service
+      notify: restart paygress
 
     - name: Reload systemd
       systemd:
@@ -340,41 +1711,9 @@
       systemd:
         name: paygress
         enabled: yes
+        state: started
 
-    # ===============================
-    # Configure Firewall
-    # ===============================
-    - name: Install ufw
-      apt:
-        name: ufw
-        state: present
 
-    - name: Configure firewall for SSH
-      ufw:
-        rule: allow
-        port: '22'
-        proto: tcp
-
-    - name: Configure firewall for Kubernetes API
-      ufw:
-        rule: allow
-        port: '6443'
-        proto: tcp
-
-    - name: Configure firewall for Paygress service and SSH pods
-      ufw:
-        rule: allow
-        port: '{{ ssh_port_start }}:{{ ssh_port_end }}'
-        proto: tcp
-
-    - name: Allow traffic from public IP
-      ufw:
-        rule: allow
-        src: '{{ public_ip }}'
-
-    - name: Enable firewall
-      ufw:
-        state: enabled
 
     # ===============================
     # Final Setup Instructions
@@ -385,31 +1724,350 @@
           #!/bin/bash
           echo "🎉 Paygress setup completed!"
           echo ""
-          echo "📋 Next steps:"
-          echo "1. Configure your settings in inventory.ini:"
-          echo "   - Set nostr_private_key to your actual private key"
-          echo "   - Verify nostr_relays and whitelisted_mints"
-          echo "   - Update public_ip with your server public IP"
-          echo "2. Re-run ansible-playbook ansible-setup.yml to apply changes"
-          echo "3. Start the service: sudo systemctl start paygress"
-          echo "4. Check service status: sudo systemctl status paygress"
-          echo "5. View logs: sudo journalctl -u paygress -f"
+          echo "=========================================="
+          echo "🚀 PAYGRESS SERVICE ARCHITECTURE"
+          echo "=========================================="
           echo ""
-          echo "🌐 Service is running in Nostr mode:"
-          echo "   - Listen for NIP-17 encrypted messages on configured relays"
-          echo "   - Service public key available in logs: sudo journalctl -u paygress -f"
+          echo "📊 **Service:** paygress.service"
+          echo "   - Interfaces: HTTP + MCP"
+          echo "   - Architecture: MCP → HTTP (L402 Paywall)"
+          echo "   - Status: sudo systemctl status paygress"
+          echo "   - Logs:   sudo journalctl -u paygress -f"
+          echo "   - Config: {{ paygress_dir }}/.env"
           echo ""
-          echo "🔐 SSH pods will be accessible at:"
-          echo "   ssh user@{{ public_ip }} -p <allocated-port>"
+          echo "=========================================="
+          echo "🌐 HTTP API Endpoints"
+          echo "=========================================="
+          echo "   - Health check: http://{{ public_ip }}:{{ http_port }}/health"
+          echo "   - Get offers: http://{{ public_ip }}:{{ http_port }}/offers"
+          echo "   - Get pod status: POST http://{{ public_ip }}:{{ http_port }}/pods/status"
+          echo "   - Spawn pod: POST http://{{ public_ip }}:{{ http_port }}/pods/spawn"
+          echo "   - Topup pod: POST http://{{ public_ip }}:{{ http_port }}/pods/topup"
           echo ""
-          echo "📁 Paygress directory: {{ paygress_dir }}"
-          echo "⚙️  Configuration file: {{ paygress_dir }}/paygress.env"
+          echo "   ⚡ Nginx reverse proxy configured (L402 paywall ready)"
+          echo "   📝 L402 environment: /etc/systemd/system/nginx.service.d/l402-environment.conf"
+          echo "   📝 Nginx config: /etc/nginx/sites-available/paygress-l402"
+          echo "   💡 To enable L402 paywall, install ngx_l402 module and uncomment location blocks"
+          echo ""
+          echo "=========================================="
+          echo "🤖 MCP Interface (Model Context Protocol)"
+          echo "=========================================="
+          echo "   - MCP server calls HTTP endpoints internally"
+          echo "   - Supports L402 paywalled endpoints"
+          echo "   - Available tools: spawn_pod, topup_pod, get_offers, get_pod_status"
+          echo "   - HTTP Base URL: http://localhost:8080"
+          echo ""
+          echo "=========================================="
+          echo "🌐 Context VM Gateway Service"
+          echo "=========================================="
+          echo "   - Service: contextvm.service"
+          echo "   - Status: sudo systemctl status contextvm"
+          echo "   - Logs:   sudo journalctl -u contextvm -f"
+          echo "   - Relays: wss://relay.contextvm.org"
+          echo "   - Enables: Paygress MCP server via Nostr relay"
+          echo "   - Installation: gateway-cli installed via GitHub install script"
+          echo "   - Start:  sudo systemctl start contextvm"
+          echo "   - Troubleshoot: If service fails, check logs above or reinstall:"
+          echo "     curl -fsSL https://raw.githubusercontent.com/contextvm/gateway-cli/main/install.sh | bash"
+          echo ""
+          echo "=========================================="
+          echo "🔧 Management Commands"
+          echo "=========================================="
+          echo "   Restart service:       sudo systemctl restart paygress"
+          echo "   Stop service:          sudo systemctl stop paygress"
+          echo "   Start service:         sudo systemctl start paygress"
+          echo "   View logs:             sudo journalctl -u paygress -f"
+          echo "   Firewall status:       sudo ufw status"
+          echo ""
+          echo "=========================================="
+          echo "🔥 Firewall Configuration"
+          echo "=========================================="
+          echo "   Open ports:"
+          echo "   - {{ machine_ssh_port }}/tcp    (Machine SSH)"
+          echo "   - {{ ssh_port_start }}-{{ ssh_port_end }}/tcp  (Pod SSH range)"
+          echo "   - 80/tcp         (Nginx reverse proxy with L402)"
+          {% if enable_http | default(true) %}
+          echo "   - {{ http_port }}/tcp      (Backend HTTP API)"
+          {% endif %}
+          {% if static_ip_enabled | default(false) %}
+          echo "   - 51820/udp      (WireGuard VPN)"
+          {% endif %}
+          echo ""
+          {% if static_ip_enabled | default(false) %}
+          echo "=========================================="
+          echo "🌐 Static IP Configuration"
+          echo "=========================================="
+          echo "   - Static IP enabled: YES"
+          echo "   - Static IP: {{ static_ip }}"
+          echo "   - Public IP: {{ public_ip }}"
+          echo "   - SSH Port Range: {{ ssh_port_start }}-{{ ssh_port_end }}"
+          echo "   - Interface: wg0"
+          echo "   - Config: /etc/wireguard/wg0.conf"
+          echo "   - Status: sudo wg show"
+          echo "   - Restart: sudo systemctl restart wg-quick@wg0"
+          echo ""
+          echo "=========================================="
+          echo "🔐 SSH Access"
+          echo "=========================================="
+          echo "   Machine SSH (LOCAL NETWORK):"
+          echo "      ssh {{ paygress_user }}@{{ ansible_host }} -p {{ machine_ssh_port }}"
+          echo ""
+          echo "   Machine SSH (PUBLIC - requires port forwarding):"
+          echo "      ssh {{ paygress_user }}@{{ public_ip }} -p {{ machine_ssh_port }}"
+          echo "      ⚠️  You need to configure port forwarding on your router:"
+          echo "         {{ public_ip }}:{{ machine_ssh_port }} → {{ ansible_host }}:{{ machine_ssh_port }}"
+          echo ""
+          echo "   Pod SSH (via static IP):"
+          echo "      ssh user@{{ static_ip }} -p <allocated-port>"
+          echo "      Port range: {{ ssh_port_start }}-{{ ssh_port_end }}"
+          {% else %}
+          echo "=========================================="
+          echo "🔐 SSH Access"
+          echo "=========================================="
+          echo "   Machine SSH (LOCAL NETWORK):"
+          echo "      ssh {{ paygress_user }}@{{ ansible_host }} -p {{ machine_ssh_port }}"
+          echo ""
+          echo "   Machine SSH (PUBLIC - requires port forwarding):"
+          echo "      ssh {{ paygress_user }}@{{ public_ip }} -p {{ machine_ssh_port }}"
+          echo "      ⚠️  You need to configure port forwarding on your router:"
+          echo "         {{ public_ip }}:{{ machine_ssh_port }} → {{ ansible_host }}:{{ machine_ssh_port }}"
+          echo ""
+          echo "   Pod SSH (via public IP - requires port forwarding):"
+          echo "      ssh user@{{ public_ip }} -p <allocated-port>"
+          echo "      Port range: {{ ssh_port_start }}-{{ ssh_port_end }}"
+          echo "      ⚠️  Forward ports {{ ssh_port_start }}-{{ ssh_port_end }} to {{ ansible_host }}"
+          {% endif %}
+          echo ""
+          echo "📁 Files:"
+          echo "   - Paygress directory: {{ paygress_dir }}"
+          echo "   - Main config:        {{ paygress_dir }}/.env"
+          echo "   - Context VM config:  {{ paygress_dir }}/.env.contextvm"
+          echo "   - Pod specs:          {{ paygress_dir }}/pod-specs.json"
+          {% if static_ip_enabled | default(false) %}
+          echo "   - Static IP config:   /etc/wireguard/wg0.conf"
+          echo "   - Extracted values:   /etc/paygress/ (static_ip, public_ip, ssh_port_start, ssh_port_end)"
+          {% endif %}
+          echo ""
         dest: "/home/{{ paygress_user }}/setup-complete.sh"
         mode: '0755'
         owner: "{{ paygress_user }}"
         group: "{{ paygress_user }}"
 
+    # ===============================
+    # Context VM Gateway Setup
+    # ===============================
+    - name: Install Node.js and npm (for gateway-cli)
+      apt:
+        name:
+          - nodejs
+          - npm
+        state: present
+
+    - name: Verify Node.js installation
+      command: node --version
+      register: node_version
+      ignore_errors: yes
+      
+    - name: Display Node.js version
+      debug:
+        msg: "Node.js version: {{ node_version.stdout }}"
+    
+    - name: Install gateway-cli using GitHub install script
+      become: yes
+      shell: |
+        set -e
+        
+        # Check if already installed
+        if command -v gateway-cli &> /dev/null; then
+          echo "gateway-cli already installed"
+          gateway-cli --version
+          exit 0
+        fi
+        
+        # Download and run the official install script (installs to /usr/local/bin)
+        echo "Installing gateway-cli..."
+        curl -fsSL https://raw.githubusercontent.com/contextvm/gateway-cli/main/install.sh | bash
+        
+        # Verify installation
+        gateway-cli --version || echo "Installation verification failed"
+      args:
+        executable: /bin/bash
+      ignore_errors: yes
+      timeout: 300
+      register: gateway_cli_install
+
+    - name: Display gateway-cli installation result
+      debug:
+        msg: "{{ gateway_cli_install.stdout_lines }}"
+      when: gateway_cli_install.stdout_lines is defined
+
+    - name: Create MCP-specific startup script
+      copy:
+        dest: "{{ paygress_dir }}/start-paygress-mcp.sh"
+        content: |
+          #!/bin/bash
+          # Start script for Paygress MCP Service (for Context VM)
+          # This MCP server calls HTTP endpoints (with optional L402 paywall support)
+          
+          # Get the directory where this script is located
+          BASEDIR=$(dirname "$0")
+          
+          # Change to the script directory
+          cd "$BASEDIR"
+          
+          # Load environment variables from .env.contextvm file
+          if [ -f ".env.contextvm" ]; then
+              echo "📋 Loading MCP environment variables..."
+              set -a  # automatically export all variables
+              source .env.contextvm
+              set +a
+              echo "✅ Environment variables loaded"
+          else
+              echo "❌ Error: .env.contextvm file not found"
+              exit 1
+          fi
+          
+          # Disable logging for MCP mode (logs break JSON-RPC over stdio)
+          export RUST_LOG="${RUST_LOG:-off}"
+          
+          # Configure MCP to call HTTP endpoints
+          export ENABLE_MCP=true
+          export ENABLE_HTTP=false
+          export HTTP_BASE_URL="${HTTP_BASE_URL:-http://localhost:8080}"
+          
+          # Optional L402 token for paywalled endpoints
+          if [ -n "${HTTP_L402_TOKEN}" ]; then
+              echo "✅ L402 token configured for paywalled endpoints"
+          else
+              echo "⚠️  No L402 token - endpoints may require payment"
+          fi
+          
+          # Check if binary exists (prefer release build)
+          if [ -f "./target/release/paygress" ]; then
+              BINARY_PATH="./target/release/paygress"
+          elif [ -f "./target/debug/paygress" ]; then
+              BINARY_PATH="./target/debug/paygress"
+          else
+              echo "❌ Error: Binary not found"
+              exit 1
+          fi
+          
+          # Display configuration
+          echo "🤖 Starting Paygress MCP Service (HTTP Client Mode)"
+          echo "===================================="
+          echo "Architecture: MCP → HTTP (L402 Paywall Support)"
+          echo "HTTP Base URL: ${HTTP_BASE_URL}"
+          echo ""
+          
+          # Run the MCP service
+          exec "$BINARY_PATH" "$@"
+        owner: "{{ paygress_user }}"
+        group: "{{ paygress_user }}"
+        mode: '0755'
+
+    - name: Create Context VM startup script
+      copy:
+        dest: "/home/{{ paygress_user }}/start-contextvm.sh"
+        content: |
+          #!/bin/bash
+          cd /home/{{ paygress_user }}/paygress
+          
+          # Add .local/bin to PATH for gateway-cli
+          export PATH="$HOME/.local/bin:$PATH"
+          
+          # Check if gateway-cli is installed
+          if ! command -v gateway-cli &> /dev/null; then
+              echo "❌ Error: gateway-cli not found"
+              echo "   Please run: curl -fsSL https://raw.githubusercontent.com/contextvm/gateway-cli/main/install.sh | bash"
+              echo "   Or check installation: ls -la $HOME/.local/bin/"
+              exit 1
+          fi
+          
+          echo "✅ Using gateway-cli: $(which gateway-cli)"
+          
+          # Start Context VM with Paygress MCP-only mode
+          gateway-cli \
+            --private-key "{{ contextvm_private_key | default('5747e39e96339baf8484d9a503286c302aff8ee88c796812839e2dccf9b75dfe') }}" \
+            --relays "wss://relay.contextvm.org" \
+            --server ./start-paygress-mcp.sh
+        owner: "{{ paygress_user }}"
+        group: "{{ paygress_user }}"
+        mode: '0755'
+
+    - name: Create systemd service for Context VM
+      copy:
+        dest: /etc/systemd/system/contextvm.service
+        content: |
+          [Unit]
+          Description=Context VM Gateway for Paygress (MCP-only)
+          After=network.target docker.service
+          Requires=docker.service
+          # Note: This service runs independently of paygress.service
+          # It spawns its own paygress instance with MCP-only enabled
+
+          [Service]
+          Type=simple
+          User={{ paygress_user }}
+          WorkingDirectory=/home/{{ paygress_user }}/paygress
+          ExecStart=/home/{{ paygress_user }}/start-contextvm.sh
+          Restart=always
+          RestartSec=10
+          Environment=NODE_ENV=production
+          Environment=PATH=/home/{{ paygress_user }}/.local/bin:/home/{{ paygress_user }}/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd daemon for Context VM
+      systemd:
+        daemon_reload: yes
+
+    - name: Enable Context VM service
+      systemd:
+        name: contextvm
+        enabled: yes
+        state: started
+    
+    - name: Restart Context VM service to use new binary
+      systemd:
+        name: contextvm
+        state: restarted
+      ignore_errors: yes
+        
+    - name: Wait for Context VM service to initialize
+      pause:
+        seconds: 10
+        
+    - name: Check Context VM service status
+      shell: systemctl is-active contextvm || echo "inactive"
+      register: contextvm_status_check
+      ignore_errors: yes
+      
+    - name: Display Context VM installation status
+      debug:
+        msg: |
+          Context VM service status: {{ contextvm_status_check.stdout }}
+          
+          If status is 'inactive' or 'failed':
+          1. Check logs: sudo journalctl -u contextvm -f
+          2. The service uses npx to run @contextvm/gateway-cli
+          3. First run may take time to download the package
+          4. You can manually start: sudo systemctl start contextvm
+
+    - name: Show Context VM service status
+      shell: systemctl status contextvm --no-pager || true
+      register: contextvm_status
+
+    - name: Display Context VM status
+      debug:
+        msg: "{{ contextvm_status.stdout_lines }}"
+
   handlers:
+    - name: restart paygress
+      systemd:
+        name: paygress
+        state: restarted
+
     - name: restart docker
       systemd:
         name: docker
@@ -419,3 +2077,34 @@
       systemd:
         name: kubelet
         state: restarted
+
+    - name: restart sshd
+      systemd:
+        name: ssh
+        state: restarted
+
+    # ===============================
+    # Final Kubernetes Health Check
+    # ===============================
+    - name: Final check - Ensure Kubernetes is running
+      shell: "{{ kubectl_path }} cluster-info --request-timeout=10s"
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: final_k8s_check
+      ignore_errors: yes
+
+    - name: Show Kubernetes status
+      debug:
+        msg: "Kubernetes cluster status: {{ final_k8s_check.stdout if final_k8s_check.rc == 0 else 'NOT RUNNING' }}"
+
+    - name: Show Kubernetes nodes
+      shell: "{{ kubectl_path }} get nodes"
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: k8s_nodes
+      ignore_errors: yes
+
+    - name: Display Kubernetes nodes
+      debug:
+        msg: "{{ k8s_nodes.stdout_lines }}"
+      when: k8s_nodes.rc == 0
