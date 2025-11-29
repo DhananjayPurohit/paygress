@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Dhananjay Purohit <dhananjaypurohit7@gmail.com>"]
 description = "Cashu payment verification and pod provisioning for ingress controllers"
-license = "MIT"
+license = "Apache-2.0"
 
 
 # Unified Paygress service binary
