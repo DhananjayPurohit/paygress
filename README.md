@@ -93,7 +93,3 @@ kubectl get nodes
 
 Payment verification: ngx_l402 only  
 Duration calculation: Paygress (payment ÷ rate)
-
-## 📄 License
-
-MIT
