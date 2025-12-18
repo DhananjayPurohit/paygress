@@ -387,7 +387,7 @@ impl PodManager {
                                 // Check if container is ready
                                 if let Some(container_statuses) = &status.container_statuses {
                                     if let Some(container_status) = container_statuses.first() {
-                                        if container_status.ready.unwrap_or(false) {
+                                        if container_status.ready {
                                             // Verify SSH is actually listening on the port
                                             use std::net::TcpStream;
                                             match TcpStream::connect_timeout(
@@ -628,60 +628,19 @@ impl SidecarState {
 
     // Check if port is in use using multiple methods for reliability
     pub fn is_port_in_use(&self, port: u16) -> bool {
-        use std::process::Command;
-        
         // Method 1: Try to bind to the port (most reliable)
         use std::net::{TcpListener, SocketAddr};
         let addr = SocketAddr::from(([0, 0, 0, 0], port));
         match TcpListener::bind(addr) {
             Ok(_listener) => {
-                // Port is available, but double-check with system commands
-                // The listener will be automatically dropped when it goes out of scope
-                return false;
+                // Port is available - the listener will be automatically dropped when it goes out of scope
+                false
             },
             Err(_) => {
                 // Port is definitely in use
-                return true;
+                true
             }
         }
-        
-        // Method 2: Check with ss command (more reliable than netstat)
-        let ss_result = Command::new("ss")
-            .args(&["-tlnp"])
-            .output();
-            
-        if let Ok(output) = ss_result {
-            let output_str = String::from_utf8_lossy(&output.stdout);
-            // Look for exact port matches in listening state
-            for line in output_str.lines() {
-                if line.contains("LISTEN") && 
-                   (line.contains(&format!(":{} ", port)) || 
-                    line.contains(&format!(":{}:", port)) ||
-                    line.ends_with(&format!(":{}", port))) {
-                    return true;
-                }
-            }
-        }
-        
-        // Method 3: Fallback to netstat
-        let netstat_result = Command::new("netstat")
-            .args(&["-tlnp"])
-            .output();
-            
-        if let Ok(output) = netstat_result {
-            let output_str = String::from_utf8_lossy(&output.stdout);
-            for line in output_str.lines() {
-                if line.contains("LISTEN") && 
-                   (line.contains(&format!(":{} ", port)) || 
-                    line.contains(&format!(":{}:", port)) ||
-                    line.ends_with(&format!(":{}", port))) {
-                    return true;
-                }
-            }
-        }
-        
-        // If all checks pass, port is available
-        false
     }
 
     // Find next available port starting from a given port
