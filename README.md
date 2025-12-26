@@ -14,6 +14,17 @@ chmod +x setup-paygress.sh
 ./setup-paygress.sh deploy
 ```
 
+### Docker Deployment
+
+```bash
+# 1. Configure
+cp .env.template .env
+nano .env
+
+# 2. Deploy
+docker-compose up -d
+```
+
 ## 💰 How It Works
 
 ```

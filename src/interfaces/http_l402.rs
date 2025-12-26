@@ -40,7 +40,7 @@ pub struct L402Payment {
 /// 
 /// Supports format from ngx_l402:
 /// - Authorization: Cashu <token>
-async fn extract_l402_payment(headers: &HeaderMap) -> Option<L402Payment> {
+async fn extract_l402_payment(headers: &HeaderMap) -> Result<Option<L402Payment>, String> {
     use crate::sidecar_service::extract_token_value;
     
     let mut cashu_token: Option<String> = None;
@@ -54,25 +54,35 @@ async fn extract_l402_payment(headers: &HeaderMap) -> Option<L402Payment> {
             }
         }
     }
+
+    // Try X-Cashu header
+    if cashu_token.is_none() {
+        if let Some(x_cashu_header) = headers.get("x-cashu") {
+            if let Ok(x_cashu_str) = x_cashu_header.to_str() {
+                cashu_token = Some(x_cashu_str.trim().to_string());
+                info!("✅ Found Cashu token in X-Cashu header");
+            }
+        }
+    }
     
     // If we found a token, decode it to get the amount
     if let Some(token) = cashu_token {
         match extract_token_value(&token).await {
             Ok(amount_msats) => {
                 info!("✅ Decoded Cashu token: {} msats", amount_msats);
-                return Some(L402Payment {
+                return Ok(Some(L402Payment {
                     token,
                     amount_msats,
-                });
+                }));
             }
             Err(e) => {
                 error!("❌ Failed to decode Cashu token: {}", e);
-                return None;
+                return Err(format!("Invalid Cashu token: {}", e));
             }
         }
     }
     
-    None
+    Ok(None)
 }
 
 /// Run the HTTP interface with L402 support
@@ -124,7 +134,7 @@ async fn get_offers(State(service): State<Arc<PodProvisioningService>>) -> Resul
                 "pod_specs": response.pod_specs,
                 "payment_info": {
                     "accepted_tokens": ["cashu"],
-                    "header_format": "Authorization: Cashu <cashu_token>"
+                    "header_format": "Authorization: Cashu <token> OR X-Cashu: <token>"
                 }
             });
             Ok(Json(offers_json))
@@ -183,24 +193,38 @@ async fn spawn_pod_l402(
     info!("📨 Received spawn pod request via HTTP+L402");
 
     // Extract payment from Authorization: Cashu <token> header (from ngx_l402 or MCP client)
-    if let Some(l402_payment) = extract_l402_payment(&headers).await {
-        info!("✅ L402 payment from Authorization header: {} msats", l402_payment.amount_msats);
-        
-        // Use token from header (validated by ngx_l402 or provided by MCP client)
-        request.cashu_token = l402_payment.token.clone();
-    } else if !request.cashu_token.is_empty() {
-        // Fallback: Accept token from request body (for direct MCP calls bypassing nginx)
-        info!("✅ Using Cashu token from request body (direct call, bypassing nginx)");
-    } else {
-        // No payment token provided at all
-        error!("❌ No payment token found in headers or body");
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "Payment token missing",
-                "message": "Provide payment via Authorization header or cashu_token in body"
-            }))
-        ).into_response();
+    let extracted_payment = extract_l402_payment(&headers).await;
+
+    match extracted_payment {
+        Ok(Some(l402_payment)) => {
+            info!("✅ L402 payment from Authorization header: {} msats", l402_payment.amount_msats);
+            request.cashu_token = l402_payment.token.clone();
+        }
+        Ok(None) => {
+             // Check if body has token
+             if !request.cashu_token.is_empty() {
+                 info!("✅ Using Cashu token from request body (direct call, bypassing nginx)");
+             } else {
+                 error!("❌ No payment token found in headers or body");
+                 return (
+                     StatusCode::BAD_REQUEST,
+                     Json(serde_json::json!({
+                         "error": "Payment token missing",
+                         "message": "Provide payment via Authorization header or cashu_token in body"
+                     }))
+                 ).into_response();
+             }
+        }
+        Err(e) => {
+             error!("❌ Invalid payment token in header: {}", e);
+             return (
+                 StatusCode::BAD_REQUEST,
+                 Json(serde_json::json!({
+                     "error": "Invalid Payment Token",
+                     "message": e
+                 }))
+             ).into_response();
+        }
     }
 
     // Process the spawn request (payment already verified by ngx_l402)
@@ -256,24 +280,37 @@ async fn topup_pod_l402(
     info!("📨 Received topup pod request via HTTP+L402");
 
     // Extract payment from Authorization: Cashu <token> header (from ngx_l402 or MCP client)
-    if let Some(l402_payment) = extract_l402_payment(&headers).await {
-        info!("✅ L402 payment from Authorization header for top-up: {} msats", l402_payment.amount_msats);
-        
-        // Use token from header (validated by ngx_l402 or provided by MCP client)
-        request.cashu_token = l402_payment.token;
-    } else if !request.cashu_token.is_empty() {
-        // Fallback: Accept token from request body (for direct MCP calls bypassing nginx)
-        info!("✅ Using Cashu token from request body for top-up (direct call, bypassing nginx)");
-    } else {
-        // No payment token provided at all
-        error!("❌ No payment token found in headers or body");
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "Payment token missing",
-                "message": "Provide payment via Authorization header or cashu_token in body"
-            }))
-        ).into_response();
+    let extracted_payment = extract_l402_payment(&headers).await;
+    
+    match extracted_payment {
+        Ok(Some(l402_payment)) => {
+             info!("✅ L402 payment from Authorization header for top-up: {} msats", l402_payment.amount_msats);
+             request.cashu_token = l402_payment.token;
+        }
+        Ok(None) => {
+             if !request.cashu_token.is_empty() {
+                 info!("✅ Using Cashu token from request body for top-up (direct call, bypassing nginx)");
+             } else {
+                 error!("❌ No payment token found in headers or body");
+                 return (
+                     StatusCode::BAD_REQUEST,
+                     Json(serde_json::json!({
+                         "error": "Payment token missing",
+                         "message": "Provide payment via Authorization header or cashu_token in body"
+                     }))
+                 ).into_response();
+             }
+        }
+        Err(e) => {
+            error!("❌ Invalid payment token in header: {}", e);
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "Invalid Payment Token",
+                    "message": e
+                }))
+            ).into_response();
+        }
     }
 
     // Process the topup request (payment already verified by ngx_l402)

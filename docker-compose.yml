@@ -1,0 +1,97 @@
+services:
+  # Kubernetes (K3s) running in a container
+  k3s:
+    image: rancher/k3s:v1.34.2-k3s1
+    container_name: k3s
+    command: server --disable=traefik --debug --tls-san k3s
+    privileged: true
+    ports:
+      - "6443:6443"
+      - "${SSH_PORT_RANGE_START:-1000}-${SSH_PORT_RANGE_END:-1999}:${SSH_PORT_RANGE_START:-1000}-${SSH_PORT_RANGE_END:-1999}"
+    environment:
+      - K3S_KUBECONFIG_OUTPUT=/output/kubeconfig.yaml
+      - K3S_KUBECONFIG_MODE=666
+    ulimits:
+      nproc: 65535
+      nofile:
+        soft: 65535
+        hard: 65535
+    tmpfs:
+      - /run
+      - /var/run
+    volumes:
+      - k3s-server:/var/lib/rancher/k3s
+      - k3s-kubeconfig:/output
+
+  # Paygress Application
+  paygress:
+    build: .
+    container_name: paygress
+    restart: always
+    # Wait for K3s to generate kubeconfig before starting
+    command: >
+      /bin/sh -c "
+        while [ ! -f /kubeconfig/kubeconfig.yaml ]; do
+          echo 'Waiting for kubeconfig...';
+          sleep 2;
+        done;
+        mkdir -p /app/kubeconfig;
+        sed 's/127.0.0.1/k3s/g' /kubeconfig/kubeconfig.yaml > /app/kubeconfig/kubeconfig.yaml;
+        echo 'Creating user-workloads namespace...';
+        kubectl apply -f /app/k8s/namespace.yaml || echo 'Namespace already exists or failed to create';
+        exec paygress
+      "
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    environment:
+      - RUST_LOG=info
+      - KUBECONFIG=/app/kubeconfig/kubeconfig.yaml
+      # Overrides from .env can go here if needed
+    volumes:
+      - ./data:/app/data
+      - ./pod-specs.json:/app/pod-specs.json:ro
+      - ./k8s:/app/k8s:ro
+      - k3s-kubeconfig:/kubeconfig:ro
+    depends_on:
+      - k3s
+
+  # Optional: Watchtower for auto-updates (good for shipping clients)
+  watchtower:
+    image: containrrr/watchtower
+    container_name: watchtower
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  # Nginx Reverse Proxy with L402
+  nginx:
+    image: ghcr.io/dhananjaypurohit/ngx_l402:1.2.0
+    container_name: nginx
+    restart: always
+    ports:
+      - "80:80"
+    environment:
+      # L402 Configuration (passed to module via process env)
+      - LN_CLIENT_TYPE=${LN_CLIENT_TYPE:-LNURL}
+      - LNURL_ADDRESS=${LNURL_ADDRESS:-https://your-lnurl-server.com}
+      - ROOT_KEY=${l402_root_key:-your-root-key-change-me}
+      # LND Options (Defaults to empty to suppress warnings)
+      - LND_ADDRESS=${LND_ADDRESS:-}
+      - MACAROON_FILE_PATH=${MACAROON_FILE_PATH:-}
+      - CERT_FILE_PATH=${CERT_FILE_PATH:-}
+      # Cashu Options
+      - CASHU_ECASH_SUPPORT=${CASHU_ECASH_SUPPORT:-true}
+      - CASHU_DB_PATH=/var/lib/nginx/cashu.db
+      - CASHU_WALLET_SECRET=${CASHU_WALLET_SECRET:-CHANGE-ME-USE-openssl-rand-hex-32}
+      - CASHU_WHITELISTED_MINTS=${WHITELISTED_MINTS:-https://testnut.cashu.space}
+      - CASHU_REDEEM_ON_LIGHTNING=${CASHU_REDEEM_ON_LIGHTNING:-true}
+    volumes:
+      - ./data/nginx:/var/lib/nginx
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+    depends_on:
+      - paygress
+
+volumes:
+  k3s-server:
+  k3s-kubeconfig:

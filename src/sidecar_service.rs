@@ -314,13 +314,78 @@ impl PodManager {
             }]),
             env: Some(env_vars),
             image_pull_policy: Some("IfNotPresent".to_string()),
-            // Override entrypoint to set SSH port before init script
-            // linuxserver/openssh-server init script checks /config/sshd_config
-            // We need to create it with Port directive before /init runs
+            // Universal SSH setup that works with any image
+            // Detects the base OS and installs/configures SSH accordingly
             command: Some(vec![
-                "/bin/bash".to_string(),
+                "/bin/sh".to_string(),
                 "-c".to_string(),
-                format!("set -e && mkdir -p /config && cat > /config/sshd_config <<EOF\nPort {}\nListenAddress 0.0.0.0\nPermitRootLogin yes\nPasswordAuthentication yes\nPubkeyAuthentication yes\nUseDNS no\nGSSAPIAuthentication no\nEOF\n/init", ssh_port),
+                format!(
+                    r#"set -e
+echo "Setting up SSH access on port {ssh_port}..."
+
+# Detect package manager and install OpenSSH if not present
+if command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq && apt-get install -y -qq openssh-server sudo 2>/dev/null || true
+    mkdir -p /run/sshd
+elif command -v apk >/dev/null 2>&1; then
+    apk add --no-cache openssh sudo 2>/dev/null || true
+    ssh-keygen -A 2>/dev/null || true
+elif command -v yum >/dev/null 2>&1; then
+    yum install -y openssh-server sudo 2>/dev/null || true
+fi
+
+# Detect available shell
+if [ -f /bin/bash ]; then
+    DEFAULT_SHELL="/bin/bash"
+else
+    DEFAULT_SHELL="/bin/sh"
+fi
+
+# Create user if it doesn't exist
+if ! id "{username}" >/dev/null 2>&1; then
+    useradd -m -s "$DEFAULT_SHELL" "{username}" 2>/dev/null || adduser -D -s "$DEFAULT_SHELL" "{username}" 2>/dev/null || true
+fi
+
+# Set password
+echo "{username}:{password}" | chpasswd 2>/dev/null || true
+
+# Add user to sudoers
+echo "{username} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/{username} 2>/dev/null || true
+chmod 0440 /etc/sudoers.d/{username} 2>/dev/null || true
+
+# Configure SSH
+mkdir -p /etc/ssh
+cat > /etc/ssh/sshd_config <<EOF
+Port {ssh_port}
+ListenAddress 0.0.0.0
+PermitRootLogin yes
+PasswordAuthentication yes
+PubkeyAuthentication yes
+UseDNS no
+X11Forwarding yes
+PrintMotd no
+AcceptEnv LANG LC_*
+Subsystem sftp internal-sftp
+EOF
+
+# Start SSH daemon
+if command -v sshd >/dev/null 2>&1; then
+    # Use absolute path to sshd if possible
+    SSHD_BIN=$(command -v sshd)
+    $SSHD_BIN -f /etc/ssh/sshd_config -D &
+    echo "SSH server started on port {ssh_port}"
+else
+    echo "Warning: sshd not found"
+fi
+
+echo "Container ready. SSH on port {ssh_port}, user: {username} (shell: $DEFAULT_SHELL)"
+tail -f /dev/null
+"#,
+                    ssh_port = ssh_port,
+                    username = username,
+                    password = password
+                ),
             ]),
             resources: Some(k8s_openapi::api::core::v1::ResourceRequirements {
                 limits: Some({
