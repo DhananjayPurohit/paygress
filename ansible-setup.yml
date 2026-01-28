@@ -2,12 +2,14 @@
 - name: Setup Ubuntu machine with Docker, Kubernetes, and Paygress
   hosts: all
   become: yes
-  gather_facts: no
+  gather_facts: yes
   vars:
     kubernetes_version: "1.28"
     containerd_version: "1.6.24"
     paygress_user: "{{ ansible_user }}"
-    paygress_dir: "/home/{{ paygress_user }}/paygress"
+    # Use actual home directory (handles root=/root vs regular users=/home/user)
+    paygress_home: "{{ '/root' if paygress_user == 'root' else '/home/' + paygress_user }}"
+    paygress_dir: "{{ paygress_home }}/paygress"
     pod_network_cidr: "10.244.0.0/16"  # Flannel default pod network
     service_network_cidr: "10.96.0.0/12"  # Kubernetes default service network
     # All configuration variables are defined in inventory.ini
@@ -19,18 +21,33 @@
     # ===============================
     - name: Ensure home directory exists
       file:
-        path: "/home/{{ paygress_user }}"
+        path: "{{ paygress_home }}"
         state: directory
         owner: "{{ paygress_user }}"
         mode: '0755'
       ignore_errors: yes
 
-    - name: Gather facts now that home directory exists
-      setup:
-
     # ===============================
     # System Prerequisites
     # ===============================
+    - name: Remove conflicting Docker repository configurations
+      shell: |
+        # Remove Docker conflicting sources
+        rm -f /etc/apt/sources.list.d/docker.list
+        rm -f /etc/apt/sources.list.d/docker.sources
+        rm -f /etc/apt/sources.list.d/archive_uri-https_download_docker_com_linux_ubuntu-*.list
+        find /etc/apt/sources.list.d/ -name "*.list" -exec grep -l "download.docker.com" {} \; 2>/dev/null | xargs -r rm -f
+        find /etc/apt/sources.list.d/ -name "*.sources" -exec grep -l "download.docker.com" {} \; 2>/dev/null | xargs -r rm -f
+        
+        # Remove Kubernetes conflicting sources
+        rm -f /etc/apt/sources.list.d/kubernetes.list
+        rm -f /etc/apt/sources.list.d/kubernetes.sources
+        find /etc/apt/sources.list.d/ -name "*.list" -exec grep -l "pkgs.k8s.io" {} \; 2>/dev/null | xargs -r rm -f
+        find /etc/apt/sources.list.d/ -name "*.sources" -exec grep -l "pkgs.k8s.io" {} \; 2>/dev/null | xargs -r rm -f
+        
+        true
+      ignore_errors: yes
+
     - name: Update apt cache
       apt:
         update_cache: yes
@@ -81,7 +98,7 @@
       stat:
         path: "/etc/wireguard/wg0.conf"
       register: wg_config_exists
-      when: static_ip_enabled | default(false)
+      when: static_ip_enabled | default(false) | bool
 
     - name: Download static IP configuration with Cashu token
       shell: |
@@ -91,14 +108,14 @@
           -H "User-Agent: Paygress-StaticIP-Client/1.0" \
           "{{ static_ip_config_url }}" \
           -o "/etc/wireguard/wg0.conf"
-      when: static_ip_enabled | default(false) and not wg_config_exists.stat.exists
+      when: static_ip_enabled | default(false) | bool and not wg_config_exists.stat.exists
       ignore_errors: yes
       register: static_ip_download_result
 
     - name: Display message if config already exists
       debug:
         msg: "✅ WireGuard config already exists at /etc/wireguard/wg0.conf - skipping download"
-      when: static_ip_enabled | default(false) and wg_config_exists.stat.exists
+      when: static_ip_enabled | default(false) | bool and wg_config_exists.stat.exists
 
     - name: Set proper permissions on static IP config
       file:
@@ -106,7 +123,7 @@
         mode: '0600'
         owner: root
         group: root
-      when: static_ip_enabled | default(false)
+      when: static_ip_enabled | default(false) | bool
 
     - name: Create script to exclude Kubernetes networks from WireGuard routing
       copy:
@@ -136,7 +153,7 @@
           fi
           
           exit 0
-      when: static_ip_enabled | default(false)
+      when: static_ip_enabled | default(false) | bool
 
     - name: Create systemd service to run after WireGuard starts
       copy:
@@ -156,43 +173,43 @@
           
           [Install]
           WantedBy=multi-user.target
-      when: static_ip_enabled | default(false)
+      when: static_ip_enabled | default(false) | bool
       register: wg_exclude_service_created
 
     - name: Reload systemd daemon
       systemd:
         daemon_reload: yes
-      when: static_ip_enabled | default(false) and wg_exclude_service_created.changed
+      when: static_ip_enabled | default(false) | bool and wg_exclude_service_created.changed
 
     - name: Enable the WireGuard K8s exclusion service
       systemd:
         name: wg-exclude-k8s
         enabled: yes
-      when: static_ip_enabled | default(false)
+      when: static_ip_enabled | default(false) | bool
 
     - name: Restart WireGuard to apply changes
       systemd:
         name: wg-quick@wg0
         state: restarted
-      when: static_ip_enabled | default(false) and wg_exclude_service_created.changed
+      when: static_ip_enabled | default(false) | bool and wg_exclude_service_created.changed
       ignore_errors: yes
 
     - name: Wait for WireGuard to initialize
       pause:
         seconds: 3
-      when: static_ip_enabled | default(false) and wg_exclude_service_created.changed
+      when: static_ip_enabled | default(false) | bool and wg_exclude_service_created.changed
 
     - name: Start the WireGuard K8s exclusion service
       systemd:
         name: wg-exclude-k8s
         state: started
-      when: static_ip_enabled | default(false)
+      when: static_ip_enabled | default(false) | bool
       ignore_errors: yes
 
     - name: Wait for route exclusion to complete
       pause:
         seconds: 2
-      when: static_ip_enabled | default(false)
+      when: static_ip_enabled | default(false) | bool
 
     - name: Create persistent route configuration for Kubernetes service network
       copy:
@@ -203,14 +220,14 @@
           
           [Route]
           Destination={{ service_network_cidr }}
-      when: static_ip_enabled | default(false)
+      when: static_ip_enabled | default(false) | bool
       register: k8s_route_config
 
     - name: Restart systemd-networkd if route config changed
       systemd:
         name: systemd-networkd
         state: restarted
-      when: static_ip_enabled | default(false) and k8s_route_config.changed
+      when: static_ip_enabled | default(false) | bool and k8s_route_config.changed
       ignore_errors: yes
 
     - name: Verify Kubernetes networks are excluded from WireGuard routing
@@ -222,14 +239,14 @@
           echo "SUCCESS - Kubernetes networks excluded from WireGuard routing"
           exit 0
         fi
-      when: static_ip_enabled | default(false)
+      when: static_ip_enabled | default(false) | bool
       register: wg_route_verification
       ignore_errors: yes
 
     - name: Display WireGuard route verification result
       debug:
         msg: "{{ wg_route_verification.stdout }}"
-      when: static_ip_enabled | default(false) and wg_route_verification.stdout is defined
+      when: static_ip_enabled | default(false) | bool and wg_route_verification.stdout is defined
 
     - name: Validate downloaded config is not HTML
       shell: |
@@ -244,14 +261,14 @@
         else
           echo "MISSING"
         fi
-      when: static_ip_enabled | default(false)
+      when: static_ip_enabled | default(false) | bool
       register: config_validation
       ignore_errors: yes
 
     - name: Display config validation result
       debug:
         msg: "Static IP config validation: {{ config_validation.stdout }}"
-      when: static_ip_enabled | default(false)
+      when: static_ip_enabled | default(false) | bool
 
     - name: Extract VPN IP and port range from configuration
       shell: |
@@ -283,7 +300,7 @@
           echo "PORT_START:{{ ssh_port_start }}"
           echo "PORT_END:{{ ssh_port_end }}"
         fi
-      when: static_ip_enabled | default(false) and config_validation.stdout == "VALID"
+      when: static_ip_enabled | default(false) | bool and config_validation.stdout == "VALID"
       register: extracted_vpn_config
       ignore_errors: yes
 
@@ -292,7 +309,7 @@
         extracted_static_ip: "{{ extracted_vpn_config.stdout | regex_search('VPN_IP:([^\\n]+)', '\\1') | first }}"
         extracted_ssh_port_start: "{{ extracted_vpn_config.stdout | regex_search('PORT_START:([^\\n]+)', '\\1') | first }}"
         extracted_ssh_port_end: "{{ extracted_vpn_config.stdout | regex_search('PORT_END:([^\\n]+)', '\\1') | first }}"
-      when: static_ip_enabled | default(false) and config_validation.stdout == "VALID" and extracted_vpn_config.stdout is defined
+      when: static_ip_enabled | default(false) | bool and config_validation.stdout == "VALID" and extracted_vpn_config.stdout is defined
 
     - name: Extract public IP from WireGuard Endpoint
       shell: |
@@ -302,38 +319,38 @@
         else
           echo "{{ public_ip }}"
         fi
-      when: static_ip_enabled | default(false) and config_validation.stdout == "VALID"
+      when: static_ip_enabled | default(false) | bool and config_validation.stdout == "VALID"
       register: extracted_public_ip
       ignore_errors: yes
 
     - name: Display static IP download result
       debug:
         msg: "{{ static_ip_download_result.stdout_lines }}"
-      when: static_ip_enabled | default(false) and static_ip_download_result is defined and not static_ip_download_result.skipped | default(false)
+      when: static_ip_enabled | default(false) | bool and static_ip_download_result is defined and not static_ip_download_result.skipped | default(false)
 
     - name: Check if WireGuard interface is already running
       shell: wg show wg0 2>/dev/null
       register: wg_interface_check
-      when: static_ip_enabled | default(false) and config_validation.stdout == "VALID"
+      when: static_ip_enabled | default(false) | bool and config_validation.stdout == "VALID"
       ignore_errors: yes
       changed_when: false
 
     - name: Start static IP interface
       shell: |
         wg-quick up wg0
-      when: static_ip_enabled | default(false) and config_validation.stdout == "VALID" and wg_interface_check.rc != 0
+      when: static_ip_enabled | default(false) | bool and config_validation.stdout == "VALID" and wg_interface_check.rc != 0
       ignore_errors: yes
       register: static_ip_start_result
 
     - name: Display message if interface already running
       debug:
         msg: "✅ WireGuard interface wg0 already running - skipping startup"
-      when: static_ip_enabled | default(false) and config_validation.stdout == "VALID" and wg_interface_check.rc == 0
+      when: static_ip_enabled | default(false) | bool and config_validation.stdout == "VALID" and wg_interface_check.rc == 0
 
     - name: Check systemd status for wg-quick
       shell: systemctl is-active wg-quick@wg0 || echo "not-active"
       register: wg_systemd_status
-      when: static_ip_enabled | default(false) and config_validation.stdout == "VALID"
+      when: static_ip_enabled | default(false) | bool and config_validation.stdout == "VALID"
       changed_when: false
       ignore_errors: yes
 
@@ -341,13 +358,13 @@
       systemd:
         name: "wg-quick@wg0"
         enabled: yes
-      when: static_ip_enabled | default(false) and config_validation.stdout == "VALID"
+      when: static_ip_enabled | default(false) | bool and config_validation.stdout == "VALID"
       ignore_errors: yes
 
     - name: Display WireGuard status
       debug:
         msg: "WireGuard interface status: {{ wg_systemd_status.stdout if wg_systemd_status.stdout is defined else 'unknown' }}"
-      when: static_ip_enabled | default(false)
+      when: static_ip_enabled | default(false) | bool
 
     - name: Save extracted configuration to files
       shell: |
@@ -356,7 +373,7 @@
         echo "{{ extracted_ssh_port_start | default(ssh_port_start) }}" > /etc/paygress/ssh_port_start
         echo "{{ extracted_ssh_port_end | default(ssh_port_end) }}" > /etc/paygress/ssh_port_end
         chmod 644 /etc/paygress/*
-      when: static_ip_enabled | default(false) and config_validation.stdout == "VALID" and extracted_public_ip.stdout is defined
+      when: static_ip_enabled | default(false) | bool and config_validation.stdout == "VALID" and extracted_public_ip.stdout is defined
       ignore_errors: yes
 
     - name: Set facts from extracted configuration (enabled and valid)
@@ -365,7 +382,7 @@
         public_ip: "{{ extracted_public_ip.stdout | default(public_ip) }}"
         ssh_port_start: "{{ extracted_ssh_port_start | default(ssh_port_start) }}"
         ssh_port_end: "{{ extracted_ssh_port_end | default(ssh_port_end) }}"
-      when: static_ip_enabled | default(false) and config_validation.stdout == "VALID"
+      when: static_ip_enabled | default(false) | bool and config_validation.stdout == "VALID"
 
     - name: Display final IP configuration
       debug:
@@ -379,17 +396,17 @@
             └─ Use this for machine SSH access (requires port forwarding)
           SSH Port Range: {{ ssh_port_start }}-{{ ssh_port_end }}
           ========================================
-      when: static_ip_enabled | default(false)
+      when: static_ip_enabled | default(false) | bool
 
     - name: Set facts from inventory (disabled or invalid config)
       set_fact:
         static_ip: "{{ public_ip }}"
-      when: not (static_ip_enabled | default(false)) or (static_ip_enabled | default(false) and config_validation.stdout != "VALID")
+      when: not (static_ip_enabled | default(false) | bool) or (static_ip_enabled | default(false) | bool and config_validation.stdout != "VALID")
 
     - name: Warn if static IP config is invalid
       debug:
         msg: "⚠️  WARNING: Static IP config is invalid ({{ config_validation.stdout }}). Using inventory.ini values. Check your Cashu token or config URL."
-      when: static_ip_enabled | default(false) and config_validation.stdout != "VALID"
+      when: static_ip_enabled | default(false) | bool and config_validation.stdout != "VALID"
 
     # ===============================
     # Firewall Configuration
@@ -426,6 +443,13 @@
         proto: tcp
         comment: "New SSH access to machine"
 
+    - name: Always allow port 22 (prevent lockout)
+      ufw:
+        rule: allow
+        port: "22"
+        proto: tcp
+        comment: "Default SSH port - always keep open"
+
     - name: Allow pod SSH port range in firewall
       ufw:
         rule: allow
@@ -439,7 +463,7 @@
         port: "{{ http_port }}"
         proto: tcp
         comment: "Paygress HTTP API"
-      when: enable_http | default(true)
+      when: enable_http | default(true) | bool
 
     - name: Allow Nginx HTTP port in firewall
       ufw:
@@ -454,7 +478,7 @@
         port: "51820"
         proto: udp
         comment: "WireGuard VPN"
-      when: static_ip_enabled | default(false)
+      when: static_ip_enabled | default(false) | bool
 
     - name: Set default firewall policies
       ufw:
@@ -627,15 +651,32 @@
     # ===============================
     # Docker Installation
     # ===============================
-    - name: Add Docker GPG key
-      apt_key:
-        url: https://download.docker.com/linux/ubuntu/gpg
-        state: present
+    - name: Remove existing Docker repository configurations
+      shell: |
+        rm -f /etc/apt/sources.list.d/docker.list
+        rm -f /etc/apt/sources.list.d/docker.sources
+        rm -f /etc/apt/sources.list.d/archive_uri-https_download_docker_com_linux_ubuntu-*.list
+      ignore_errors: yes
 
-    - name: Add Docker repository
-      apt_repository:
-        repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
-        state: present
+    - name: Setup Docker repository properly
+      shell: |
+        # Remove old GPG key if exists
+        rm -f /etc/apt/keyrings/docker.gpg /etc/apt/keyrings/docker.asc
+        
+        # Create keyrings directory
+        install -m 0755 -d /etc/apt/keyrings
+        
+        # Download and install GPG key
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+        chmod a+r /etc/apt/keyrings/docker.asc
+        
+        # Add repository with signed-by
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" > /etc/apt/sources.list.d/docker.list
+        
+        # Update apt cache
+        apt-get update
+      args:
+        creates: /etc/apt/sources.list.d/docker.list
 
     - name: Install Docker
       apt:
@@ -678,6 +719,7 @@
           - kubelet
           - kubeadm
           - kubectl
+          - cri-tools
         state: present
         update_cache: yes
         force: yes
@@ -771,6 +813,45 @@
         name: containerd
         state: restarted
         enabled: yes
+
+    - name: Wait for containerd to be ready
+      pause:
+        seconds: 5
+
+    - name: Verify containerd CRI is working
+      shell: |
+        # Check if containerd socket exists and is accessible
+        if [ ! -S /var/run/containerd/containerd.sock ]; then
+          echo "FAIL: containerd socket not found"
+          exit 1
+        fi
+        
+        # Test crictl can communicate with containerd
+        crictl --runtime-endpoint unix:///var/run/containerd/containerd.sock version 2>&1 || {
+          echo "FAIL: CRI not responding, regenerating config..."
+          
+          # Regenerate containerd config
+          containerd config default > /etc/containerd/config.toml
+          sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+          
+          # Restart containerd
+          systemctl restart containerd
+          sleep 5
+          
+          # Try again
+          crictl --runtime-endpoint unix:///var/run/containerd/containerd.sock version 2>&1 || exit 1
+        }
+        echo "SUCCESS: containerd CRI is working"
+      register: containerd_cri_check
+      retries: 3
+      delay: 5
+      until: containerd_cri_check.rc == 0
+      ignore_errors: yes
+
+    - name: Display containerd CRI status
+      debug:
+        msg: "{{ containerd_cri_check.stdout_lines }}"
+      when: containerd_cri_check.stdout_lines is defined
 
     # ===============================
     # Configure Firewall (Before Kubernetes)
@@ -925,7 +1006,7 @@
 
     - name: Create .kube directory
       file:
-        path: "/home/{{ paygress_user }}/.kube"
+        path: "{{ paygress_home }}/.kube"
         state: directory
         owner: "{{ paygress_user }}"
         group: "{{ paygress_user }}"
@@ -938,7 +1019,7 @@
     - name: Copy kubeconfig
       copy:
         src: /etc/kubernetes/admin.conf
-        dest: "/home/{{ paygress_user }}/.kube/config"
+        dest: "{{ paygress_home }}/.kube/config"
         owner: "{{ paygress_user }}"
         group: "{{ paygress_user }}"
         remote_src: yes
@@ -983,7 +1064,7 @@
 
     - name: Recreate .kube directory if needed
       file:
-        path: "/home/{{ paygress_user }}/.kube"
+        path: "{{ paygress_home }}/.kube"
         state: directory
         owner: "{{ paygress_user }}"
         group: "{{ paygress_user }}"
@@ -992,7 +1073,7 @@
     - name: Copy kubeconfig if reinitialized
       copy:
         src: /etc/kubernetes/admin.conf
-        dest: "/home/{{ paygress_user }}/.kube/config"
+        dest: "{{ paygress_home }}/.kube/config"
         owner: "{{ paygress_user }}"
         group: "{{ paygress_user }}"
         remote_src: yes
@@ -1041,7 +1122,7 @@
         # Flush cache
         ip route flush cache
       ignore_errors: yes
-      when: static_ip_enabled | default(false)
+      when: static_ip_enabled | default(false) | bool
 
     - name: Verify Kubernetes service network route
       shell: "ip route show | grep '{{ service_network_cidr }}'"
@@ -1464,7 +1545,7 @@
 
     - name: Ensure .bashrc exists
       file:
-        path: "/home/{{ paygress_user }}/.bashrc"
+        path: "{{ paygress_home }}/.bashrc"
         state: touch
         owner: "{{ paygress_user }}"
         group: "{{ paygress_user }}"
@@ -1472,7 +1553,7 @@
 
     - name: Add Rust to PATH
       lineinfile:
-        path: "/home/{{ paygress_user }}/.bashrc"
+        path: "{{ paygress_home }}/.bashrc"
         line: 'export PATH="$HOME/.cargo/bin:$PATH"'
         create: yes
 
@@ -1489,7 +1570,7 @@
       git:
         repo: https://github.com/DhananjayPurohit/paygress.git
         dest: "{{ paygress_dir }}"
-        version: feat/nip04
+        version: main
         force: yes
 
     - name: Create user-workloads namespace
@@ -1693,7 +1774,7 @@
           ExecStart={{ paygress_dir }}/target/release/paygress
           Restart=always
           RestartSec=10
-          Environment=PATH=/home/{{ paygress_user }}/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+          Environment=PATH={{ paygress_home }}/.cargo/bin:/usr/local/bin:/usr/bin:/bin
 
           # Load environment variables
           EnvironmentFile={{ paygress_dir }}/.env
@@ -1786,14 +1867,14 @@
           echo "   - {{ machine_ssh_port }}/tcp    (Machine SSH)"
           echo "   - {{ ssh_port_start }}-{{ ssh_port_end }}/tcp  (Pod SSH range)"
           echo "   - 80/tcp         (Nginx reverse proxy with L402)"
-          {% if enable_http | default(true) %}
+          {% if enable_http | default(true) | bool %}
           echo "   - {{ http_port }}/tcp      (Backend HTTP API)"
           {% endif %}
-          {% if static_ip_enabled | default(false) %}
+          {% if static_ip_enabled | default(false) | bool %}
           echo "   - 51820/udp      (WireGuard VPN)"
           {% endif %}
           echo ""
-          {% if static_ip_enabled | default(false) %}
+          {% if static_ip_enabled | default(false) | bool %}
           echo "=========================================="
           echo "🌐 Static IP Configuration"
           echo "=========================================="
@@ -1843,12 +1924,12 @@
           echo "   - Main config:        {{ paygress_dir }}/.env"
           echo "   - Context VM config:  {{ paygress_dir }}/.env.contextvm"
           echo "   - Pod specs:          {{ paygress_dir }}/pod-specs.json"
-          {% if static_ip_enabled | default(false) %}
+          {% if static_ip_enabled | default(false) | bool %}
           echo "   - Static IP config:   /etc/wireguard/wg0.conf"
           echo "   - Extracted values:   /etc/paygress/ (static_ip, public_ip, ssh_port_start, ssh_port_end)"
           {% endif %}
           echo ""
-        dest: "/home/{{ paygress_user }}/setup-complete.sh"
+        dest: "{{ paygress_home }}/setup-complete.sh"
         mode: '0755'
         owner: "{{ paygress_user }}"
         group: "{{ paygress_user }}"
@@ -1967,10 +2048,10 @@
 
     - name: Create Context VM startup script
       copy:
-        dest: "/home/{{ paygress_user }}/start-contextvm.sh"
+        dest: "{{ paygress_home }}/start-contextvm.sh"
         content: |
           #!/bin/bash
-          cd /home/{{ paygress_user }}/paygress
+          cd {{ paygress_home }}/paygress
           
           # Add .local/bin to PATH for gateway-cli
           export PATH="$HOME/.local/bin:$PATH"
@@ -2008,12 +2089,12 @@
           [Service]
           Type=simple
           User={{ paygress_user }}
-          WorkingDirectory=/home/{{ paygress_user }}/paygress
-          ExecStart=/home/{{ paygress_user }}/start-contextvm.sh
+          WorkingDirectory={{ paygress_home }}/paygress
+          ExecStart={{ paygress_home }}/start-contextvm.sh
           Restart=always
           RestartSec=10
           Environment=NODE_ENV=production
-          Environment=PATH=/home/{{ paygress_user }}/.local/bin:/home/{{ paygress_user }}/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+          Environment=PATH={{ paygress_home }}/.local/bin:{{ paygress_home }}/.cargo/bin:/usr/local/bin:/usr/bin:/bin
 
           [Install]
           WantedBy=multi-user.target
