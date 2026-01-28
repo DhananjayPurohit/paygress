@@ -85,10 +85,21 @@ deploy() {
     echo -e "${YELLOW}🚀 Deploying Paygress...${NC}"
     echo ""
     
-    # Check Ansible
+    # Check Ansible (local installation - detect OS)
     if ! command -v ansible-playbook &> /dev/null; then
-        echo -e "${YELLOW}📦 Installing Ansible...${NC}"
-        sudo apt update && sudo apt install -y ansible
+        echo -e "${YELLOW}📦 Installing Ansible locally...${NC}"
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+            # macOS - use Homebrew
+            if ! command -v brew &> /dev/null; then
+                echo -e "${RED}❌ Homebrew not found. Please install it first:${NC}"
+                echo '  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
+                exit 1
+            fi
+            brew install ansible
+        else
+            # Linux - use apt
+            sudo apt update && sudo apt install -y ansible
+        fi
     fi
     
     # Check files
@@ -263,6 +274,68 @@ set -e
 
 echo "Checking Kubernetes..."
 
+# First, fix containerd configuration (common cause of CRI errors)
+echo "Ensuring containerd is properly configured..."
+
+# Check if containerd is installed
+if ! command -v containerd &> /dev/null; then
+    echo "✗ containerd not found, installing..."
+    apt-get update
+    apt-get install -y containerd
+fi
+
+# Create proper containerd config
+mkdir -p /etc/containerd
+containerd config default > /etc/containerd/config.toml
+
+# Enable SystemdCgroup (required for Kubernetes)
+sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+
+# Restart containerd
+echo "Restarting containerd..."
+systemctl restart containerd
+systemctl enable containerd
+sleep 5
+
+# Verify containerd is running
+if ! systemctl is-active --quiet containerd; then
+    echo "✗ containerd failed to start"
+    systemctl status containerd
+    exit 1
+fi
+echo "✓ containerd is running"
+
+# Load required kernel modules
+echo "Loading kernel modules..."
+modprobe overlay 2>/dev/null || true
+modprobe br_netfilter 2>/dev/null || true
+
+# Set sysctl params
+cat > /etc/sysctl.d/k8s.conf <<EOF
+net.bridge.bridge-nf-call-iptables = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward = 1
+EOF
+sysctl --system > /dev/null 2>&1 || true
+
+# Check if kubeadm is installed
+if ! command -v kubeadm &> /dev/null; then
+    echo "✗ kubeadm not found, installing Kubernetes packages..."
+    
+    apt-get update
+    apt-get install -y apt-transport-https ca-certificates curl gpg
+    
+    mkdir -p /etc/apt/keyrings
+    curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.28/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg 2>/dev/null || true
+    echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.28/deb/ /' | tee /etc/apt/sources.list.d/kubernetes.list
+    
+    apt-get update
+    apt-get install -y kubelet kubeadm kubectl
+    apt-mark hold kubelet kubeadm kubectl
+    
+    echo "✓ Kubernetes packages installed"
+fi
+
 # Check if API server is accessible
 if kubectl cluster-info --request-timeout=5s &> /dev/null; then
     echo "✓ Kubernetes is working"
@@ -272,9 +345,13 @@ fi
 echo "✗ Kubernetes API not accessible, reinitializing..."
 
 # Reset and reinitialize
-kubeadm reset --force
+kubeadm reset --force 2>/dev/null || true
 rm -rf /etc/cni/net.d ~/.kube
-iptables -F && iptables -t nat -F && iptables -t mangle -F && iptables -X
+iptables -F && iptables -t nat -F && iptables -t mangle -F && iptables -X 2>/dev/null || true
+
+# Make sure containerd is still running after reset
+systemctl restart containerd
+sleep 3
 
 echo "Initializing Kubernetes..."
 kubeadm init --pod-network-cidr=10.244.0.0/16 --ignore-preflight-errors=all
@@ -295,8 +372,8 @@ kubectl taint nodes --all node-role.kubernetes.io/control-plane- 2>/dev/null || 
 # Create namespace
 kubectl create namespace user-workloads 2>/dev/null || true
 
-    echo "✓ Kubernetes fixed!"
-    kubectl get nodes
+echo "✓ Kubernetes fixed!"
+kubectl get nodes
 FIXSCRIPT
     
     # Upload and run

@@ -42,12 +42,12 @@ Client → nginx + ngx_l402 → Paygress → Kubernetes Pod
 | standard | 200 msats/sec | 2 cores | 2GB | 5 min |
 | premium | 400 msats/sec | 4 cores | 4GB | 2.5 min |
 
-## 📝 Usage
+## 📝 API Usage
 
 ```bash
-curl -X POST http://your-server/pods/spawn \
+curl -X POST http://your-server:<http-port>/pods/spawn \
   -H "Content-Type: application/json" \
-  -H "X-Cashu: Cashu cashuAeyJ0b2tlbiI6..." \
+  -H "X-Cashu Cashu cashuAeyJ0b2tlbiI6..." \
   -d '{
     "pod_spec_id": "basic",
     "pod_image": "linuxserver/openssh-server:latest",
@@ -56,7 +56,52 @@ curl -X POST http://your-server/pods/spawn \
   }'
 ```
 
-## 🛠️ Commands
+## 🖥️ CLI Tool
+
+### Build
+
+```bash
+cargo build --bin paygress-cli
+```
+
+### Commands
+
+```bash
+# Spawn a pod with Cashu payment
+paygress-cli spawn \
+  -s http://your-server:<http-port> \
+  --tier basic \
+  --token "cashuBo2F..." \
+  --ssh-user myuser \
+  --ssh-pass mypassword
+
+# Check pod status
+paygress-cli status \
+  -s http://your-server:<http-port> \
+  --pod-id <POD_NPUB>
+
+# Top up a pod
+paygress-cli topup \
+  -s http://your-server:<http-port> \
+  --pod-id <POD_NPUB> \
+  --token "cashuBo2F..."
+
+# List available offers/tiers
+./target/debug/paygress-cli offers -s http://your-server:<http-port>
+```
+
+### CLI Options
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `-s, --server` | Paygress server URL | `http://localhost:8080` |
+| `-t, --tier` | Pod tier (basic, standard, premium) | Required |
+| `-k, --token` | Cashu token for payment | Required |
+| `-i, --image` | Container image | `linuxserver/openssh-server:latest` |
+| `-u, --ssh-user` | SSH username | `user` |
+| `-p, --ssh-pass` | SSH password | `password` |
+
+## 🛠️ Server Commands
 
 ```bash
 ./setup-paygress.sh deploy    # Deploy

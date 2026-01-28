@@ -12,6 +12,11 @@ license = "Apache-2.0"
 name = "paygress"
 path = "src/main.rs"
 
+# CLI tool binary
+[[bin]]
+name = "paygress-cli"
+path = "src/cli/main.rs"
+
 [dependencies]
 # Core dependencies
 serde = { version = "1.0", features = ["derive"] }
@@ -48,6 +53,11 @@ async-trait = "0.1"
 
 # Environment file loading
 dotenv = "0.15"
+
+# CLI dependencies
+clap = { version = "4", features = ["derive"] }
+indicatif = "0.17"
+colored = "2"
 
 
 [profile.release]
