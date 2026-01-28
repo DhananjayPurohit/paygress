@@ -47,7 +47,7 @@ Client → nginx + ngx_l402 → Paygress → Kubernetes Pod
 ```bash
 curl -X POST http://your-server:<http-port>/pods/spawn \
   -H "Content-Type: application/json" \
-  -H "Authorization: Cashu cashuAeyJ0b2tlbiI6..." \
+  -H "X-Cashu Cashu cashuAeyJ0b2tlbiI6..." \
   -d '{
     "pod_spec_id": "basic",
     "pod_image": "linuxserver/openssh-server:latest",
