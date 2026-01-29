@@ -1,13 +1,18 @@
 // Nostr client for receiving pod provisioning events with private messaging
 use anyhow::{Context, Result};
-use nostr_sdk::{Client, Keys, Filter, Kind, RelayPoolNotification, Url, EventBuilder, Tag, ToBech32};
+use nostr_sdk::{Client, Keys, Filter, Kind, RelayPoolNotification, Url, EventBuilder, Tag, ToBech32, Timestamp};
 use nostr_sdk::nips::nip59::UnwrappedGift;
 use nostr_sdk::nips::nip04;
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 use std::future::Future;
-use tracing::{error, info};
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use tracing::{error, info, warn};
 
+// Custom event kinds for Paygress provider discovery
+pub const KIND_PROVIDER_OFFER: u16 = 38383;
+pub const KIND_PROVIDER_HEARTBEAT: u16 = 38384;
 #[derive(Clone, Debug)]
 pub struct RelayConfig {
     pub relays: Vec<String>,
@@ -76,19 +81,23 @@ impl NostrRelaySubscriber {
         Ok(Self { client, keys })
     }
 
+    pub fn public_key(&self) -> nostr_sdk::PublicKey {
+        self.keys.public_key()
+    }
+
     pub async fn subscribe_to_pod_events<F>(&self, handler: F) -> Result<()>
     where
         F: Fn(NostrEvent) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> + Send + Sync + 'static,
     {
-        // Subscribe to both NIP-04 (Encrypted Direct Messages) and NIP-17 (Gift Wrap) messages
+        // Subscribe to messages sent TO us (filter by p-tag)
         let nip04_filter = Filter::new()
             .kind(Kind::EncryptedDirectMessage)
-            .pubkey(self.keys.public_key())
+            .pubkeys(vec![self.keys.public_key()]) // Sets #p tag
             .limit(0);
 
         let nip17_filter = Filter::new()
             .kind(Kind::GiftWrap)
-            .pubkey(self.keys.public_key())
+            .pubkeys(vec![self.keys.public_key()]) // Sets #p tag
             .limit(0);
 
         let _ = self.client.subscribe(vec![nip04_filter, nip17_filter], None).await;
@@ -108,7 +117,7 @@ impl NostrRelaySubscriber {
                                 
                                 // Check if the rumor is a private direct message
                                 if rumor.kind == Kind::PrivateDirectMessage {
-                                    info!("Received NIP-17 private direct message content: {}", rumor.content);
+                                    info!("DEBUG: NIP-17 rumor is PrivateDirectMessage. Content length: {}", rumor.content.len());
                                     
                                     // Create a NostrEvent from the unwrapped rumor with NIP-17 flag
                                     let nostr_event = NostrEvent {
@@ -149,7 +158,7 @@ impl NostrRelaySubscriber {
                             Ok(secret_key) => {
                                 match nip04::decrypt(&secret_key, &event.pubkey, &event.content) {
                                     Ok(decrypted_content) => {
-                                        info!("Decrypted NIP-04 message content: {}", decrypted_content);
+                                        info!("DEBUG: Decrypted NIP-04 message. Length: {}", decrypted_content.len());
                                         
                                         // Create a NostrEvent from the decrypted message with NIP-04 flag
                                         let nostr_event = NostrEvent {
@@ -224,151 +233,111 @@ impl NostrRelaySubscriber {
         }
     }
 
-    // Send access details via private encrypted message (supports both NIP-04 and NIP-17)
+    // Generic method to send an encrypted private message (supports both NIP-04 and NIP-17)
+    pub async fn send_encrypted_private_message(
+        &self,
+        receiver_pubkey: &str,
+        content: String,
+        message_type: &str,
+    ) -> Result<String> {
+        let receiver_pubkey_parsed = nostr_sdk::PublicKey::parse(receiver_pubkey)?;
+
+        match message_type {
+            "nip04" => {
+                match self.keys.secret_key() {
+                    Ok(secret_key) => {
+                        let encrypted_content = nip04::encrypt(&secret_key, &receiver_pubkey_parsed, &content)?;
+                        let receiver_tag = Tag::public_key(receiver_pubkey_parsed);
+                        let alt_tag = Tag::parse(&["alt", "Private Message"])?;
+                        
+                        let event_builder = EventBuilder::new(Kind::EncryptedDirectMessage, encrypted_content, [receiver_tag, alt_tag]);
+                        let event = event_builder.to_event(&self.keys)?;
+                        let event_id = self.client.send_event(event).await?;
+                        info!("Sent NIP-04 message to {}: {:?}", receiver_pubkey, event_id);
+                        Ok(event_id.to_hex())
+                    }
+                    Err(e) => {
+                        error!("Failed to get secret key for NIP-04 encryption: {}", e);
+                        Err(e.into())
+                    }
+                }
+            }
+            "nip17" | _ => {
+                // Default to NIP-17 if not specified or nip17
+                let event_id = self.client.send_private_msg(receiver_pubkey_parsed, content, None).await?;
+                info!("Sent NIP-17 message to {}: {:?}", receiver_pubkey, event_id);
+                Ok(event_id.to_hex())
+            }
+        }
+    }
+
+    // Send access details via private encrypted message
     pub async fn send_access_details_private_message(
         &self, 
         request_pubkey: &str,
         details: AccessDetailsContent,
         message_type: &str
     ) -> Result<String> {
-        // Serialize the access details
         let details_json = serde_json::to_string(&details)?;
-        
-        let request_pubkey_parsed = nostr_sdk::PublicKey::parse(request_pubkey)?;
-        
-        match message_type {
-            "nip04" => {
-                // Send as NIP-04 Encrypted Direct Message
-                match self.keys.secret_key() {
-                    Ok(secret_key) => {
-                        let encrypted_content = nip04::encrypt(&secret_key, &request_pubkey_parsed, &details_json)?;
-                        
-                        // Create proper tags for NIP-04: p tag with receiver's public key hex
-                        let receiver_tag = Tag::public_key(request_pubkey_parsed);
-                        let alt_tag = Tag::parse(&["alt", "Private Message"])?;
-                        
-                        let event_builder = EventBuilder::new(Kind::EncryptedDirectMessage, encrypted_content, [receiver_tag, alt_tag]);
-                        let event = event_builder.to_event(&self.keys)?;
-                        let event_id = self.client.send_event(event).await?;
-                        info!("Sent access details via NIP-04 Encrypted Direct Message to {}: {:?}", request_pubkey, event_id);
-                        Ok(event_id.to_hex())
-                    }
-                    Err(e) => {
-                        error!("Failed to get secret key for NIP-04 encryption: {}", e);
-                        Err(e.into())
-                    }
-                }
-            }
-            "nip17" => {
-                // Send as NIP-17 Gift Wrap private message
-                let event_id = self.client.send_private_msg(request_pubkey_parsed, details_json, None).await?;
-                info!("Sent access details via NIP-17 Gift Wrap private message to {}: {:?}", request_pubkey, event_id);
-                Ok(event_id.to_hex())
-            }
-            _ => {
-                error!("Unsupported message type: {}", message_type);
-                Err(anyhow::anyhow!("Unsupported message type: {}", message_type))
-            }
-        }
+        self.send_encrypted_private_message(request_pubkey, details_json, message_type).await
     }
 
-    // Send error response via private encrypted message (supports both NIP-04 and NIP-17)
+    // Send status response via private encrypted message
+    pub async fn send_status_response(
+        &self, 
+        request_pubkey: &str,
+        response: StatusResponseContent,
+        message_type: &str
+    ) -> Result<String> {
+        let response_json = serde_json::to_string(&response)?;
+        self.send_encrypted_private_message(request_pubkey, response_json, message_type).await
+    }
+
+    // Convenience helper to send error response with individual fields
+    pub async fn send_error_response(
+        &self,
+        request_pubkey: &str,
+        error_type: &str,
+        message: &str,
+        details: Option<&str>,
+        message_type: &str,
+    ) -> Result<String> {
+        let error = ErrorResponseContent {
+            error_type: error_type.to_string(),
+            message: message.to_string(),
+            details: details.map(|s| s.to_string()),
+        };
+        self.send_error_response_private_message(request_pubkey, error, message_type).await
+    }
+
+    // Send error response via private encrypted message
     pub async fn send_error_response_private_message(
         &self, 
         request_pubkey: &str,
         error: ErrorResponseContent,
         message_type: &str
     ) -> Result<String> {
-        // Serialize the error response
         let error_json = serde_json::to_string(&error)?;
-        
-        let request_pubkey_parsed = nostr_sdk::PublicKey::parse(request_pubkey)?;
-        
-        match message_type {
-            "nip04" => {
-                // Send as NIP-04 Encrypted Direct Message
-                match self.keys.secret_key() {
-                    Ok(secret_key) => {
-                        let encrypted_content = nip04::encrypt(&secret_key, &request_pubkey_parsed, &error_json)?;
-                        
-                        // Create proper tags for NIP-04: p tag with receiver's public key hex
-                        let receiver_tag = Tag::public_key(request_pubkey_parsed);
-                        let alt_tag = Tag::parse(&["alt", "Private Message"])?;
-                        
-                        let event_builder = EventBuilder::new(Kind::EncryptedDirectMessage, encrypted_content, [receiver_tag, alt_tag]);
-                        let event = event_builder.to_event(&self.keys)?;
-                        let event_id = self.client.send_event(event).await?;
-                        info!("Sent error response via NIP-04 Encrypted Direct Message to {}: {:?}", request_pubkey, event_id);
-                        Ok(event_id.to_hex())
-                    }
-                    Err(e) => {
-                        error!("Failed to get secret key for NIP-04 encryption: {}", e);
-                        Err(e.into())
-                    }
-                }
-            }
-            "nip17" => {
-                // Send as NIP-17 Gift Wrap private message
-                let event_id = self.client.send_private_msg(request_pubkey_parsed, error_json, None).await?;
-                info!("Sent error response via NIP-17 Gift Wrap private message to {}: {:?}", request_pubkey, event_id);
-                Ok(event_id.to_hex())
-            }
-            _ => {
-                error!("Unsupported message type: {}", message_type);
-                Err(anyhow::anyhow!("Unsupported message type: {}", message_type))
-            }
-        }
+        self.send_encrypted_private_message(request_pubkey, error_json, message_type).await
     }
 
-    // Send top-up response via private encrypted message (supports both NIP-04 and NIP-17)
+    // Send top-up response via private encrypted message
     pub async fn send_topup_response_private_message(
         &self, 
         request_pubkey: &str,
         response: TopUpResponseContent,
         message_type: &str
     ) -> Result<String> {
-        // Serialize the top-up response
         let response_json = serde_json::to_string(&response)?;
-        
-        let request_pubkey_parsed = nostr_sdk::PublicKey::parse(request_pubkey)?;
-        
-        match message_type {
-            "nip04" => {
-                // Send as NIP-04 Encrypted Direct Message
-                match self.keys.secret_key() {
-                    Ok(secret_key) => {
-                        let encrypted_content = nip04::encrypt(&secret_key, &request_pubkey_parsed, &response_json)?;
-                        
-                        // Create proper tags for NIP-04: p tag with receiver's public key hex
-                        let receiver_tag = Tag::public_key(request_pubkey_parsed);
-                        let alt_tag = Tag::parse(&["alt", "Private Message"])?;
-                        
-                        let event_builder = EventBuilder::new(Kind::EncryptedDirectMessage, encrypted_content, [receiver_tag, alt_tag]);
-                        let event = event_builder.to_event(&self.keys)?;
-                        let event_id = self.client.send_event(event).await?;
-                        info!("Sent top-up response via NIP-04 Encrypted Direct Message to {}: {:?}", request_pubkey, event_id);
-                        Ok(event_id.to_hex())
-                    }
-                    Err(e) => {
-                        error!("Failed to get secret key for NIP-04 encryption: {}", e);
-                        Err(e.into())
-                    }
-                }
-            }
-            "nip17" => {
-                // Send as NIP-17 Gift Wrap private message
-                let event_id = self.client.send_private_msg(request_pubkey_parsed, response_json, None).await?;
-                info!("Sent top-up response via NIP-17 Gift Wrap private message to {}: {:?}", request_pubkey, event_id);
-                Ok(event_id.to_hex())
-            }
-            _ => {
-                error!("Unsupported message type: {}", message_type);
-                Err(anyhow::anyhow!("Unsupported message type: {}", message_type))
-            }
-        }
+        self.send_encrypted_private_message(request_pubkey, response_json, message_type).await
     }
 
 
+
+    // Get the underlying Nostr client
+    pub fn client(&self) -> &Client {
+        &self.client
+    }
 
     // NEW: Get service public key for users
     pub fn get_service_public_key(&self) -> String {
@@ -388,6 +357,99 @@ impl NostrRelaySubscriber {
             sig: event.sig.to_string(),
             message_type: "unknown".to_string(), // Default value since this function doesn't know the context
         }
+    }
+
+    /// Wait for a private decrypted message from a specific sender
+    pub async fn wait_for_decrypted_message(&self, sender_pubkey: &str, timeout_secs: u64) -> Result<NostrEvent> {
+        let sender_pk = nostr_sdk::PublicKey::parse(sender_pubkey)?;
+        let receiver_pk = self.keys.public_key();
+        
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let tx = Arc::new(Mutex::new(Some(tx)));
+        let client = self.client.clone();
+        let receiver_keys = self.keys.clone();
+        let timeout = tokio::time::Duration::from_secs(timeout_secs);
+        
+        // Subscribe to messages sent TO us
+        let filter = Filter::new()
+            .pubkeys(vec![receiver_pk])
+            .kinds(vec![Kind::EncryptedDirectMessage, Kind::GiftWrap]);
+        
+        client.subscribe(vec![filter], None).await;
+
+        // Use tokio::select to handle timeout and notification processing
+        let result = tokio::select! {
+            notification_res = client.handle_notifications(|notification| {
+                let tx = tx.clone();
+                let receiver_keys = receiver_keys.clone();
+                let sender_pk = sender_pk.clone();
+                let client = client.clone();
+                
+                async move {
+                    if let RelayPoolNotification::Event { event, .. } = notification {
+                        let mut event_to_send = None;
+                        
+                        match event.kind {
+                            Kind::GiftWrap => {
+                                // GiftWrap might be NIP-17
+                                if let Ok(UnwrappedGift { rumor, sender }) = client.unwrap_gift_wrap(&event).await {
+                                    if sender == sender_pk && rumor.kind == Kind::PrivateDirectMessage {
+                                        event_to_send = Some(NostrEvent {
+                                            id: rumor.id.map(|id| id.to_hex()).unwrap_or_default(),
+                                            pubkey: sender.to_hex(),
+                                            created_at: rumor.created_at.as_u64(),
+                                            kind: rumor.kind.as_u32(),
+                                            tags: rumor.tags.iter().map(|tag| tag.as_vec().iter().map(|s| s.to_string()).collect()).collect(),
+                                            content: rumor.content,
+                                            sig: String::new(),
+                                            message_type: "nip17".to_string(),
+                                        });
+                                    }
+                                }
+                            }
+                            Kind::EncryptedDirectMessage => {
+                                if event.pubkey == sender_pk {
+                                    if let Ok(secret_key) = receiver_keys.secret_key() {
+                                        if let Ok(content) = nip04::decrypt(&secret_key, &event.pubkey, &event.content) {
+                                            event_to_send = Some(NostrEvent {
+                                                id: event.id.to_hex(),
+                                                pubkey: event.pubkey.to_hex(),
+                                                created_at: event.created_at.as_u64(),
+                                                kind: event.kind.as_u32(),
+                                                tags: event.tags.iter().map(|tag| tag.as_vec().iter().map(|s| s.to_string()).collect()).collect(),
+                                                content,
+                                                sig: event.sig.to_string(),
+                                                message_type: "nip04".to_string(),
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                        
+                        if let Some(ev) = event_to_send {
+                            let mut lock = tx.lock().await;
+                            if let Some(sender) = lock.take() {
+                                let _ = sender.send(ev).await;
+                                return Ok(true); // Stop handling notifications
+                            }
+                        }
+                    }
+                    Ok(false)
+                }
+            }) => {
+                match notification_res {
+                    Ok(_) => rx.recv().await.ok_or_else(|| anyhow::anyhow!("Channel closed")),
+                    Err(e) => Err(anyhow::anyhow!("Notification handler error: {}", e)),
+                }
+            }
+            _ = tokio::time::sleep(timeout) => {
+                Err(anyhow::anyhow!("Timeout waiting for response from {}", sender_pubkey))
+            }
+        };
+        
+        result
     }
 }
 
@@ -484,13 +546,300 @@ pub async fn send_provisioning_request_private_message(
 }
 
 // NEW: Helper function to parse private message content
-pub fn parse_private_message_content(content: &str) -> Result<EncryptedSpawnPodRequest> {
-    match serde_json::from_str::<EncryptedSpawnPodRequest>(content) {
+/// Unified request type for private messages
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PrivateRequest {
+    Spawn(EncryptedSpawnPodRequest),
+    TopUp(EncryptedTopUpPodRequest),
+    Status(StatusRequestContent),
+}
+
+pub fn parse_private_message_content(content: &str) -> Result<PrivateRequest> {
+    match serde_json::from_str::<PrivateRequest>(content) {
         Ok(request) => Ok(request),
         Err(e) => {
-            // Provide detailed error information
-            Err(anyhow::anyhow!("JSON parsing failed: {}. Content: '{}'", e, content))
+            // Provide detailed error information, but truncate content to avoid huge log strings
+            let truncated_content = if content.len() > 100 {
+                format!("{}...", &content[..100])
+            } else {
+                content.to_string()
+            };
+            Err(anyhow::anyhow!("JSON parsing failed: {}. Content: '{}'", e, truncated_content))
         }
     }
 }
 
+// ==================== Provider Discovery Structures ====================
+
+/// Capacity information for a provider
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapacityInfo {
+    pub cpu_available: u64,      // Available CPU in millicores
+    pub memory_mb_available: u64, // Available memory in MB
+    pub storage_gb_available: u64, // Available storage in GB
+}
+
+/// Provider offer content published to Nostr (Kind 38383)
+/// This is a replaceable event that describes what a provider offers
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderOfferContent {
+    pub provider_npub: String,
+    pub hostname: String,
+    pub location: Option<String>,
+    pub capabilities: Vec<String>,  // ["lxc", "vm"]
+    pub specs: Vec<PodSpec>,
+    pub whitelisted_mints: Vec<String>,
+    pub uptime_percent: f32,
+    pub total_jobs_completed: u64,
+    pub api_endpoint: Option<String>,
+}
+
+/// Heartbeat content published to Nostr (Kind 38384)
+/// Published every 60 seconds to prove liveness
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeartbeatContent {
+    pub provider_npub: String,
+    pub timestamp: u64,
+    pub active_workloads: u32,
+    pub available_capacity: CapacityInfo,
+}
+
+/// Provider info as seen by discovery clients
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderInfo {
+    pub npub: String,
+    pub hostname: String,
+    pub location: Option<String>,
+    pub capabilities: Vec<String>,
+    pub specs: Vec<PodSpec>,
+    pub whitelisted_mints: Vec<String>,
+    pub uptime_percent: f32,
+    pub total_jobs_completed: u64,
+    pub last_seen: u64,  // Timestamp of last heartbeat
+    pub is_online: bool,
+}
+
+/// Filter for querying providers
+#[derive(Debug, Clone, Default)]
+pub struct ProviderFilter {
+    pub capability: Option<String>,
+    pub min_uptime: Option<f32>,
+    pub min_memory_mb: Option<u64>,
+    pub min_cpu: Option<u64>,
+}
+
+impl NostrRelaySubscriber {
+    /// Publish a provider offer event (Kind 38383 - replaceable)
+    pub async fn publish_provider_offer(&self, offer: ProviderOfferContent) -> Result<String> {
+        let content = serde_json::to_string(&offer)?;
+        info!("Publishing provider offer for {}", offer.hostname);
+        
+        // Use "d" tag for replaceable event (NIP-33 parameterized replaceable)
+        let tags = vec![
+            Tag::hashtag("paygress"),
+            Tag::hashtag("compute"),
+            Tag::parse(&["d", &offer.provider_npub])?,
+        ];
+        
+        let builder = EventBuilder::new(Kind::Custom(KIND_PROVIDER_OFFER), content, tags);
+        let event = builder.to_event(&self.keys)?;
+        let event_id = event.id.to_hex();
+        
+        match self.client.send_event(event).await {
+            Ok(res) => {
+                info!("✅ Published provider offer: {} ({:?})", event_id, res);
+                Ok(event_id)
+            }
+            Err(e) => {
+                error!("❌ Failed to publish provider offer: {}", e);
+                Err(e.into())
+            }
+        }
+    }
+
+    /// Publish a heartbeat event (Kind 38384)
+    pub async fn publish_heartbeat(&self, heartbeat: HeartbeatContent) -> Result<String> {
+        let content = serde_json::to_string(&heartbeat)?;
+        
+        let tags = vec![
+            Tag::hashtag("paygress-heartbeat"),
+            Tag::public_key(nostr_sdk::PublicKey::parse(&heartbeat.provider_npub)?),
+        ];
+        
+        let builder = EventBuilder::new(Kind::Custom(KIND_PROVIDER_HEARTBEAT), content, tags);
+        let event = builder.to_event(&self.keys)?;
+        let event_id = event.id.to_hex();
+        
+        match self.client.send_event(event).await {
+            Ok(_) => {
+                info!("💓 Heartbeat published: {}", event_id);
+                Ok(event_id)
+            }
+            Err(e) => {
+                warn!("Failed to publish heartbeat: {}", e);
+                Err(e.into())
+            }
+        }
+    }
+
+    /// Query all provider offers from relays
+    pub async fn query_providers(&self) -> Result<Vec<ProviderOfferContent>> {
+        let filter = Filter::new()
+            .kind(Kind::Custom(KIND_PROVIDER_OFFER))
+            .hashtag("paygress");
+
+        let events = self.client.get_events_of(vec![filter], Some(std::time::Duration::from_secs(5))).await?;
+        
+        let mut providers = Vec::new();
+        for event in events {
+            match serde_json::from_str::<ProviderOfferContent>(&event.content) {
+                Ok(offer) => providers.push(offer),
+                Err(e) => {
+                    warn!("Failed to parse provider offer {}: {}", event.id, e);
+                }
+            }
+        }
+        
+        info!("Found {} providers", providers.len());
+        Ok(providers)
+    }
+
+    /// Query heartbeats for a specific provider since a given time
+    pub async fn query_heartbeats(&self, provider_npub: &str, since_secs: u64) -> Result<Vec<HeartbeatContent>> {
+        let provider_pubkey = nostr_sdk::PublicKey::parse(provider_npub)?;
+        
+        let filter = Filter::new()
+            .kind(Kind::Custom(KIND_PROVIDER_HEARTBEAT))
+            .author(provider_pubkey)
+            .since(Timestamp::from(since_secs));
+
+        let events = self.client.get_events_of(vec![filter], Some(std::time::Duration::from_secs(5))).await?;
+        
+        let mut heartbeats = Vec::new();
+        for event in events {
+            match serde_json::from_str::<HeartbeatContent>(&event.content) {
+                Ok(hb) => heartbeats.push(hb),
+                Err(e) => {
+                    warn!("Failed to parse heartbeat {}: {}", event.id, e);
+                }
+            }
+        }
+        
+        Ok(heartbeats)
+    }
+
+    /// Get the latest heartbeat for a provider (to check if online)
+    pub async fn get_latest_heartbeat(&self, provider_npub: &str) -> Result<Option<HeartbeatContent>> {
+        let provider_pubkey = nostr_sdk::PublicKey::parse(provider_npub)?;
+        
+        // Look for heartbeats in the last 5 minutes
+        let five_mins_ago = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() - 300;
+        
+        let filter = Filter::new()
+            .kind(Kind::Custom(KIND_PROVIDER_HEARTBEAT))
+            .author(provider_pubkey)
+            .since(Timestamp::from(five_mins_ago))
+            .limit(1);
+
+        let events = self.client.get_events_of(vec![filter], Some(std::time::Duration::from_secs(3))).await?;
+        
+        if let Some(event) = events.first() {
+            match serde_json::from_str::<HeartbeatContent>(&event.content) {
+                Ok(hb) => return Ok(Some(hb)),
+                Err(e) => warn!("Failed to parse heartbeat: {}", e),
+            }
+        }
+        
+        Ok(None)
+    }
+
+    /// Get the latest heartbeats for multiple providers in a single batch query
+    pub async fn get_latest_heartbeats_multi(&self, provider_npubs: Vec<String>) -> Result<std::collections::HashMap<String, HeartbeatContent>> {
+        if provider_npubs.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let mut pubkeys = Vec::new();
+        for npub in provider_npubs {
+            if let Ok(pk) = nostr_sdk::PublicKey::parse(&npub) {
+                pubkeys.push(pk);
+            }
+        }
+
+        // Look for heartbeats in the last 5 minutes
+        let five_mins_ago = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() - 300;
+        
+        // Query for ANY heartbeat from ANY of these authors
+        let filter = Filter::new()
+            .kind(Kind::Custom(KIND_PROVIDER_HEARTBEAT))
+            .authors(pubkeys)
+            .since(Timestamp::from(five_mins_ago));
+
+        // Use a short timeout of 3 seconds for fast feedback
+        let events = self.client.get_events_of(vec![filter], Some(std::time::Duration::from_secs(3))).await?;
+        
+        let mut heartbeats = std::collections::HashMap::new();
+        
+        // Process events, keeping only the latest for each provider
+        for event in events {
+            if let Ok(hb) = serde_json::from_str::<HeartbeatContent>(&event.content) {
+                match heartbeats.entry(hb.provider_npub.clone()) {
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        let existing: &HeartbeatContent = entry.get();
+                        if hb.timestamp > existing.timestamp {
+                            entry.insert(hb);
+                        }
+                    }
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(hb);
+                    }
+                }
+            }
+        }
+        
+        Ok(heartbeats)
+    }
+
+    /// Calculate uptime percentage for a provider over the last N days
+    pub async fn calculate_uptime(&self, provider_npub: &str, days: u32) -> Result<f32> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        let since = now - (days as u64 * 24 * 60 * 60);
+        
+        let heartbeats = self.query_heartbeats(provider_npub, since).await?;
+        
+        if heartbeats.is_empty() {
+            return Ok(0.0);
+        }
+        
+        // Expected heartbeats (one per minute)
+        let expected = (days as f32) * 24.0 * 60.0;
+        let actual = heartbeats.len() as f32;
+        
+        Ok((actual / expected * 100.0).min(100.0))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatusRequestContent {
+    pub pod_id: String, // Can be NPUB or container ID
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatusResponseContent {
+    pub pod_id: String,
+    pub status: String,
+    pub expires_at: String,
+    pub time_remaining_seconds: u64,
+    pub cpu_millicores: u64,
+    pub memory_mb: u64,
+    pub ssh_host: String,
+    pub ssh_port: u16,
+    pub ssh_username: String,
+}
