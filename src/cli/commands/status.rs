@@ -23,13 +23,11 @@ pub async fn execute(server: &str, args: StatusArgs, verbose: bool) -> Result<()
     if let Some(provider_npub) = args.provider {
         return execute_decentralized_status(args.pod_id, provider_npub, verbose).await;
     }
-
     if verbose {
         println!("{} Checking pod status...", "→".blue());
         println!("  Server: {}", server);
         println!("  Pod ID: {}", args.pod_id);
     }
-    
     let spinner = ProgressBar::new_spinner();
     spinner.set_style(
         ProgressStyle::default_spinner()

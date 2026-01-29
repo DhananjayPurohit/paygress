@@ -7,7 +7,6 @@ pub mod offers;
 pub mod deploy;
 pub mod service;
 pub mod fix;
-
 // New Proxmox/Provider commands
 pub mod provider;
 pub mod market;

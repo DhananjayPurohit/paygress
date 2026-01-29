@@ -1,4 +1,8 @@
-# Paygress
+# [Paygress](https://paygress.net)
+
+
+### Demo video
+https://github.com/user-attachments/assets/627d2bb1-1a9b-4e66-bc42-7c91a1804fe1
 
 **Decentralized Pay-per-Use Compute with Cashu + Nostr**
 
@@ -151,6 +155,13 @@ ssh root@<IP> "journalctl -u paygress-provider -f"
 ```
 
 ### Market Interactions
+```bash
+# interactive prompt to pick a provider
+paygress-cli market list 
+
+# Spawn with specific image (if supported)
+paygress-cli market spawn ... --image "ubuntu:24.04"
+```
 ```bash
 # interactive prompt to pick a provider
 paygress-cli market list 
