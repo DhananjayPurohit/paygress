@@ -1,16 +1,13 @@
-# [Paygress](https://paygress.net)
-
-
-### Demo video
-https://github.com/user-attachments/assets/627d2bb1-1a9b-4e66-bc42-7c91a1804fe1
-
-**Decentralized Pay-per-Use Compute with Cashu + Nostr**
-
-Paygress is a platform that allows anyone to buy and sell compute resources instantly using **Cashu** (e-cash) for payments and **Nostr** for discovery and communication. No accounts, no signups, just pay and compute.
-
-🌐 **Website:** [paygress.net](https://paygress.net)
+# Paygress
 
 ## 🎥 Demo
+https://github.com/user-attachments/assets/627d2bb1-1a9b-4e66-bc42-7c91a1804fe1
+
+**Decentralized Pay-per-Use Compute with Lightening + Nostr**
+
+Paygress is a platform that allows anyone to buy and sell compute resources instantly using **Lightening** for payments and **Nostr** for discovery and communication. No accounts, no signups, just pay and compute.
+
+🌐 **Website:** [paygress.net](https://paygress.net)
 
 <video width="100%" controls>
   <source src="assets/paygress-demo.mov" type="video/quicktime">
@@ -22,7 +19,7 @@ Paygress is a platform that allows anyone to buy and sell compute resources inst
 - **Anonymous & Private**: No KYC, no accounts. Payments are settled instantly via Cashu tokens.
 - **Decentralized Discovery**: Providers broadcast availability via Nostr. Clients discover and negotiate directly.
 - **Multi-Backend Support**:
-    - **LXD (Native)**: Perfect for VPS and bare metal (Ubuntu 22.04+).
+    - **LXD (Native)**: Perfect for VPS and bare metal.
     - **Proxmox VE**: Enterprise-grade virtualization management.
     - **Kubernetes**: Scalable pod provisioning.
 - **End-to-End Encryption**: All communication between client and provider is encrypted (NIP-04/NIP-17).
