@@ -1,151 +1,185 @@
 # Paygress
 
-**Cashu Payment Gateway for Kubernetes Pod Provisioning with ngx_l402**
+**Decentralized Pay-per-Use Compute with Cashu + Nostr**
 
-## 🚀 Deploy
+Paygress is a platform that allows anyone to buy and sell compute resources instantly using **Cashu** (e-cash) for payments and **Nostr** for discovery and communication. No accounts, no signups, just pay and compute.
 
-```bash
-# 1. Configure
-cp inventory.ini.template inventory.ini
-nano inventory.ini
+🌐 **Website:** [paygress.net](https://paygress.net)
 
-# 2. Deploy
-chmod +x setup-paygress.sh
-./setup-paygress.sh deploy
-```
+## 🎥 Demo
 
-### Docker Deployment
+<video width="100%" controls>
+  <source src="assets/paygress-demo.mov" type="video/quicktime">
+  Your browser does not support the video tag. <a href="assets/paygress-demo.mov">Download video</a>.
+</video>
 
-```bash
-# 1. Configure
-cp .env.template .env
-nano .env
+## ✨ Features
 
-# 2. Deploy
-docker-compose up -d
-```
+- **Anonymous & Private**: No KYC, no accounts. Payments are settled instantly via Cashu tokens.
+- **Decentralized Discovery**: Providers broadcast availability via Nostr. Clients discover and negotiate directly.
+- **Multi-Backend Support**:
+    - **LXD (Native)**: Perfect for VPS and bare metal (Ubuntu 22.04+).
+    - **Proxmox VE**: Enterprise-grade virtualization management.
+    - **Kubernetes**: Scalable pod provisioning.
+- **End-to-End Encryption**: All communication between client and provider is encrypted (NIP-04/NIP-17).
 
-## 💰 How It Works
+---
 
-```
-Client → nginx + ngx_l402 → Paygress → Kubernetes Pod
-         (validates payment)  (decodes → calculates duration)
-```
+## 🚀 Quick Start: Using the Marketplace
 
-**Payment determines duration:** `duration = payment_msats ÷ tier_rate`
+The **Paygress CLI** is your gateway to buying compute.
 
-## 📊 Pricing
-
-| Tier | Rate | CPU | RAM | 60k msats |
-|------|------|-----|-----|-----------|
-| basic | 100 msats/sec | 1 core | 1GB | 10 min |
-| standard | 200 msats/sec | 2 cores | 2GB | 5 min |
-| premium | 400 msats/sec | 4 cores | 4GB | 2.5 min |
-
-## 📝 API Usage
-
-```bash
-curl -X POST http://your-server:<http-port>/pods/spawn \
-  -H "Content-Type: application/json" \
-  -H "X-Cashu Cashu cashuAeyJ0b2tlbiI6..." \
-  -d '{
-    "pod_spec_id": "basic",
-    "pod_image": "linuxserver/openssh-server:latest",
-    "ssh_username": "user",
-    "ssh_password": "password"
-  }'
-```
-
-## 🖥️ CLI Tool
-
-### Build
-
+### 1. Build the CLI
 ```bash
 cargo build --bin paygress-cli
+# Optional: Install to path
+cargo install --path . --bin paygress-cli
 ```
 
-### Commands
+### 2. List Available Providers
+Find providers offering compute resources.
+```bash
+# List all providers
+paygress-cli market list
+
+# Sort by price
+paygress-cli market list --sort price
+
+# Filter by capability
+paygress-cli market list --capability lxd
+```
+
+### 3. Spawn a Workload
+Provision a container instantly. You need a **Cashu token** (minted from a Cashu wallet like [Nutstash](https://nutstash.app/)).
 
 ```bash
-# Spawn a pod with Cashu payment
-paygress-cli spawn \
-  -s http://your-server:<http-port> \
+paygress-cli market spawn \
+  --provider <PROVIDER_NPUB> \
   --tier basic \
-  --token "cashuBo2F..." \
-  --ssh-user myuser \
-  --ssh-pass mypassword
-
-# Check pod status
-paygress-cli status \
-  -s http://your-server:<http-port> \
-  --pod-id <POD_NPUB>
-
-# Top up a pod
-paygress-cli topup \
-  -s http://your-server:<http-port> \
-  --pod-id <POD_NPUB> \
-  --token "cashuBo2F..."
-
-# List available offers/tiers
-./target/debug/paygress-cli offers -s http://your-server:<http-port>
+  --token "cashuA..." \
+  --ssh-pass "my-secure-password"
 ```
 
-### CLI Options
+**Output:**
+```
+🎉 Workload Provisioned Successfully!
 
-| Option | Description | Default |
-|--------|-------------|---------|
-| `-s, --server` | Paygress server URL | `http://localhost:8080` |
-| `-t, --tier` | Pod tier (basic, standard, premium) | Required |
-| `-k, --token` | Cashu token for payment | Required |
-| `-i, --image` | Container image | `linuxserver/openssh-server:latest` |
-| `-u, --ssh-user` | SSH username | `user` |
-| `-p, --ssh-pass` | SSH password | `password` |
+  Pod ID:   container-1001
+  Expires:   2026-01-29T17:15:00+00:00
+  Spec:   1 vCPU, 1024 MB RAM
 
-## 🛠️ Server Commands
+Connection Instructions:
+  • 🚀 Workload provisioned successfully!
+  • 👤 Username: root
+  • 🔑 Password: my-secure-password
+  • ⌛ Expires: 2026-01-29 17:15:00 UTC
+  • Access: You can connect to the container using SSH.
+  •   ssh -p <PORT> root@<PROVIDER_IP>
+```
+
+### 4. Connect
+Use the provided SSH command to access your container.
+```bash
+ssh -p <PORT> root@<PROVIDER_IP>
+```
+
+---
+
+## ☁️ Become a Provider
+
+Monetize your idle hardware by joining the Paygress network.
+
+### One-Click Bootstrap (LXD/Proxmox)
+
+The CLI can automatically set up your server as a Paygress Provider.
+
+**Requirements:**
+- **Linux** (with systemd)
+- **LXD** or **Proxmox VE** installed (or let bootstrap install them)
+- Root access
 
 ```bash
-./setup-paygress.sh deploy    # Deploy
-./setup-paygress.sh status    # Check status
-./setup-paygress.sh logs      # View logs
-./setup-paygress.sh test      # Test API
-./setup-paygress.sh restart   # Restart
-./setup-paygress.sh fix-k8s   # Fix Kubernetes
+paygress-cli bootstrap \
+  --host <YOUR_SERVER_IP> \
+  --user root \
+  --name "My Compute Node" \
+  --location "US-West" \
+  --backend lxd  # or 'proxmox'
 ```
 
-## 🔧 Fix Container Issues
+This command will:
+1. SSH into your server.
+2. Install dependencies (LXD or Proxmox).
+3. configure networking and storage.
+4. Deploy the Paygress Provider service.
+5. Generate a Nostr identity and start broadcasting offers.
 
-If pods are stuck in `ContainerCreating`:
+---
 
+## 🔧 Supported Backends
+
+Paygress supports multiple compute backends to suit different needs.
+
+| Backend | Description | Best For | Status |
+|---------|-------------|----------|--------|
+| **LXD** | Lightweight Linux Containers. Fast startup, low overhead. | Linux VPS, Bare Metal | ✅ **Verified** |
+| **Proxmox** | Full VM and Container management via API. | Home Labs, Enterprise | ✅ **Verified** |
+| **Kubernetes** | Pod provisioning in a K8s cluster. | Scalable Cloud Installs | 🚧 **Beta** |
+
+### Kubernetes Mode
+To run Paygress as a Kubernetes operator/gateway:
+
+1. **Deploy Ingress Controller:** Ensure Nginx is set up with `ngx_l402` for payment validation.
+2. **Deploy Paygress Service:**
+   ```bash
+   ./setup-paygress.sh deploy
+   ```
+3. **Usage:**
+   Clients send HTTP requests with Cashu tokens headers to the ingress endpoint.
+
+---
+
+## 🛠️ CLI Command Showcase
+
+### System Management
 ```bash
-ssh c03rad0r@192.168.8.229
+# Reset the provider service on a remote host (useful for debugging)
+paygress-cli system reset --host <IP>
 
-# Restart containerd and kubelet
-sudo systemctl restart containerd
-sudo systemctl restart kubelet
-
-# Wait
-sleep 30
-
-# Check status
-kubectl get pods -n user-workloads
-
-# If still stuck, delete failed pods
-kubectl delete pod --all -n user-workloads --force --grace-period=0
-
-# Check nodes
-kubectl get nodes
+# View provider logs
+ssh root@<IP> "journalctl -u paygress-provider -f"
 ```
 
-## ⚙️ Configuration
+### Market Interactions
+```bash
+# interactive prompt to pick a provider
+paygress-cli market list 
 
-**inventory.ini:** Server details, pricing, mints  
-**pod-specs.json:** Pricing tiers  
+# Spawn with specific image (if supported)
+paygress-cli market spawn ... --image "ubuntu:24.04"
+```
+
+### Direct HTTP API (Centralized Mode)
+For private/centralized deployments using the HTTP API:
+```bash
+paygress-cli spawn \
+  -s http://my-private-server.com \
+  --tier standard \
+  --token "cashuA..."
+```
+
+---
 
 ## 🏗️ Architecture
 
-- **ngx_l402** - Payment enforcement at nginx
-- **Paygress** - Token decoding & duration calculation
-- **Kubernetes** - Pod provisioning & management
+1.  **Provider Service**: Runs on the compute node. Listens for NIP-04 encrypted messages on Nostr relays.
+2.  **Discovery**: Providers publish advertisements (NIP-01) with 'ephemeral' events or specialized kinds to announce availability.
+3.  **Negotiation**: Client sends a `spawn` request with a Cashu token.
+4.  **Verification**: Provider verifies the Cashu token against the mint (Preventing double-spends).
+5.  **Provisioning**:
+    *   **LXD**: Creates a container, sets limits, configures SSH port forwarding.
+    *   **Proxmox**: Calls Proxmox API to clone a template/container.
+6.  **Access**: Provider sends back IP, Port, and Credentials encrypted to the client.
 
-Payment verification: ngx_l402 only  
-Duration calculation: Paygress (payment ÷ rate)
+---
+**License**: MIT

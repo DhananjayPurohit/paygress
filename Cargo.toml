@@ -59,6 +59,11 @@ clap = { version = "4", features = ["derive"] }
 indicatif = "0.17"
 colored = "2"
 
+# Proxmox integration dependencies
+serde_urlencoded = "0.7"
+futures = "0.3"
+num_cpus = "1.0"
+
 
 [profile.release]
 # Optimize for small binary size  

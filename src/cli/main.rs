@@ -8,16 +8,16 @@ use colored::Colorize;
 mod api;
 mod commands;
 
-use commands::{spawn, topup, status, offers, deploy, service, fix};
+use commands::{spawn, topup, status, offers, deploy, service, fix, provider, market, bootstrap, system};
 
-/// Paygress CLI - Cashu Payment Gateway for Kubernetes Pod Provisioning
+/// Paygress CLI - Cashu Payment Gateway for Compute Provisioning
 #[derive(Parser)]
 #[command(name = "paygress-cli")]
 #[command(author = "Dhananjay Purohit")]
-#[command(version = "0.1.0")]
-#[command(about = "CLI tool for Paygress - spawn pods with Cashu payments", long_about = None)]
+#[command(version = "0.2.0")]
+#[command(about = "CLI tool for Paygress - spawn compute with Cashu payments", long_about = None)]
 struct Cli {
-    /// Paygress server URL
+    /// Paygress server URL (for K8s mode)
     #[arg(short, long, default_value = "http://localhost:8080", global = true)]
     server: String,
 
@@ -31,9 +31,25 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    // ============ API Commands (End Users) ============
+    // ============ Marketplace Commands (End Users - Proxmox Mode) ============
     
-    /// Spawn a new pod with Cashu payment
+    /// Discover and use compute providers (Proxmox mode)
+    Market(market::MarketArgs),
+
+    // ============ Provider Commands (Machine Operators - Proxmox Mode) ============
+    
+    /// Provider management - setup, start, stop (Proxmox mode)
+    Provider(provider::ProviderArgs),
+    
+    /// One-click bootstrap - install Proxmox + Paygress on a server
+    Bootstrap(bootstrap::BootstrapArgs),
+
+    /// System management - reset, clean up environment
+    System(system::SystemArgs),
+
+    // ============ API Commands (End Users - K8s Mode) ============
+    
+    /// Spawn a new pod with Cashu payment (K8s mode)
     Spawn(spawn::SpawnArgs),
 
     /// Top up an existing pod with additional payment
@@ -45,9 +61,9 @@ enum Commands {
     /// List available pod offers/tiers
     Offers(offers::OffersArgs),
 
-    // ============ Management Commands (Server Operators) ============
+    // ============ Management Commands (Server Operators - K8s Mode) ============
     
-    /// Deploy Paygress to a server
+    /// Deploy Paygress to a server (K8s mode)
     Deploy(deploy::DeployArgs),
 
     /// Service management (status, logs, restart)
@@ -60,13 +76,19 @@ enum Commands {
 fn print_banner() {
     println!("{}", "╔════════════════════════════════════════════════════════════╗".blue());
     println!("{}", "║                    PAYGRESS CLI                            ║".blue());
-    println!("{}", "║  Cashu Payment Gateway for Kubernetes Pod Provisioning    ║".blue());
+    println!("{}", "║     Pay-per-Use Compute with Cashu + Nostr                 ║".blue());
     println!("{}", "╚════════════════════════════════════════════════════════════╝".blue());
     println!();
 }
 
 #[tokio::main]
 async fn main() {
+    // Initialize tracing
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")))
+        .with_writer(std::io::stderr)
+        .init();
+
     let cli = Cli::parse();
 
     if cli.verbose {
@@ -74,13 +96,21 @@ async fn main() {
     }
 
     let result = match cli.command {
-        // API Commands
+        // Proxmox Mode - Marketplace
+        Commands::Market(args) => market::execute(args, cli.verbose).await,
+        
+        // Proxmox Mode - Provider
+        Commands::Provider(args) => provider::execute(args, cli.verbose).await,
+        Commands::Bootstrap(args) => bootstrap::execute(args, cli.verbose).await,
+        Commands::System(args) => system::execute(args, cli.verbose).await,
+        
+        // K8s Mode - API Commands
         Commands::Spawn(args) => spawn::execute(&cli.server, args, cli.verbose).await,
         Commands::Topup(args) => topup::execute(&cli.server, args, cli.verbose).await,
         Commands::Status(args) => status::execute(&cli.server, args, cli.verbose).await,
         Commands::Offers(args) => offers::execute(&cli.server, args, cli.verbose).await,
         
-        // Management Commands
+        // K8s Mode - Management Commands
         Commands::Deploy(args) => deploy::execute(args, cli.verbose).await,
         Commands::Service(args) => service::execute(args, cli.verbose).await,
         Commands::Fix(args) => fix::execute(args, cli.verbose).await,

@@ -883,32 +883,8 @@ impl SidecarState {
 
 // Extract token value in sats from Cashu token
 pub async fn extract_token_value(token: &str) -> Result<u64, String> {
-    use std::str::FromStr;
-    
-    // Decode the token to get its value
-    let token_decoded = cdk::nuts::Token::from_str(token)
-        .map_err(|e| format!("Failed to decode Cashu token: {}", e))?;
-    
-    // Check if the token is valid
-    if token_decoded.proofs().is_empty() {
-        return Err("Token has no proofs".to_string());
-    }
-    
-    // Calculate total token amount
-    let total_amount = token_decoded.value()
-        .map_err(|e| format!("Failed to get token value: {}", e))?;
-
-    // Check if the token unit is in millisatoshis or satoshis
-    let total_amount_msats: u64 = match token_decoded.unit() {
-        Some(unit) => match unit {
-            cdk::nuts::CurrencyUnit::Sat => u64::from(total_amount) * 1000, // Convert sat to msat
-            cdk::nuts::CurrencyUnit::Msat => u64::from(total_amount), // Already in msat
-            _ => return Err(format!("Unsupported token unit: {:?}", unit)),
-        },
-        None => return Err("Token has no unit specified".to_string()),
-    };
-    
-    Ok(total_amount_msats)
+    crate::cashu::extract_token_value(token).await
+        .map_err(|e| e.to_string())
 }
 
 // Create router for the sidecar service
