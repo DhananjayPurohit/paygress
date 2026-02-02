@@ -5,6 +5,9 @@
 use anyhow::Result;
 use clap::{Args, Subcommand};
 use colored::Colorize;
+use std::io::Write;
+use std::path::Path;
+use nostr_sdk::{Keys, ToBech32}; // Ensure nostr_sdk is available or use full path
 
 use paygress::discovery::DiscoveryClient;
 use paygress::nostr::{
@@ -99,9 +102,9 @@ pub struct SpawnArgs {
     #[arg(long)]
     pub ssh_pass: String,
     
-    /// Your Nostr private key (nsec) for encrypted communication
+    /// Your Nostr private key (nsec) for encrypted communication (optional - will use ~/.paygress/identity if not provided)
     #[arg(long)]
-    pub nostr_key: String,
+    pub nostr_key: Option<String>,
     
     /// Custom Nostr relays (comma-separated)
     #[arg(long)]
@@ -124,6 +127,50 @@ fn parse_relays(relays: Option<String>) -> Vec<String> {
             .collect(),
         None => DEFAULT_RELAYS.iter().map(|s| s.to_string()).collect(),
     }
+}
+
+fn get_or_create_identity(explicit_key: Option<String>) -> Result<String> {
+    if let Some(key) = explicit_key {
+        return Ok(key);
+    }
+
+    let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("Could not determine home directory"))?;
+    let paygress_dir = Path::new(&home).join(".paygress");
+    if !paygress_dir.exists() {
+        std::fs::create_dir_all(&paygress_dir)?;
+    }
+    
+    let identity_file = paygress_dir.join("identity");
+    if identity_file.exists() {
+        let key = std::fs::read_to_string(&identity_file)?.trim().to_string();
+        println!("  Using identity from {}", identity_file.display().to_string().dimmed());
+        return Ok(key);
+    }
+    
+    // Generate new key
+    println!("{}", "  ℹ No identity found. Generating new Nostr identity...".yellow());
+    let keys = Keys::generate();
+    let nsec = keys.secret_key()?.to_bech32()?;
+    
+    // Save to file
+    let mut file = std::fs::File::create(&identity_file)?;
+    file.write_all(nsec.as_bytes())?;
+    
+    // Set permissions to 600 (owner read/write only) on Unix
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = file.metadata()?.permissions();
+        perms.set_mode(0o600);
+        file.set_permissions(perms)?;
+    }
+    
+    println!("  {} Created new identity at {}", "✓".green(), identity_file.display());
+    println!("  {} {}", "NSEC:".bold(), nsec.red());
+    println!("  {}", "Make sure to back up this key!".yellow());
+    println!();
+    
+    Ok(nsec)
 }
 
 async fn execute_list(args: ListArgs, verbose: bool) -> Result<()> {
@@ -213,8 +260,11 @@ async fn execute_spawn(args: SpawnArgs, verbose: bool) -> Result<()> {
 
     let relays = parse_relays(args.relays);
     
+    // Get or create identity
+    let nostr_key = get_or_create_identity(args.nostr_key)?;
+    
     // Create discovery client with user's key for encrypted messaging
-    let client = DiscoveryClient::new_with_key(relays.clone(), args.nostr_key.clone()).await?;
+    let client = DiscoveryClient::new_with_key(relays.clone(), nostr_key).await?;
     
     println!("  Your NPUB: {}", client.get_npub().cyan());
     println!();

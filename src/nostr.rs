@@ -375,7 +375,7 @@ impl NostrRelaySubscriber {
             .pubkeys(vec![receiver_pk])
             .kinds(vec![Kind::EncryptedDirectMessage, Kind::GiftWrap]);
         
-        client.subscribe(vec![filter], None).await;
+        let _ = client.subscribe(vec![filter], None).await;
 
         // Use tokio::select to handle timeout and notification processing
         let result = tokio::select! {

@@ -2443,7 +2443,6 @@ dependencies = [
 ]
 
 [[package]]
-<<<<<<< HEAD
 name = "num_cpus"
 version = "1.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2454,8 +2453,6 @@ dependencies = [
 ]
 
 [[package]]
-=======
->>>>>>> d8f8296ac85528edfda3b8ca8d96e58cd03feb50
 name = "number_prefix"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

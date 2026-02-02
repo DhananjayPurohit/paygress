@@ -268,7 +268,7 @@ impl PodProvisioningService {
                 // Pod exists in Kubernetes but not in our tracking (likely expired)
                 let status = pod.status.as_ref()
                     .and_then(|status| status.phase.as_ref())
-                    .map(|phase| phase.clone())
+                    .cloned()
                     .unwrap_or_else(|| "unknown".to_string());
 
                 Ok(GetPodStatusResponse {

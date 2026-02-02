@@ -189,7 +189,7 @@ impl ComputeBackend for LxdBackend {
         }
 
         // Use `df -B1 /` for disk
-        let disk_output = Command::new("df").args(&["-B1", "/"]).output()?;
+        let disk_output = Command::new("df").args(["-B1", "/"]).output()?;
         let disk_str = String::from_utf8_lossy(&disk_output.stdout);
         
         let mut disk_total = 0;

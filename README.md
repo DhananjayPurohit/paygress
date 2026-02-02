@@ -105,7 +105,6 @@ paygress-cli bootstrap \
   --user root \
   --name "My Compute Node" \
   --location "US-West" \
-  --backend lxd  # or 'proxmox'
 ```
 
 This command will:

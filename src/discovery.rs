@@ -165,7 +165,7 @@ impl DiscoveryClient {
     }
 
     /// Sort providers by various criteria
-    pub fn sort_providers(providers: &mut Vec<ProviderInfo>, sort_by: &str) {
+    pub fn sort_providers(providers: &mut [ProviderInfo], sort_by: &str) {
         match sort_by {
             "price" => {
                 providers.sort_by(|a, b| {

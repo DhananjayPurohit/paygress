@@ -1,19 +1,9 @@
-use axum::{
-    routing::{get, post},
-    Router,
-    extract::{Query, State, Path},
-    Json,
-    http::StatusCode,
-    response::{IntoResponse, Response},
-};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::sync::Arc;
-use tracing::{info, warn, error};
+use tracing::{info, warn};
 use std::collections::{HashMap, BTreeMap, HashSet};
 use chrono::{DateTime, Utc};
-// Removed unused nostr_sdk imports
-use kube::{Api, api::ListParams};
-use k8s_openapi::api::core::v1::Pod;
+
 // Using NIP-17 private direct messages - no manual encryption needed
 use std::sync::Mutex;
 
@@ -76,25 +66,6 @@ impl PortPool {
         }
     }
     
-    pub fn allocate_port(&mut self) -> Option<u16> {
-        if let Some(&port) = self.available_ports.iter().next() {
-            self.available_ports.remove(&port);
-            self.allocated_ports.insert(port);
-            Some(port)
-        } else {
-            None
-        }
-    }
-    
-    pub fn deallocate_port(&mut self, port: u16) {
-        if self.allocated_ports.remove(&port) {
-            self.available_ports.insert(port);
-        }
-    }
-    
-    pub fn is_allocated(&self, port: u16) -> bool {
-        self.allocated_ports.contains(&port)
-    }
     
     pub fn available_count(&self) -> usize {
         self.available_ports.len()
@@ -131,44 +102,7 @@ pub struct PodInfo {
     pub nostr_private_key: String, // Pod's nsec
 }
 
-// Request to spawn a pod
-#[derive(Debug, Deserialize)]
-pub struct SpawnPodRequest {
-    pub cashu_token: String,
-    pub pod_image: Option<String>, // Optional: Uses base image if not specified
-    pub ssh_username: Option<String>, // Optional custom username
-    pub ssh_password: Option<String>, // Optional custom password
-}
 
-// Request to top up/extend a pod
-#[derive(Debug, Deserialize)]
-pub struct TopUpPodRequest {
-    pub pod_npub: String,    // Changed from pod_name to pod_npub
-    pub cashu_token: String,
-}
-
-// Response from pod spawning
-#[derive(Debug, Serialize)]
-pub struct SpawnPodResponse {
-    pub success: bool,
-    pub message: String,
-    pub pod_info: Option<PodInfo>,
-}
-
-// Response from pod top-up
-#[derive(Debug, Serialize)]
-pub struct TopUpPodResponse {
-    pub success: bool,
-    pub message: String,
-    pub pod_info: Option<PodInfo>,
-    pub extended_duration_seconds: Option<u64>,
-}
-
-// Auth query for ingress
-#[derive(Debug, Deserialize)]
-pub struct AuthQuery {
-    pub token: Option<String>,
-}
 
 // Pod management service
 pub struct PodManager {
@@ -277,8 +211,8 @@ impl PodManager {
         labels.insert("pod-type".to_string(), "ssh-access".to_string());
         labels.insert("pod-name".to_string(), pod_name.to_string());
         // Extract hex part from NPUB and truncate to fit Kubernetes label limit (63 chars)
-        let npub_hex = if pod_npub.starts_with("npub1") {
-            &pod_npub[5..] // Remove "npub1" prefix
+        let npub_hex = if let Some(stripped) = pod_npub.strip_prefix("npub1") {
+            stripped // Remove "npub1" prefix
         } else {
             pod_npub // Already hex or different format
         };
@@ -444,7 +378,7 @@ tail -f /dev/null
             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
             attempts += 1;
             
-            match pods.get(&pod_name).await {
+            match pods.get(pod_name).await {
                 Ok(p) => {
                     if let Some(status) = &p.status {
                         if let Some(phase) = &status.phase {
@@ -513,66 +447,12 @@ tail -f /dev/null
         Ok(node_port)
     }
 
-    // Set up port forwarding for SSH access
-    async fn setup_port_forward(
-        namespace: &str,
-        pod_name: &str,
-        ssh_port: u16,
-    ) -> Result<(), String> {
-        use std::process::Command;
-        use std::thread;
-        use std::time::Duration;
-
-        // Start port forwarding in a separate thread
-        let namespace = namespace.to_string();
-        let pod_name = pod_name.to_string();
-        
-        thread::spawn(move || {
-            let mut cmd = Command::new("kubectl");
-            cmd.args(&[
-                "port-forward",
-                &format!("pod/{}", pod_name),
-                &format!("0.0.0.0:{}:2222", ssh_port), // Bind to all interfaces
-                "-n", &namespace,
-            ]);
-            
-            info!("Starting port forward: 0.0.0.0:{}:2222 for pod {}", ssh_port, pod_name);
-            
-            // Run port forward command
-            match cmd.spawn() {
-                Ok(mut child) => {
-                    info!("Port forward started for pod {} on port {}", pod_name, ssh_port);
-                    let _ = child.wait();
-                }
-                Err(e) => {
-                    error!("Failed to start port forward for pod {}: {}", pod_name, e);
-                }
-            }
-        });
-
-        // Give port forward time to start
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        
-        Ok(())
-    }
 
 
 
 
-    pub async fn delete_pod(&self, namespace: &str, pod_name: &str) -> Result<(), String> {
-        use kube::api::DeleteParams;
-        use kube::Api;
-        use k8s_openapi::api::core::v1::Pod;
 
-        let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
 
-        // Delete the pod
-        let dp = DeleteParams::default();
-        let _ = pods.delete(pod_name, &dp).await;
-
-        info!(pod_name = %pod_name, namespace = %namespace, "Deleted pod (no services to clean up - using hostPort)");
-        Ok(())
-    }
 
     pub async fn extend_pod_deadline(&self, namespace: &str, pod_name: &str, additional_duration_seconds: u64) -> Result<(), String> {
         use kube::api::{Patch, PatchParams};
@@ -660,12 +540,6 @@ impl SidecarState {
         payment_msats / msats_per_sec
     }
 
-    // Check if payment is sufficient for minimum duration
-    pub fn is_payment_sufficient(&self, payment_msats: u64) -> bool {
-        let calculated_duration = self.calculate_duration_from_payment(payment_msats);
-        calculated_duration >= self.config.minimum_pod_duration_seconds
-    }
-
     // Generate secure random password
     pub fn generate_password() -> String {
         use rand::Rng;
@@ -679,17 +553,11 @@ impl SidecarState {
             .collect()
     }
 
-    // Validate port is actually available before allocation
-    pub fn validate_port_available(&self, port: u16) -> Result<(), String> {
-        use std::net::{TcpListener, SocketAddr};
-        
-        // Try to bind to the port to check if it's available
-        let addr = SocketAddr::from(([0, 0, 0, 0], port));
-        match TcpListener::bind(addr) {
-            Ok(_) => Ok(()), // Port is available
-            Err(_) => Err(format!("Port {} is already in use", port)),
-        }
-    }
+
+
+
+
+
 
     // Check if port is in use using multiple methods for reliability
     pub fn is_port_in_use(&self, port: u16) -> bool {
@@ -708,15 +576,7 @@ impl SidecarState {
         }
     }
 
-    // Find next available port starting from a given port
-    pub fn find_next_available_port(&self, start_port: u16, max_attempts: u16) -> Result<u16, String> {
-        for port in start_port..start_port + max_attempts {
-            if !self.is_port_in_use(port) {
-                return Ok(port);
-            }
-        }
-        Err(format!("No available ports found in range {}-{}", start_port, start_port + max_attempts - 1))
-    }
+
 
     // Check what ports are actually in use by existing pods
     async fn get_ports_in_use_by_pods(&self) -> Result<HashSet<u16>, String> {
@@ -845,40 +705,9 @@ impl SidecarState {
         Err("No available ports in the configured range".to_string())
     }
     
-    // Deallocate a port back to the pool
-    pub fn deallocate_ssh_port(&self, port: u16) -> Result<(), String> {
-        let mut port_pool = self.port_pool.lock().map_err(|e| format!("Failed to lock port pool: {}", e))?;
-        port_pool.deallocate_port(port);
-        info!("Deallocated port {} back to pool ({} available, {} allocated)", 
-              port, port_pool.available_count(), port_pool.allocated_count());
-        Ok(())
-    }
+
     
-    // Clean up ports for expired pods
-    pub async fn cleanup_expired_pods(&self) -> Result<(), String> {
-        let mut pods = self.active_pods.write().await;
-        let now = Utc::now();
-        let mut expired_pods = Vec::new();
-        
-        // Find expired pods
-        for (pod_name, pod_info) in pods.iter() {
-            if now > pod_info.expires_at {
-                expired_pods.push((pod_name.clone(), pod_info.allocated_port));
-            }
-        }
-        
-        // Remove expired pods and deallocate their ports
-        for (pod_name, allocated_port) in expired_pods {
-            pods.remove(&pod_name);
-            if let Err(e) = self.deallocate_ssh_port(allocated_port) {
-                error!("Failed to deallocate port {} for expired pod {}: {}", allocated_port, pod_name, e);
-            } else {
-                info!("Cleaned up expired pod {} and deallocated port {}", pod_name, allocated_port);
-            }
-        }
-        
-        Ok(())
-    }
+
 }
 
 // Extract token value in sats from Cashu token
@@ -887,501 +716,4 @@ pub async fn extract_token_value(token: &str) -> Result<u64, String> {
         .map_err(|e| e.to_string())
 }
 
-// Create router for the sidecar service
-pub fn create_sidecar_router(state: SidecarState) -> Router {
-    Router::new()
-        .route("/healthz", get(health_check))
-        .route("/auth", get(auth_check))
-        .route("/spawn-pod", post(|State(state): State<SidecarState>, Json(request): Json<SpawnPodRequest>| async move {
-            spawn_pod_handler(state, request).await
-        }))
-        .route("/pods", get(list_pods))
-        .route("/pods/:pod_name", get(get_pod_info))
-        .route("/pods/:pod_name/port-forward", get(get_port_forward_command))
-        .with_state(state)
-}
 
-// Health check endpoint
-async fn health_check(State(state): State<SidecarState>) -> impl IntoResponse {
-    let active_count = state.active_pods.read().await.len();
-    
-    let status = serde_json::json!({
-        "status": "healthy",
-        "service": "paygress-sidecar",
-        "version": env!("CARGO_PKG_VERSION"),
-        "config": {
-            "payment_model": "1 sat = 1 minute",
-            "minimum_payment": "1 sat",
-            "namespace": state.config.pod_namespace,
-        },
-        "active_pods": active_count,
-    });
-    
-    Json(status)
-}
-
-// Auth check for ingress (simplified)
-async fn auth_check(
-    Query(params): Query<AuthQuery>,
-    State(state): State<SidecarState>,
-) -> Response {
-    info!("Auth check request: {:?}", params);
-
-    let Some(token) = params.token else {
-        warn!("No Cashu token provided");
-        return StatusCode::UNAUTHORIZED.into_response();
-    };
-
-    // Extract payment amount from token
-    let payment_amount_msats = match extract_token_value(&token).await {
-        Ok(msats) => msats,
-        Err(e) => {
-            warn!("Failed to decode token: {}", e);
-            return StatusCode::BAD_REQUEST.into_response();
-        }
-    };
-
-    // Check if payment is sufficient for minimum duration
-    if !state.is_payment_sufficient(payment_amount_msats) {
-        warn!("❌ Insufficient payment: {} msats (minimum required: {} msats for {} seconds)", 
-            payment_amount_msats, 
-            state.config.minimum_pod_duration_seconds * state.config.pod_specs.first().map(|s| s.rate_msats_per_sec).unwrap_or(100),
-            state.config.minimum_pod_duration_seconds);
-        return StatusCode::PAYMENT_REQUIRED.into_response();
-    }
-
-    // Calculate duration based on payment
-    let duration_seconds = state.calculate_duration_from_payment(payment_amount_msats);
-
-    // Token verification handled by ngx_l402 at nginx layer
-    info!("✅ Payment verified by ngx_l402: {} msats → {} seconds", payment_amount_msats, duration_seconds);
-    StatusCode::OK.into_response()
-}
-
-// Simple test handler
-async fn spawn_pod_simple(
-    State(_state): State<SidecarState>,
-    Json(_request): Json<SpawnPodRequest>,
-) -> Json<SpawnPodResponse> {
-    Json(SpawnPodResponse {
-        success: false,
-        message: "Not implemented yet".to_string(),
-        pod_info: None,
-    })
-}
-
-// Spawn a new pod with SSH access - handler function
-async fn spawn_pod_handler(
-    state: SidecarState,
-    request: SpawnPodRequest,
-) -> Response {
-    info!("Pod spawn request received");
-
-    // First, decode the token to get the payment amount
-    let payment_amount_msats = match extract_token_value(&request.cashu_token).await {
-        Ok(msats) => msats,
-        Err(e) => {
-            return (StatusCode::BAD_REQUEST, Json(SpawnPodResponse {
-                success: false,
-                message: format!("Failed to decode Cashu token: {}", e),
-                pod_info: None,
-            })).into_response();
-        }
-    };
-
-    // Check if payment is sufficient for minimum duration
-    if !state.is_payment_sufficient(payment_amount_msats) {
-        let minimum_required = state.config.minimum_pod_duration_seconds * state.config.pod_specs.first().map(|s| s.rate_msats_per_sec).unwrap_or(100);
-        return (StatusCode::PAYMENT_REQUIRED, Json(SpawnPodResponse {
-            success: false,
-            message: format!("Insufficient payment: {} msats. Minimum required: {} msats for {} seconds", 
-                payment_amount_msats, minimum_required, state.config.minimum_pod_duration_seconds),
-            pod_info: None,
-        })).into_response();
-    }
-
-    // Calculate duration based on payment amount
-    let duration_seconds = state.calculate_duration_from_payment(payment_amount_msats);
-
-    info!("💰 Payment: {} msats → ⏱️ Duration: {} seconds", payment_amount_msats, duration_seconds);
-
-    // Token verification handled by ngx_l402 at nginx layer
-    info!("✅ Token verified by ngx_l402, proceeding with pod creation");
-
-    // Generate NPUB first and use it as pod name
-    let pod_keys = nostr_sdk::Keys::generate();
-    let pod_npub = pod_keys.public_key().to_hex();
-    let pod_nsec = pod_keys.secret_key().unwrap().to_secret_hex();
-    
-    // Create Kubernetes-safe pod name from NPUB
-    let pod_name = format!("pod-{}", pod_npub.replace("npub1", "").chars().take(8).collect::<String>());
-    let username = request.ssh_username.unwrap_or_else(|| format!("user-{}", &pod_name[4..12]));
-    let password = request.ssh_password.unwrap_or_else(|| SidecarState::generate_password());
-    let image = request.pod_image.unwrap_or_else(|| state.config.base_image.clone());
-    let allocated_port = match state.generate_ssh_port().await {
-        Ok(port) => port,
-        Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(SpawnPodResponse {
-                success: false,
-                message: format!("Failed to allocate port: {}", e),
-                pod_info: None,
-            })).into_response();
-        }
-    };
-
-    let now = Utc::now();
-    let expires_at = now + chrono::Duration::seconds(duration_seconds as i64);
-
-    // Create the pod
-    match state.k8s_client.create_ssh_pod(
-        &state.config,
-        &state.config.pod_namespace,
-        &pod_name,
-        &pod_npub,
-        &pod_nsec,
-        &image,
-        allocated_port,
-        &username,
-        &password,
-        duration_seconds,
-        1024, // 1GB memory
-        1000, // 1 CPU core
-        "http-mode-user", // Dummy user pubkey for HTTP mode
-    ).await {
-        Ok(node_port) => {
-            let pod_info = PodInfo {
-                pod_npub: pod_npub.clone(),
-                namespace: state.config.pod_namespace.clone(),
-                created_at: now,
-                expires_at,
-                allocated_port,
-                ssh_username: username.clone(),
-                ssh_password: password.clone(),
-                payment_amount_msats: payment_amount_msats,
-                duration_seconds,
-                node_port: Some(node_port),
-                nostr_public_key: pod_npub.clone(),
-                nostr_private_key: pod_nsec,
-            };
-
-            // Store pod info
-            state.active_pods.write().await.insert(pod_npub.clone(), pod_info.clone());
-
-            // Pod will be automatically deleted by Kubernetes based on TTL annotation
-            // No need for manual scheduling - Kubernetes handles this natively
-
-            (StatusCode::CREATED, Json(SpawnPodResponse {
-                success: true,
-                message: format!(
-                    "Pod created successfully. SSH access available for {} seconds. External port: {}",
-                    duration_seconds, node_port
-                ),
-                pod_info: Some(pod_info),
-            })).into_response()
-        },
-        Err(e) => {
-            // Deallocate the port if pod creation failed
-            if let Err(dealloc_err) = state.deallocate_ssh_port(allocated_port) {
-                error!("Failed to deallocate port {} after pod creation failure: {}", allocated_port, dealloc_err);
-            }
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(SpawnPodResponse {
-                success: false,
-                message: format!("Failed to create pod: {}", e),
-                pod_info: None,
-            })).into_response()
-        }
-    }
-}
-
-// Top up/extend a pod's duration - handler function
-pub async fn top_up_pod_handler(
-    state: SidecarState,
-    request: TopUpPodRequest,
-) -> Response {
-    info!("Pod top-up request received for NPUB: {}", request.pod_npub);
-
-    // Find pod by NPUB label in Kubernetes
-    let pods_api: Api<Pod> = Api::namespaced(state.k8s_client.client.clone(), &state.config.pod_namespace);
-    let pods = match pods_api.list(&ListParams::default()).await {
-        Ok(pods) => pods,
-        Err(e) => {
-            error!("Failed to list pods: {}", e);
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(TopUpPodResponse {
-                success: false,
-                message: format!("Failed to list pods: {}", e),
-                pod_info: None,
-                extended_duration_seconds: None,
-            })).into_response();
-        }
-    };
-
-    // Find pod by NPUB label (compare truncated hex parts)
-    let target_pod = match pods.items.iter().find(|pod| {
-        pod.metadata.labels.as_ref()
-            .and_then(|labels| labels.get("pod-npub"))
-            .map(|stored_hex| {
-                // Extract hex from the requested NPUB
-                let requested_hex = if request.pod_npub.starts_with("npub1") {
-                    &request.pod_npub[5..] // Remove "npub1" prefix
-                } else {
-                    &request.pod_npub // Already hex or different format
-                };
-                // Truncate both to 63 chars for comparison
-                let stored_truncated = if stored_hex.len() > 63 {
-                    &stored_hex[..63]
-                } else {
-                    stored_hex
-                };
-                let requested_truncated = if requested_hex.len() > 63 {
-                    &requested_hex[..63]
-                } else {
-                    requested_hex
-                };
-                stored_truncated == requested_truncated
-            })
-            .unwrap_or(false)
-    }) {
-        Some(pod) => pod,
-        None => {
-            return (StatusCode::NOT_FOUND, Json(TopUpPodResponse {
-                success: false,
-                message: format!("Pod with NPUB '{}' not found or already expired", request.pod_npub),
-                pod_info: None,
-                extended_duration_seconds: None,
-            })).into_response();
-        }
-    };
-
-    // Get pod name from metadata
-    let pod_name = match &target_pod.metadata.name {
-        Some(name) => name.clone(),
-        None => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(TopUpPodResponse {
-                success: false,
-                message: "Pod has no name in metadata".to_string(),
-                pod_info: None,
-                extended_duration_seconds: None,
-            })).into_response();
-        }
-    };
-
-    // Check if pod has already expired by looking at activeDeadlineSeconds
-    let now = Utc::now();
-    let pod_expires_at = match &target_pod.spec {
-        Some(spec) => match spec.active_deadline_seconds {
-            Some(deadline_secs) => {
-                // Calculate expiration time from pod creation time
-                match &target_pod.metadata.creation_timestamp {
-                    Some(creation_time) => {
-                        let creation_utc = creation_time.0;
-                        creation_utc + chrono::Duration::seconds(deadline_secs)
-                    }
-                    None => now + chrono::Duration::seconds(deadline_secs), // Fallback
-                }
-            }
-            None => {
-                return (StatusCode::INTERNAL_SERVER_ERROR, Json(TopUpPodResponse {
-                    success: false,
-                    message: "Pod has no active deadline set".to_string(),
-                    pod_info: None,
-                    extended_duration_seconds: None,
-                })).into_response();
-            }
-        }
-        None => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(TopUpPodResponse {
-                success: false,
-                message: "Pod has no spec".to_string(),
-                pod_info: None,
-                extended_duration_seconds: None,
-            })).into_response();
-        }
-    };
-
-    if now > pod_expires_at {
-        // Pod has expired, deallocate its port if we can find it
-        let allocated_port = match target_pod.spec.as_ref()
-            .and_then(|spec| spec.containers.first())
-            .and_then(|container| container.ports.as_ref())
-            .and_then(|ports| ports.first())
-            .and_then(|port| port.host_port) {
-            Some(port) => port as u16,
-            None => {
-                warn!("Could not determine port for expired pod {}", pod_name);
-                0
-            }
-        };
-        
-        if allocated_port > 0 {
-            state.port_pool.lock().unwrap().deallocate_port(allocated_port);
-        }
-        if let Err(e) = state.deallocate_ssh_port(allocated_port) {
-            error!("Failed to deallocate port {} for expired pod {}: {}", allocated_port, pod_name, e);
-        }
-        return (StatusCode::GONE, Json(TopUpPodResponse {
-            success: false,
-            message: format!("Pod '{}' (NPUB: {}) has already expired and cannot be extended", pod_name, request.pod_npub),
-            pod_info: None,
-            extended_duration_seconds: None,
-        })).into_response();
-    }
-
-    // Extract payment amount from token
-    let payment_amount_msats = match extract_token_value(&request.cashu_token).await {
-        Ok(msats) => msats,
-        Err(e) => {
-            return (StatusCode::BAD_REQUEST, Json(TopUpPodResponse {
-                success: false,
-                message: format!("Failed to decode Cashu token: {}", e),
-                pod_info: None,
-                extended_duration_seconds: None,
-            })).into_response();
-        }
-    };
-
-    // Calculate additional duration from payment
-    let additional_duration_seconds = state.calculate_duration_from_payment(payment_amount_msats);
-    
-    if additional_duration_seconds == 0 {
-        return (StatusCode::PAYMENT_REQUIRED, Json(TopUpPodResponse {
-            success: false,
-            message: format!("Insufficient payment: {} msats. Minimum required: {} msats for 1 second extension", 
-                payment_amount_msats, state.config.pod_specs.first().map(|s| s.rate_msats_per_sec).unwrap_or(100)),
-            pod_info: None,
-            extended_duration_seconds: None,
-        })).into_response();
-    }
-
-    info!("💰 Top-up payment: {} msats → ⏱️ Additional duration: {} seconds", payment_amount_msats, additional_duration_seconds);
-
-    // Token verification handled by ngx_l402 at nginx layer
-    info!("✅ Top-up token verified by ngx_l402, proceeding with extension");
-
-    // Update the pod's activeDeadlineSeconds in Kubernetes
-    if let Err(e) = state.k8s_client.extend_pod_deadline(&state.config.pod_namespace, &pod_name, additional_duration_seconds).await {
-        error!("Failed to extend pod deadline in Kubernetes: {}", e);
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(TopUpPodResponse {
-            success: false,
-            message: format!("Failed to extend pod deadline: {}", e),
-            pod_info: None,
-            extended_duration_seconds: None,
-        })).into_response();
-    }
-
-    // Calculate new expiration time
-    let new_expires_at = pod_expires_at + chrono::Duration::seconds(additional_duration_seconds as i64);
-    
-    info!(
-        "🔄 Pod '{}' (NPUB: {}) extended: {} → {} (added {} seconds)",
-        pod_name,
-        request.pod_npub,
-        pod_expires_at.format("%H:%M:%S UTC"),
-        new_expires_at.format("%H:%M:%S UTC"),
-        additional_duration_seconds
-    );
-
-    // Calculate new expiration time
-    let new_expires_at = pod_expires_at + chrono::Duration::seconds(additional_duration_seconds as i64);
-    
-    (StatusCode::OK, Json(TopUpPodResponse {
-        success: true,
-        message: format!(
-            "Pod '{}' (NPUB: {}) successfully extended by {} seconds. New expiration: {}",
-            pod_name,
-            request.pod_npub,
-            additional_duration_seconds,
-            new_expires_at.format("%Y-%m-%d %H:%M:%S UTC")
-        ),
-        pod_info: None, // We don't maintain in-memory state anymore
-        extended_duration_seconds: Some(additional_duration_seconds),
-    })).into_response()
-}
-
-// List all active pods
-async fn list_pods(State(state): State<SidecarState>) -> Json<Vec<PodInfo>> {
-    let pods = state.active_pods.read().await;
-    Json(pods.values().cloned().collect())
-}
-
-// Get specific pod info
-async fn get_pod_info(
-    Path(pod_npub): Path<String>,
-    State(state): State<SidecarState>,
-) -> Result<Json<PodInfo>, StatusCode> {
-    let pods = state.active_pods.read().await;
-
-    match pods.get(&pod_npub) {
-        Some(pod_info) => Ok(Json(pod_info.clone())),
-        None => Err(StatusCode::NOT_FOUND),
-    }
-}
-
-// Get port-forward command for a specific pod
-async fn get_port_forward_command(
-    Path(pod_name): Path<String>,
-    State(state): State<SidecarState>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let pods = state.active_pods.read().await;
-
-    match pods.get(&pod_name) {
-        Some(pod_info) => {
-            let direct_ssh_command = format!(
-                "ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no {}@{} -p {}",
-                pod_info.ssh_username, state.config.ssh_host, pod_info.node_port.unwrap_or(pod_info.allocated_port)
-            );
-
-            let ssh_command = format!(
-                "ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no {}@{} -p {}",
-                pod_info.ssh_username, state.config.ssh_host, pod_info.node_port.unwrap_or(pod_info.allocated_port)
-            );
-
-            let response = serde_json::json!({
-                "pod_name": pod_name,
-                "allocated_port": pod_info.allocated_port,
-                "node_port": pod_info.node_port,
-                "direct_ssh_command": direct_ssh_command,
-                "ssh_command": ssh_command,
-                "instructions": [
-                    "🚀 Direct SSH access (no kubectl needed):".to_string(),
-                    direct_ssh_command,
-                    format!("Password: {}", pod_info.ssh_password),
-                    "".to_string(),
-                    format!("Port {} is directly accessible on {}", pod_info.node_port.unwrap_or(pod_info.allocated_port), state.config.ssh_host)
-                ]
-            });
-
-            Ok(Json(response))
-        },
-        None => Err(StatusCode::NOT_FOUND),
-    }
-}
-
-// Start the sidecar service
-pub async fn start_sidecar_service(bind_addr: &str, config: SidecarConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let state = SidecarState::new(config.clone()).await.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-    
-    // Pod cleanup is now handled by Kubernetes TTL annotations
-    // No need for polling-based cleanup loops
-    
-    let app = create_sidecar_router(state);
-    
-    println!("🚀 Starting Paygress Sidecar Service");
-    println!("📍 Listening on: {}", bind_addr);
-    println!("💰 Available pod specs: {}", config.pod_specs.len());
-    for spec in &config.pod_specs {
-        println!("   - {}: {} msats/sec ({} CPU, {} MB)", spec.name, spec.rate_msats_per_sec, spec.cpu_millicores, spec.memory_mb);
-    }
-    println!("⏱️  Minimum duration: {} seconds", config.minimum_pod_duration_seconds);
-    println!("🔐 SSH port range: {}-{}", config.ssh_port_range_start, config.ssh_port_range_end);
-    println!("📋 Endpoints:");
-    println!("   GET  /healthz      - Health check");
-    println!("   GET  /auth         - Auth verification for ingress");
-    println!("   POST /spawn-pod    - Spawn new SSH pod");
-    println!("   GET  /pods         - List active pods");
-    println!("   GET  /pods/:name   - Get pod info");
-    
-    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
-    axum::serve(listener, app).await?;
-    
-    Ok(())
-}
