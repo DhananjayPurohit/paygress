@@ -71,6 +71,8 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
     }
 
     let target = format!("{}@{}", args.user, args.host);
+    let is_root = args.user == "root";
+    let sudo = if is_root { "" } else { "sudo " };
     
     println!("Target: {}", target.cyan());
     println!("Name:   {}", args.name.yellow());
@@ -127,8 +129,8 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
                 println!("  LXD is already installed.");
             } else {
                 println!("  Installing LXD...");
-                let install_cmd = "snap install lxd && lxd init --auto";
-                run_ssh_command(&args, install_cmd)?;
+                let install_cmd = format!("{}snap install lxd && lxd init --auto", sudo);
+                run_ssh_command(&args, &install_cmd)?;
                 println!("  LXD installed and initialized!");
             }
             
@@ -165,7 +167,14 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
                 
                 // Run Proxmox installation script
                 let install_script = get_proxmox_install_script();
-                run_ssh_command(&args, &install_script)?;
+                // If not root, run with sudo bash
+                let cmd = if is_root {
+                    install_script.to_string()
+                } else {
+                    format!("sudo bash -c '{}'", install_script.replace("'", "'\\''"))
+                };
+                
+                run_ssh_command(&args, &cmd)?;
                 
                 println!("  {} Proxmox VE installed!", "✓".green());
             }
@@ -196,8 +205,8 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
             std::io::stdout().flush()?;
             
             let token_output = run_ssh_command_output(&args, &format!(
-                "pveum user token add root@pam {} --privsep=0 2>&1 || echo 'exists'",
-                token_name
+                "{}pveum user token add root@pam {} --privsep=0 2>&1 || echo 'exists'",
+                sudo, token_name
             ))?;
             
             if token_output.contains("exists") || token_output.contains("already exists") {
@@ -218,7 +227,7 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
     println!("{}", "Step 4: Installing Dependencies & Syncing Source".blue().bold());
     println!("{}", "─".repeat(50));
     
-    let install_deps = r#"
+    let install_deps = format!(r#"
         echo "Checking for Rust environment..."
         if ! command -v cargo &> /dev/null; then
              if [ -f "$HOME/.cargo/env" ]; then source "$HOME/.cargo/env"; fi
@@ -231,19 +240,19 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
         
         if command -v apt-get &> /dev/null; then
             export DEBIAN_FRONTEND=noninteractive
-            apt-get update -q && apt-get install -y build-essential pkg-config libssl-dev rsync
+            {0}apt-get update -q && {0}apt-get install -y build-essential pkg-config libssl-dev rsync
         fi
         
         # Clean build dir
         mkdir -p /tmp/paygress-src
-    "#;
+    "#, sudo);
     
     if args.dry_run {
         println!("  Would install deps and sync source");
     } else {
         print!("  Installing system dependencies... ");
         std::io::stdout().flush()?;
-        run_ssh_command(&args, install_deps)?;
+        run_ssh_command(&args, &install_deps)?;
         println!("{}", "OK".green());
         
         println!("  Syncing source code... ");
@@ -283,10 +292,11 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
         }
         
         println!("  Compiling Paygress from source (this may take 2-5 mins)...");
-        let build_cmd = "source $HOME/.cargo/env 2>/dev/null || true; cargo install --path /tmp/paygress-src --bin paygress-cli --root /usr/local --force";
+        // Install to user cargo bin then copy with sudo
+        let build_cmd = format!("source $HOME/.cargo/env 2>/dev/null || true; cargo install --path /tmp/paygress-src --bin paygress-cli --force && {}cp $HOME/.cargo/bin/paygress-cli /usr/local/bin/paygress-cli", sudo);
         
-        if !run_ssh_command(&args, build_cmd)? {
-             return Err(anyhow::anyhow!("Compilation failed"));
+        if !run_ssh_command(&args, &build_cmd)? {
+             return Err(anyhow::anyhow!("Compilation/Installation failed"));
         }
         
         println!("{}", "OK".green());
@@ -370,10 +380,17 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
     if args.dry_run {
         println!("  Would create /etc/paygress/provider-config.json");
     } else {
-        let create_config = format!(
-            "mkdir -p /etc/paygress && cat > /etc/paygress/provider-config.json << 'EOF'\n{}\nEOF",
-            config
-        );
+        let create_config = if is_root {
+            format!(
+                "mkdir -p /etc/paygress && cat > /etc/paygress/provider-config.json << 'EOF'\n{}\nEOF",
+                config
+            )
+        } else {
+             format!(
+                "{}mkdir -p /etc/paygress && echo '{}' | {}tee /etc/paygress/provider-config.json > /dev/null",
+                sudo, config.replace("'", "'\\''"), sudo
+            )
+        };
         run_ssh_command(&args, &create_config)?;
         println!("  {} Created /etc/paygress/provider-config.json", "✓".green());
     }
@@ -400,10 +417,17 @@ WantedBy=multi-user.target
     if args.dry_run {
         println!("  Would create /etc/systemd/system/paygress-provider.service");
     } else {
-        let create_service = format!(
-            "cat > /etc/systemd/system/paygress-provider.service << 'EOF'\n{}\nEOF\nsystemctl daemon-reload",
-            systemd_service
-        );
+        let create_service = if is_root {
+            format!(
+                "cat > /etc/systemd/system/paygress-provider.service << 'EOF'\n{}\nEOF\nsystemctl daemon-reload",
+                systemd_service
+            )
+        } else {
+             format!(
+                "echo '{}' | {}tee /etc/systemd/system/paygress-provider.service > /dev/null && {}systemctl daemon-reload",
+                systemd_service.replace("'", "'\\''"), sudo, sudo
+            )
+        };
         run_ssh_command(&args, &create_service)?;
         println!("  {} Created systemd service", "✓".green());
     }
@@ -417,8 +441,8 @@ WantedBy=multi-user.target
         println!("  Would run: systemctl enable --now paygress-provider");
     } else {
         if use_lxd {
-             let start_cmd = "systemctl enable paygress-provider && systemctl restart paygress-provider";
-             run_ssh_command(&args, start_cmd)?;
+             let start_cmd = format!("{}systemctl enable paygress-provider && {}systemctl restart paygress-provider", sudo, sudo);
+             run_ssh_command(&args, &start_cmd)?;
              println!("  {} Service started successfully!", "✓".green());
         } else {
             // Don't actually start yet since config needs token
@@ -475,6 +499,7 @@ fn run_ssh_command(args: &BootstrapArgs, cmd: &str) -> Result<bool> {
     let mut ssh_args = vec![
         "-o".to_string(),
         "StrictHostKeyChecking=no".to_string(),
+        "-t".to_string(),
         "-p".to_string(),
         args.port.to_string(),
     ];

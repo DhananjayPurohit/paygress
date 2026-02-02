@@ -61,6 +61,8 @@ paygress-cli market spawn \
   --ssh-pass "my-secure-password"
 ```
 
+> **Note:** If you don't provide a `--nostr-key`, the CLI will automatically generate a new identity for you and save it to `~/.paygress/identity`.
+
 **Output:**
 ```
 🎉 Workload Provisioned Successfully!
@@ -102,10 +104,13 @@ The CLI can automatically set up your server as a Paygress Provider.
 ```bash
 paygress-cli bootstrap \
   --host <YOUR_SERVER_IP> \
-  --user root \
+  --user ubuntu \
+  --port 22 \
   --name "My Compute Node" \
   --location "US-West" \
 ```
+
+> **Note:** The bootstrap command supports non-root users (like `ubuntu`) and will automatically use `sudo` for installation.
 
 This command will:
 1. SSH into your server.
