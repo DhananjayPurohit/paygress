@@ -1302,14 +1302,14 @@
 
     - name: Download ngx_l402 pre-built module
       get_url:
-        url: https://github.com/DhananjayPurohit/ngx_l402/releases/download/v1.1.1/ngx_l402-1.1.1.tar.gz
-        dest: /tmp/ngx_l402-1.1.1.tar.gz
+        url: https://github.com/DhananjayPurohit/ngx_l402/releases/download/v1.2.2/ngx_l402-1.2.2.tar.gz
+        dest: /tmp/ngx_l402
         mode: '0644'
       become: yes
 
     - name: Extract ngx_l402 module
       unarchive:
-        src: /tmp/ngx_l402-1.1.1.tar.gz
+        src: /tmp/ngx_l402
         dest: /tmp/
         remote_src: yes
       become: yes
@@ -1739,6 +1739,19 @@
     # ===============================
     # Build and Deploy Paygress
     # ===============================
+    - name: Clean up Cargo.lock if it has merge conflicts
+      become_user: "{{ paygress_user }}"
+      shell: |
+        if grep -q "<<<<<<< HEAD" Cargo.lock 2>/dev/null; then
+          echo "Merge conflict detected in Cargo.lock, regenerating..."
+          rm -f Cargo.lock
+          . ~/.cargo/env
+          cargo update
+        fi
+      args:
+        chdir: "{{ paygress_dir }}"
+      ignore_errors: yes
+
     - name: Build unified paygress service
       become_user: "{{ paygress_user }}"
       shell: |
