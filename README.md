@@ -57,8 +57,7 @@ Provision a container instantly. You need a **Cashu token** (minted from a Cashu
 paygress-cli market spawn \
   --provider <PROVIDER_NPUB> \
   --tier basic \
-  --token "cashuA..." \
-  --ssh-pass "my-secure-password"
+  --token "cashuA..."
 ```
 
 > **Note:** If you don't provide a `--nostr-key`, the CLI will automatically generate a new identity for you and save it to `~/.paygress/identity`.
