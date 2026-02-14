@@ -193,4 +193,3 @@ paygress-cli spawn \
 6.  **Access**: Provider sends back IP, Port, and Credentials encrypted to the client.
 
 ---
-**License**: MIT
