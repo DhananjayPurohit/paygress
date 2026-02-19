@@ -118,25 +118,32 @@ impl DiscoveryClient {
     }
 
     /// Get details of a specific provider (supports exact match or prefix of at least 8 chars)
+    /// Accepts both hex pubkeys and bech32 npub format.
     pub async fn get_provider(&self, npub: &str) -> Result<Option<ProviderInfo>> {
         let providers = self.list_providers(None).await?;
-        
+
+        // Normalize input to hex for comparison (provider npubs are stored as hex)
+        let lookup_hex = match nostr_sdk::PublicKey::parse(npub) {
+            Ok(pk) => pk.to_hex(),
+            Err(_) => npub.to_string(),
+        };
+
         // precise match first
-        if let Some(p) = providers.iter().find(|p| p.npub == npub) {
+        if let Some(p) = providers.iter().find(|p| p.npub == lookup_hex) {
             return Ok(Some(p.clone()));
         }
-        
+
         // try prefix match if long enough
-        if npub.len() >= 8 {
+        if lookup_hex.len() >= 8 {
             let matches: Vec<&ProviderInfo> = providers.iter()
-                .filter(|p| p.npub.starts_with(npub))
+                .filter(|p| p.npub.starts_with(&lookup_hex))
                 .collect();
-                
+
             if matches.len() == 1 {
                 return Ok(Some(matches[0].clone()));
             }
         }
-        
+
         Ok(None)
     }
 

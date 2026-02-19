@@ -18,9 +18,17 @@ pub enum SystemAction {
 
 #[derive(Args)]
 pub struct ResetArgs {
-    /// Path to inventory file (for remote reset)
-    #[arg(short, long, default_value = "inventory.ini")]
-    pub inventory: Option<String>,
+    /// Target server IP for remote reset (runs locally if not provided)
+    #[arg(long)]
+    pub host: Option<String>,
+
+    /// SSH user for remote reset
+    #[arg(long, default_value = "root")]
+    pub user: String,
+
+    /// SSH port for remote reset
+    #[arg(long, default_value = "22")]
+    pub port: u16,
 
     /// Skip confirmation prompts
     #[arg(long, short = 'y')]
@@ -38,10 +46,8 @@ pub async fn execute(args: SystemArgs, verbose: bool) -> Result<()> {
 }
 
 async fn execute_reset(args: ResetArgs, verbose: bool) -> Result<()> {
-    if let Some(ref inventory) = args.inventory {
-        if std::path::Path::new(inventory).exists() {
-            return execute_remote_reset(inventory, verbose).await;
-        }
+    if let Some(ref host) = args.host {
+        return execute_remote_reset(host, &args.user, args.port, args.uninstall_backend, args.yes, verbose).await;
     }
 
     println!("{}", "⚠️  SYSTEM RESET (LOCAL) ⚠️".red().bold());
@@ -63,31 +69,29 @@ async fn execute_reset(args: ResetArgs, verbose: bool) -> Result<()> {
     }
 
     // 1. Stop and disable service
-    print!("  ⚙ Stopping paygress-provider service... ");
+    print!("  Stopping paygress-provider service... ");
     io::stdout().flush()?;
     let _ = Command::new("systemctl").args(["stop", "paygress-provider"]).output();
     let _ = Command::new("systemctl").args(["disable", "paygress-provider"]).output();
     println!("{}", "DONE".green());
 
     // 2. Remove systemd unit
-    print!("  ⚙ Removing systemd unit... ");
+    print!("  Removing systemd unit... ");
     io::stdout().flush()?;
     let _ = Command::new("rm").args(["-f", "/etc/systemd/system/paygress-provider.service"]).output();
     let _ = Command::new("systemctl").args(["daemon-reload"]).output();
     println!("{}", "DONE".green());
 
     // 3. Remove configurations
-    print!("  ⚙ Removing /etc/paygress... ");
+    print!("  Removing /etc/paygress... ");
     io::stdout().flush()?;
     let _ = Command::new("rm").args(["-rf", "/etc/paygress"]).output();
     println!("{}", "DONE".green());
 
     // 4. Uninstall Backend if requested
     if args.uninstall_backend {
-        // Detect OS/Backend
-        println!("{}", "  ⚙ Uninstalling compute backend...".yellow());
-        
-        // Try snap remove lxd (Ubuntu common)
+        println!("{}", "  Uninstalling compute backend...".yellow());
+
         print!("    Removing LXD (snap)... ");
         io::stdout().flush()?;
         let output = Command::new("snap").args(["remove", "lxd", "--purge"]).output();
@@ -97,51 +101,71 @@ async fn execute_reset(args: ResetArgs, verbose: bool) -> Result<()> {
             println!("{}", "SKIPPED (not via snap)".yellow());
         }
 
-        // Try apt remove lxc
         print!("    Removing LXC (apt)... ");
         io::stdout().flush()?;
         let _ = Command::new("apt-get").args(["remove", "--purge", "-y", "lxc", "lxcfs"]).output();
         let _ = Command::new("apt-get").args(["autoremove", "-y"]).output();
         println!("{}", "DONE".green());
-        
-        // Proxmox removal is dangerous, we just hint it for now or do basic cleanup
-        println!("    {} Manual Proxmox cleanup may still be required if using Proxmox VE packages.", "💡".yellow());
+
+        println!("    {} Manual Proxmox cleanup may be required if using Proxmox VE.", "Note:".yellow());
     }
 
     println!();
     println!("{}", "━".repeat(50).green());
-    println!("{}", "✅ Reset Complete!".green().bold());
+    println!("{}", "Reset Complete!".green().bold());
     println!("Paygress has been uninstalled from this machine.");
-    println!("Note: The paygress-cli binary itself remains in /usr/local/bin/ (you can remove it manually if desired).");
     println!("{}", "━".repeat(50).green());
 
     Ok(())
 }
 
-async fn execute_remote_reset(inventory: &str, verbose: bool) -> Result<()> {
-    println!("{}", "🚀 Remote System Reset...".bold());
-    println!("  Inventory: {}", inventory);
+async fn execute_remote_reset(host: &str, user: &str, port: u16, uninstall_backend: bool, yes: bool, _verbose: bool) -> Result<()> {
+    println!("{}", "Remote System Reset".bold());
+    println!("  Host: {}@{}:{}", user, host, port);
     println!();
 
-    if !std::path::Path::new("reset-vps.yml").exists() {
-        return Err(anyhow::anyhow!("reset-vps.yml not found in current directory"));
+    if !yes {
+        print!("Are you sure you want to reset the remote server? [y/N] ");
+        io::stdout().flush()?;
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        if !input.trim().eq_ignore_ascii_case("y") {
+            println!("Reset aborted.");
+            return Ok(());
+        }
     }
 
-    let mut cmd = Command::new("ansible-playbook");
-    cmd.arg("-i").arg(inventory)
-       .arg("reset-vps.yml");
-    
-    if verbose {
-        cmd.arg("-v");
+    let ssh_target = format!("{}@{}", user, host);
+    let port_str = port.to_string();
+
+    let mut reset_script = String::from(
+        "systemctl stop paygress-provider 2>/dev/null; \
+         systemctl disable paygress-provider 2>/dev/null; \
+         rm -f /etc/systemd/system/paygress-provider.service; \
+         systemctl daemon-reload; \
+         rm -rf /etc/paygress; \
+         echo 'Paygress service and config removed.'"
+    );
+
+    if uninstall_backend {
+        reset_script.push_str(
+            "; snap remove lxd --purge 2>/dev/null; \
+             apt-get remove --purge -y lxc lxcfs 2>/dev/null; \
+             apt-get autoremove -y 2>/dev/null; \
+             echo 'Backend cleanup attempted.'"
+        );
     }
 
-    let status = cmd.status()?;
+    let output = Command::new("ssh")
+        .args(["-p", &port_str, "-o", "StrictHostKeyChecking=no", &ssh_target, &reset_script])
+        .output()?;
 
-    if status.success() {
-        println!();
-        println!("{}", "✅ Remote Reset Complete!".green().bold());
+    if output.status.success() {
+        println!("{}", String::from_utf8_lossy(&output.stdout));
+        println!("{}", "Remote Reset Complete!".green().bold());
     } else {
-        return Err(anyhow::anyhow!("Remote reset failed"));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!("Remote reset failed: {}", stderr));
     }
 
     Ok(())

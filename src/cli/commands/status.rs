@@ -1,40 +1,62 @@
-// Status command - Get pod status
+// Status command - Get workload status
+//
+// Unified command that works in both modes:
+//   - Nostr mode (--provider): queries a provider via Nostr
+//   - HTTP mode (--server): queries a Paygress HTTP server
 
 use anyhow::Result;
 use clap::Args;
 use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
 
+use super::identity::{parse_relays, get_or_create_identity};
 use crate::api::PaygressClient;
-use paygress::nostr::{StatusRequestContent, StatusResponseContent};
 
 #[derive(Args)]
 pub struct StatusArgs {
-    /// Pod ID or workload ID to check status
+    /// Pod/workload ID to check
     #[arg(short, long)]
     pub pod_id: String,
 
-    /// Provider NPUB (required for decentralized/Proxmox mode)
-    #[arg(short, long)]
+    /// Provider npub (Nostr mode)
+    #[arg(long)]
     pub provider: Option<String>,
+
+    /// HTTP server URL (e.g., http://localhost:8080)
+    #[arg(long)]
+    pub server: Option<String>,
+
+    /// Custom Nostr relays (comma-separated)
+    #[arg(long)]
+    pub relays: Option<String>,
 }
 
-pub async fn execute(server: &str, args: StatusArgs, verbose: bool) -> Result<()> {
-    if let Some(provider_npub) = args.provider {
-        return execute_decentralized_status(args.pod_id, provider_npub, verbose).await;
+pub async fn execute(args: StatusArgs, verbose: bool) -> Result<()> {
+    if args.provider.is_some() {
+        let provider = args.provider.clone().unwrap();
+        return execute_nostr_status(args.pod_id.clone(), provider, args.relays.clone(), verbose).await;
     }
+
+    let server = args.server.clone()
+        .ok_or_else(|| anyhow::anyhow!("Either --provider (Nostr) or --server (HTTP) is required"))?;
+
+    execute_http_status(&server, args, verbose).await
+}
+
+async fn execute_http_status(server: &str, args: StatusArgs, verbose: bool) -> Result<()> {
     if verbose {
-        println!("{} Checking pod status...", "→".blue());
+        println!("{} Checking pod status via HTTP...", "->".blue());
         println!("  Server: {}", server);
         println!("  Pod ID: {}", args.pod_id);
     }
+
     let spinner = ProgressBar::new_spinner();
     spinner.set_style(
         ProgressStyle::default_spinner()
             .template("{spinner:.blue} {msg}")
             .unwrap()
     );
-    spinner.set_message("Fetching internal pod status...");
+    spinner.set_message("Fetching pod status...");
     spinner.enable_steady_tick(std::time::Duration::from_millis(100));
 
     let client = PaygressClient::new(server);
@@ -42,7 +64,7 @@ pub async fn execute(server: &str, args: StatusArgs, verbose: bool) -> Result<()
     spinner.finish_and_clear();
 
     if response.success {
-        display_status_response(
+        display_status(
             response.pod_id.as_deref().unwrap_or(&args.pod_id),
             response.status.as_deref().unwrap_or("Unknown"),
             response.ssh_host.as_deref(),
@@ -59,11 +81,11 @@ pub async fn execute(server: &str, args: StatusArgs, verbose: bool) -> Result<()
     Ok(())
 }
 
-async fn execute_decentralized_status(pod_id: String, provider_npub: String, verbose: bool) -> Result<()> {
+async fn execute_nostr_status(pod_id: String, provider_npub: String, relays_opt: Option<String>, verbose: bool) -> Result<()> {
     use paygress::nostr::{NostrRelaySubscriber, RelayConfig, StatusRequestContent, StatusResponseContent};
-    
+
     if verbose {
-        println!("{} Checking decentralized workload status...", "→".blue());
+        println!("{} Checking workload status via Nostr...", "->".blue());
         println!("  Provider: {}", provider_npub);
         println!("  Workload ID: {}", pod_id);
     }
@@ -77,38 +99,31 @@ async fn execute_decentralized_status(pod_id: String, provider_npub: String, ver
     spinner.set_message("Connecting to Nostr and querying provider...");
     spinner.enable_steady_tick(std::time::Duration::from_millis(100));
 
-    // Initialize Nostr
+    let nostr_key = get_or_create_identity(None)?;
+    let relays = parse_relays(relays_opt);
     let relay_config = RelayConfig {
-        relays: vec![
-            "wss://relay.damus.io".to_string(),
-            "wss://nos.lol".to_string(),
-            "wss://relay.primal.net".to_string(),
-        ],
-        private_key: None, // Generate a temporary key
+        relays,
+        private_key: Some(nostr_key),
     };
-    
+
     let client = NostrRelaySubscriber::new(relay_config).await?;
-    
-    // Subscribe to responses
+
     client.subscribe_to_pod_events(|_| Box::pin(async { Ok(()) })).await?;
 
-    // Send Status Request
     let request = StatusRequestContent { pod_id: pod_id.clone() };
     let content = serde_json::to_string(&request)?;
-    
+
     client.send_encrypted_private_message(&provider_npub, content, "nip17").await?;
-    
-    // Wait for response
+
     spinner.set_message("Waiting for provider response...");
-    
+
     match client.wait_for_decrypted_message(&provider_npub, 30).await {
         Ok(response_event) => {
             spinner.finish_and_clear();
-            
-            // Try to parse as StatusResponseContent
+
             let status_resp: StatusResponseContent = serde_json::from_str(&response_event.content)?;
-            
-            display_status_response(
+
+            display_status(
                 &status_resp.pod_id,
                 &status_resp.status,
                 Some(&status_resp.ssh_host),
@@ -127,7 +142,7 @@ async fn execute_decentralized_status(pod_id: String, provider_npub: String, ver
     Ok(())
 }
 
-fn display_status_response(
+fn display_status(
     pod_id: &str,
     status: &str,
     ssh_host: Option<&str>,
@@ -136,11 +151,11 @@ fn display_status_response(
     expires_at: Option<&str>,
     time_remaining: Option<u64>,
 ) {
-    println!("{}", "📊 Workload Status".bold());
+    println!("{}", "Workload Status".bold());
     println!();
-    
+
     println!("  {} {}", "ID:".bold(), pod_id);
-    
+
     let status_colored = match status {
         "Running" | "Active" => status.green().to_string(),
         "Pending" | "Starting" => status.yellow().to_string(),
@@ -149,7 +164,7 @@ fn display_status_response(
         _ => status.to_string(),
     };
     println!("  {} {}", "Status:".bold(), status_colored);
-    
+
     if let Some(host) = ssh_host {
         let username = ssh_username.unwrap_or("root");
         if let Some(port) = ssh_port {
@@ -162,17 +177,17 @@ fn display_status_response(
             println!("  {} ssh {}@{}", "SSH:".bold(), username, host);
         }
     }
-    
+
     if let Some(expires) = expires_at {
         println!("  {} {}", "Expires:".bold(), expires);
     }
-    
+
     if let Some(remaining) = time_remaining {
         if remaining > 0 {
             let hours = remaining / 3600;
             let minutes = (remaining % 3600) / 60;
             let seconds = remaining % 60;
-            
+
             let time_str = if hours > 0 {
                 format!("{}h {}m {}s", hours, minutes, seconds)
             } else if minutes > 0 {
@@ -180,7 +195,7 @@ fn display_status_response(
             } else {
                 format!("{}s", seconds)
             };
-            
+
             let time_colored = if remaining < 300 {
                 time_str.red().to_string()
             } else if remaining < 600 {
@@ -188,7 +203,7 @@ fn display_status_response(
             } else {
                 time_str.green().to_string()
             };
-            
+
             println!("  {} {}", "Time Left:".bold(), time_colored);
         } else {
             println!("  {} {}", "Time Left:".bold(), "Expired".red());

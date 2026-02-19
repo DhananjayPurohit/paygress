@@ -10,7 +10,7 @@ use nostr_sdk::ToBech32;
 use paygress::provider::{ProviderConfig, ProviderService, load_config, save_config};
 use paygress::nostr::PodSpec;
 
-const CONFIG_PATH: &str = "provider-config.json";
+const CONFIG_PATH: &str = "/etc/paygress/provider-config.json";
 
 
 #[derive(Args)]
@@ -79,6 +79,10 @@ pub struct SetupArgs {
     #[arg(long)]
     pub location: Option<String>,
     
+    /// Public IP address (auto-detected if not provided)
+    #[arg(long)]
+    pub public_ip: Option<String>,
+
     /// Whitelisted Cashu mints (comma-separated)
     #[arg(long, default_value = "https://mint.minibits.cash")]
     pub mints: String,
@@ -87,7 +91,7 @@ pub struct SetupArgs {
 #[derive(Args)]
 pub struct StartArgs {
     /// Path to configuration file
-    #[arg(long, default_value = "provider-config.json")]
+    #[arg(long, default_value = "/etc/paygress/provider-config.json")]
     pub config: String,
     
     /// Run in foreground (don't daemonize)
@@ -176,10 +180,34 @@ async fn execute_setup(args: SetupArgs, verbose: bool) -> Result<()> {
         .filter(|s| !s.is_empty())
         .collect();
 
+    // Determine public IP
+    let public_ip = match args.public_ip {
+        Some(ip) => ip,
+        None => {
+            println!("  {} Auto-detecting public IP...", "⚙".yellow());
+            match reqwest::get("https://api.ipify.org").await {
+                Ok(resp) => match resp.text().await {
+                    Ok(ip) => {
+                        println!("  {} Detected: {}", "✓".green(), ip.trim());
+                        ip.trim().to_string()
+                    }
+                    Err(_) => {
+                        println!("  {} Could not auto-detect IP, using 127.0.0.1", "⚠".yellow());
+                        "127.0.0.1".to_string()
+                    }
+                },
+                Err(_) => {
+                    println!("  {} Could not auto-detect IP, using 127.0.0.1", "⚠".yellow());
+                    "127.0.0.1".to_string()
+                }
+            }
+        }
+    };
+
     // Create configuration
     let config = ProviderConfig {
         backend_type: Default::default(),
-        public_ip: "127.0.0.1".to_string(),
+        public_ip,
         proxmox_url: args.proxmox_url,
         proxmox_token_id: args.token_id,
         proxmox_token_secret: args.token_secret,
@@ -287,8 +315,39 @@ async fn execute_start(args: StartArgs, verbose: bool) -> Result<()> {
 
 async fn execute_stop(_verbose: bool) -> Result<()> {
     println!("{}", "Stopping provider service...".yellow());
-    // TODO: Implement graceful shutdown via signal or PID file
-    println!("{}", "Provider stopped.".green());
+
+    // Try systemctl first (for bootstrapped providers)
+    let output = std::process::Command::new("systemctl")
+        .args(["stop", "paygress-provider"])
+        .output();
+
+    match output {
+        Ok(o) if o.status.success() => {
+            println!("{}", "Provider stopped via systemctl.".green());
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    // Fallback: find and kill the process
+    let output = std::process::Command::new("pgrep")
+        .args(["-f", "paygress-cli provider start"])
+        .output();
+
+    if let Ok(o) = output {
+        if o.status.success() {
+            let pids = String::from_utf8_lossy(&o.stdout);
+            for pid in pids.trim().lines() {
+                let _ = std::process::Command::new("kill")
+                    .arg(pid.trim())
+                    .output();
+            }
+            println!("{}", "Provider stopped.".green());
+            return Ok(());
+        }
+    }
+
+    println!("{}", "No running provider found.".yellow());
     Ok(())
 }
 
