@@ -8,7 +8,7 @@ use std::pin::Pin;
 use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 // Custom event kinds for Paygress provider discovery
 pub const KIND_PROVIDER_OFFER: u16 = 38383;
@@ -117,7 +117,7 @@ impl NostrRelaySubscriber {
                                 
                                 // Check if the rumor is a private direct message
                                 if rumor.kind == Kind::PrivateDirectMessage {
-                                    info!("DEBUG: NIP-17 rumor is PrivateDirectMessage. Content length: {}", rumor.content.len());
+                                    debug!("NIP-17 rumor is PrivateDirectMessage. Content length: {}", rumor.content.len());
                                     
                                     // Create a NostrEvent from the unwrapped rumor with NIP-17 flag
                                     let nostr_event = NostrEvent {
@@ -158,7 +158,7 @@ impl NostrRelaySubscriber {
                             Ok(secret_key) => {
                                 match nip04::decrypt(&secret_key, &event.pubkey, &event.content) {
                                     Ok(decrypted_content) => {
-                                        info!("DEBUG: Decrypted NIP-04 message. Length: {}", decrypted_content.len());
+                                        debug!("Decrypted NIP-04 message. Length: {}", decrypted_content.len());
                                         
                                         // Create a NostrEvent from the decrypted message with NIP-04 flag
                                         let nostr_event = NostrEvent {

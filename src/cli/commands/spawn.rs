@@ -1,38 +1,75 @@
-// Spawn command - Create a new pod with Cashu payment
+// Spawn command - Create a new workload with Cashu payment
+//
+// Unified command that works in both modes:
+//   - Nostr mode (default): sends encrypted spawn request to a provider via Nostr
+//   - HTTP mode (--server): calls a Paygress HTTP server directly
 
 use anyhow::Result;
 use clap::Args;
 use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
 
+use super::identity::{parse_relays, get_or_create_identity};
 use crate::api::{PaygressClient, SpawnRequest};
+use paygress::discovery::DiscoveryClient;
+use paygress::nostr::{EncryptedSpawnPodRequest, AccessDetailsContent, ErrorResponseContent};
 
 #[derive(Args)]
 pub struct SpawnArgs {
+    /// Provider npub (Nostr mode) - if omitted, uses --server for HTTP mode
+    #[arg(long)]
+    pub provider: Option<String>,
+
+    /// HTTP server URL (e.g., http://localhost:8080) - used when --provider is not set
+    #[arg(long)]
+    pub server: Option<String>,
+
     /// Pod tier/specification ID (e.g., basic, standard, premium)
-    #[arg(short, long)]
+    #[arg(short, long, default_value = "basic")]
     pub tier: String,
 
-    /// Cashu token for payment (required)
+    /// Cashu token for payment
     #[arg(short = 'k', long)]
     pub token: String,
 
-    /// Container image to use
-    #[arg(short, long, default_value = "linuxserver/openssh-server:latest")]
+    /// Container image (HTTP mode only)
+    #[arg(short, long, default_value = "ubuntu:22.04")]
     pub image: String,
 
-    /// SSH username for the pod
+    /// SSH username
     #[arg(short = 'u', long, default_value = "user")]
     pub ssh_user: String,
 
-    /// SSH password for the pod
-    #[arg(short = 'p', long, default_value = "password")]
+    /// SSH password
+    #[arg(short = 'p', long)]
     pub ssh_pass: String,
+
+    /// Your Nostr private key (nsec) - uses ~/.paygress/identity if not provided
+    #[arg(long)]
+    pub nostr_key: Option<String>,
+
+    /// Custom Nostr relays (comma-separated)
+    #[arg(long)]
+    pub relays: Option<String>,
 }
 
-pub async fn execute(server: &str, args: SpawnArgs, verbose: bool) -> Result<()> {
+pub async fn execute(args: SpawnArgs, verbose: bool) -> Result<()> {
+    // If --provider is given, use Nostr mode
+    if args.provider.is_some() {
+        let provider = args.provider.clone().unwrap();
+        return execute_nostr_spawn(provider, args, verbose).await;
+    }
+
+    // Otherwise require --server for HTTP mode
+    let server = args.server.clone()
+        .ok_or_else(|| anyhow::anyhow!("Either --provider (Nostr) or --server (HTTP) is required"))?;
+
+    execute_http_spawn(&server, args, verbose).await
+}
+
+async fn execute_http_spawn(server: &str, args: SpawnArgs, verbose: bool) -> Result<()> {
     if verbose {
-        println!("{} Spawning pod...", "→".blue());
+        println!("{} Spawning pod via HTTP...", "->".blue());
         println!("  Server: {}", server);
         println!("  Tier: {}", args.tier);
         println!("  Image: {}", args.image);
@@ -49,23 +86,11 @@ pub async fn execute(server: &str, args: SpawnArgs, verbose: bool) -> Result<()>
 
     let client = PaygressClient::new(server);
 
-    // First check server health
     spinner.set_message("Checking server health...");
-    match client.health().await {
-        Ok(_) => {
-            if verbose {
-                spinner.set_message("Server is healthy");
-            }
-        }
-        Err(e) => {
-            spinner.finish_and_clear();
-            return Err(anyhow::anyhow!("Server health check failed: {}", e));
-        }
-    }
+    client.health().await?;
 
-    // Spawn the pod
     spinner.set_message("Spawning pod with Cashu payment...");
-    
+
     let request = SpawnRequest {
         pod_spec_id: args.tier,
         pod_image: args.image,
@@ -78,18 +103,18 @@ pub async fn execute(server: &str, args: SpawnArgs, verbose: bool) -> Result<()>
     spinner.finish_and_clear();
 
     if response.success {
-        println!("{}", "✅ Pod spawned successfully!".green().bold());
+        println!("{}", "Pod spawned successfully!".green().bold());
         println!();
-        
+
         if let Some(pod_id) = &response.pod_id {
             println!("  {} {}", "Pod ID:".bold(), pod_id);
         }
         if let Some(host) = &response.ssh_host {
             if let Some(port) = response.ssh_port {
-                println!("  {} ssh {}@{} -p {}", 
-                    "SSH:".bold(), 
+                println!("  {} ssh {}@{} -p {}",
+                    "SSH:".bold(),
                     response.ssh_username.as_deref().unwrap_or("user"),
-                    host, 
+                    host,
                     port
                 );
             }
@@ -102,13 +127,113 @@ pub async fn execute(server: &str, args: SpawnArgs, verbose: bool) -> Result<()>
             let seconds = duration % 60;
             println!("  {} {}m {}s", "Duration:".bold(), minutes, seconds);
         }
-        
+
         println!();
-        println!("{}", "💡 Tip: Use 'paygress-cli status --pod-id <POD_ID>' to check status".dimmed());
-        println!("{}", "💡 Tip: Use 'paygress-cli topup --pod-id <POD_ID> --token <TOKEN>' to extend".dimmed());
+        println!("{}", "Tip: Use 'paygress-cli status --pod-id <ID> --server <URL>' to check status".dimmed());
+        println!("{}", "Tip: Use 'paygress-cli topup --pod-id <ID> --server <URL> --token <TOKEN>' to extend".dimmed());
     } else {
         let error_msg = response.error.unwrap_or_else(|| "Unknown error".to_string());
         return Err(anyhow::anyhow!("Failed to spawn pod: {}", error_msg));
+    }
+
+    Ok(())
+}
+
+async fn execute_nostr_spawn(provider_npub: String, args: SpawnArgs, verbose: bool) -> Result<()> {
+    println!("{}", "Spawning Workload".blue().bold());
+    println!("{}", "-".repeat(50).blue());
+    println!();
+
+    let relays = parse_relays(args.relays);
+    let nostr_key = get_or_create_identity(args.nostr_key)?;
+
+    let client = DiscoveryClient::new_with_key(relays, nostr_key).await?;
+
+    println!("  Your NPUB: {}", client.get_npub().cyan());
+    println!();
+
+    // Check if provider is online
+    print!("  Checking provider status... ");
+    if !client.is_provider_online(&provider_npub).await {
+        println!("{}", "OFFLINE".red());
+        println!();
+        println!("{}", "Provider appears to be offline.".red());
+        println!("Try a different provider or wait for this one to come online.");
+        return Ok(());
+    }
+    println!("{}", "ONLINE".green());
+
+    // Get provider info and verify tier
+    let provider = client.get_provider(&provider_npub).await?
+        .ok_or_else(|| anyhow::anyhow!("Provider not found"))?;
+
+    let spec = provider.specs.iter()
+        .find(|s| s.id == args.tier)
+        .ok_or_else(|| anyhow::anyhow!("Tier '{}' not available on this provider", args.tier))?;
+
+    println!("  {} Found tier: {} ({} msat/sec)", "OK".green(), spec.name, spec.rate_msats_per_sec);
+
+    // Build and send spawn request
+    let request = EncryptedSpawnPodRequest {
+        cashu_token: args.token.clone(),
+        pod_spec_id: Some(args.tier.clone()),
+        pod_image: args.image,
+        ssh_username: args.ssh_user,
+        ssh_password: args.ssh_pass,
+    };
+
+    println!();
+    print!("  Sending spawn request... ");
+
+    let request_json = serde_json::to_string(&request)?;
+    let _event_id = client.nostr().send_encrypted_private_message(
+        &provider.npub,
+        request_json,
+        "nip04",
+    ).await?;
+
+    println!("{}", "SENT".green());
+    println!();
+    println!("  Waiting for provider to provision container (timeout: 120s)...");
+
+    match client.nostr().wait_for_decrypted_message(&provider.npub, 120).await {
+        Ok(response) => {
+            println!();
+            println!("{}", "-".repeat(50).blue());
+
+            if let Ok(access) = serde_json::from_str::<AccessDetailsContent>(&response.content) {
+                println!("{}", "Workload Provisioned Successfully!".green().bold());
+                println!();
+                println!("  {}   {}", "Pod ID:".bold(), access.pod_npub.cyan());
+                println!("  {}   {}", "Expires:".bold(), access.expires_at.yellow());
+                println!("  {}   {} vCPU, {} MB RAM", "Spec:".bold(), access.cpu_millicores / 1000, access.memory_mb);
+                println!();
+                println!("{}", "Connection Instructions:".bold());
+                for inst in access.instructions {
+                    println!("  - {}", inst);
+                }
+            } else if let Ok(err) = serde_json::from_str::<ErrorResponseContent>(&response.content) {
+                println!("{}", "Provider Error".red().bold());
+                println!();
+                println!("  Type:    {}", err.error_type);
+                println!("  Message: {}", err.message);
+                if let Some(details) = err.details {
+                    println!("  Details: {}", details);
+                }
+            } else {
+                println!("{}", "Received Unknown Response".yellow().bold());
+                println!();
+                println!("Content: {}", response.content);
+            }
+        }
+        Err(e) => {
+            println!();
+            println!("{}", "-".repeat(50).blue());
+            println!("  {} {}", "Warning:".yellow(), e.to_string().yellow());
+            println!();
+            println!("The request was sent, but the provider didn't respond in time.");
+            println!("You may check your status later with: paygress-cli status --pod-id <ID> --provider <npub>");
+        }
     }
 
     Ok(())

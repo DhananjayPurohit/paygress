@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::nostr::{
     NostrRelaySubscriber, RelayConfig, ProviderOfferContent, HeartbeatContent, 
@@ -309,7 +309,7 @@ impl ProviderService {
                     return Ok(());
                 }
 
-                info!("DEBUG: Handler received event kind: {}, from: {}, message_type: {}", event.kind, event.pubkey, event.message_type);
+                debug!("Handler received event kind: {}, from: {}, message_type: {}", event.kind, event.pubkey, event.message_type);
                 
                 // Parse the request
                 let request_type = match parse_private_message_content(&event.content) {
@@ -330,7 +330,7 @@ impl ProviderService {
                     }
                 };
 
-                info!("DEBUG: Successfully parsed request metadata");
+                debug!("Successfully parsed request metadata");
 
                 // Dispatch to specific handler
                 match request_type {
@@ -401,9 +401,12 @@ impl ProviderService {
             for vmid in expired {
                 info!("Cleaning up expired workload: {}", vmid);
                 
-                if let Some(workload) = workloads.remove(&vmid) {
-                    let result = self.backend.stop_container(vmid).await
-                        .and_then(|_| futures::executor::block_on(self.backend.delete_container(vmid)));
+                if let Some(_workload) = workloads.remove(&vmid) {
+                    let stop_result = self.backend.stop_container(vmid).await;
+                    let result = match stop_result {
+                        Ok(_) => self.backend.delete_container(vmid).await,
+                        Err(e) => Err(e),
+                    };
 
                     match result {
                         Ok(_) => {
@@ -534,7 +537,7 @@ async fn handle_spawn_request(
         host_port: Some(host_port),
     };
 
-    info!("DEBUG: Calling backend.create_container for workload {}", id);
+    debug!("Calling backend.create_container for workload {}", id);
     if let Err(e) = backend.create_container(&container_config).await {
         let err_msg = format!("Backend failed to create workload: {}", e);
         error!("{}", err_msg);
@@ -547,7 +550,7 @@ async fn handle_spawn_request(
         ).await?;
         return Ok(());
     }
-    info!("DEBUG: Successfully created container {}", id);
+    debug!("Successfully created container {}", id);
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
@@ -595,14 +598,14 @@ async fn handle_spawn_request(
         ],
     };
 
-    info!("DEBUG: Sending access details to {}", requester_pubkey);
+    debug!("Sending access details to {}", requester_pubkey);
     nostr.send_access_details_private_message(
         requester_pubkey,
         details,
         message_type,
     ).await?;
 
-    info!("DEBUG: Access details sent successfully");
+    debug!("Access details sent successfully");
 
     info!("Workload {} provisioned for {} seconds", id, duration_secs);
     Ok(())
@@ -665,15 +668,22 @@ async fn handle_status_request(
 
     let expires_dt = chrono::DateTime::from_timestamp(workload.expires_at as i64, 0).unwrap_or_default();
     
+    // Look up spec for actual resource values
+    let spec = config.specs.iter()
+        .find(|s| s.id == workload.spec_id);
+    let cpu = spec.map(|s| s.cpu_millicores).unwrap_or(1000);
+    let mem = spec.map(|s| s.memory_mb).unwrap_or(1024);
+    let host_port = (30000 + (workload.vmid % 10000)) as u16;
+
     let response = StatusResponseContent {
         pod_id: workload.vmid.to_string(),
         status: status.to_string(),
         expires_at: expires_dt.to_rfc3339(),
         time_remaining_seconds: time_remaining,
-        cpu_millicores: 1000, // TODO: Get from spec
-        memory_mb: 1024,      // TODO: Get from spec
+        cpu_millicores: cpu,
+        memory_mb: mem,
         ssh_host: config.public_ip.clone(),
-        ssh_port: 0, // In Proxmox/LXD it varies
+        ssh_port: host_port,
         ssh_username: "root".to_string(),
     };
 
