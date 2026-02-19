@@ -139,5 +139,3 @@ Provider publishes offers (Kind 38383) and heartbeats (Kind 38384) to Nostr rela
 Nginx with `ngx_l402` validates Cashu tokens. Paygress provisions K8s pods with SSH access. Clients interact via HTTP API.
 
 ---
-
-**License:** MIT
