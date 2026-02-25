@@ -70,6 +70,16 @@ pub struct ProviderConfig {
     // Operational settings
     pub heartbeat_interval_secs: u64,
     pub minimum_duration_seconds: u64,
+
+    // Tunnel settings (for providers behind NAT)
+    #[serde(default)]
+    pub tunnel_enabled: bool,
+    #[serde(default)]
+    pub tunnel_interface: Option<String>,
+    #[serde(default)]
+    pub ssh_port_start: Option<u16>,
+    #[serde(default)]
+    pub ssh_port_end: Option<u16>,
 }
 
 impl Default for ProviderConfig {
@@ -107,6 +117,10 @@ impl Default for ProviderConfig {
             whitelisted_mints: vec!["https://mint.minibits.cash".to_string()],
             heartbeat_interval_secs: 60,
             minimum_duration_seconds: 60,
+            tunnel_enabled: false,
+            tunnel_interface: None,
+            ssh_port_start: None,
+            ssh_port_end: None,
         }
     }
 }
@@ -520,9 +534,11 @@ async fn handle_spawn_request(
     // 5. Generate credentials
     let password = crate::sidecar_service::SidecarState::generate_password();
     
-    // Calculate host port for forwarding (simple mapping for now)
-    // ID is usually 1000+, map to 30000+
-    let host_port = 30000 + (id % 10000) as u16;
+    // Calculate host port for forwarding
+    let host_port = match config.ssh_port_start {
+        Some(start) => start + (id - config.vmid_range_start) as u16,
+        None => 30000 + (id % 10000) as u16,
+    };
 
     // 6. Create Container
     let container_config = ContainerConfig {
@@ -673,7 +689,10 @@ async fn handle_status_request(
         .find(|s| s.id == workload.spec_id);
     let cpu = spec.map(|s| s.cpu_millicores).unwrap_or(1000);
     let mem = spec.map(|s| s.memory_mb).unwrap_or(1024);
-    let host_port = (30000 + (workload.vmid % 10000)) as u16;
+    let host_port = match config.ssh_port_start {
+        Some(start) => start + (workload.vmid - config.vmid_range_start) as u16,
+        None => (30000 + (workload.vmid % 10000)) as u16,
+    };
 
     let response = StatusResponseContent {
         pod_id: workload.vmid.to_string(),

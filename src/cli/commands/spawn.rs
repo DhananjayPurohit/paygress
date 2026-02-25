@@ -8,11 +8,21 @@ use anyhow::Result;
 use clap::Args;
 use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
+use rand::Rng;
 
 use super::identity::{parse_relays, get_or_create_identity};
 use crate::api::{PaygressClient, SpawnRequest};
 use paygress::discovery::DiscoveryClient;
 use paygress::nostr::{EncryptedSpawnPodRequest, AccessDetailsContent, ErrorResponseContent};
+
+fn generate_password(len: usize) -> String {
+    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let mut rng = rand::thread_rng();
+    (0..len).map(|_| {
+        let idx = rng.gen_range(0..CHARSET.len());
+        CHARSET[idx] as char
+    }).collect()
+}
 
 #[derive(Args)]
 pub struct SpawnArgs {
@@ -36,13 +46,13 @@ pub struct SpawnArgs {
     #[arg(short, long, default_value = "ubuntu:22.04")]
     pub image: String,
 
-    /// SSH username
-    #[arg(short = 'u', long, default_value = "user")]
-    pub ssh_user: String,
+    /// SSH username (default: "user")
+    #[arg(short = 'u', long)]
+    pub ssh_user: Option<String>,
 
-    /// SSH password
+    /// SSH password (auto-generated if not provided)
     #[arg(short = 'p', long)]
-    pub ssh_pass: String,
+    pub ssh_pass: Option<String>,
 
     /// Your Nostr private key (nsec) - uses ~/.paygress/identity if not provided
     #[arg(long)]
@@ -53,21 +63,25 @@ pub struct SpawnArgs {
     pub relays: Option<String>,
 }
 
-pub async fn execute(args: SpawnArgs, verbose: bool) -> Result<()> {
+pub async fn execute(mut args: SpawnArgs, verbose: bool) -> Result<()> {
+    // Auto-generate SSH credentials if not provided
+    let ssh_user = args.ssh_user.take().unwrap_or_else(|| "user".to_string());
+    let ssh_pass = args.ssh_pass.take().unwrap_or_else(|| generate_password(16));
+
     // If --provider is given, use Nostr mode
     if args.provider.is_some() {
         let provider = args.provider.clone().unwrap();
-        return execute_nostr_spawn(provider, args, verbose).await;
+        return execute_nostr_spawn(provider, args, ssh_user, ssh_pass, verbose).await;
     }
 
     // Otherwise require --server for HTTP mode
     let server = args.server.clone()
         .ok_or_else(|| anyhow::anyhow!("Either --provider (Nostr) or --server (HTTP) is required"))?;
 
-    execute_http_spawn(&server, args, verbose).await
+    execute_http_spawn(&server, args, ssh_user, ssh_pass, verbose).await
 }
 
-async fn execute_http_spawn(server: &str, args: SpawnArgs, verbose: bool) -> Result<()> {
+async fn execute_http_spawn(server: &str, args: SpawnArgs, ssh_user: String, ssh_pass: String, verbose: bool) -> Result<()> {
     if verbose {
         println!("{} Spawning pod via HTTP...", "->".blue());
         println!("  Server: {}", server);
@@ -94,8 +108,8 @@ async fn execute_http_spawn(server: &str, args: SpawnArgs, verbose: bool) -> Res
     let request = SpawnRequest {
         pod_spec_id: args.tier,
         pod_image: args.image,
-        ssh_username: args.ssh_user,
-        ssh_password: args.ssh_pass,
+        ssh_username: ssh_user,
+        ssh_password: ssh_pass,
         cashu_token: Some(args.token),
     };
 
@@ -139,7 +153,7 @@ async fn execute_http_spawn(server: &str, args: SpawnArgs, verbose: bool) -> Res
     Ok(())
 }
 
-async fn execute_nostr_spawn(provider_npub: String, args: SpawnArgs, verbose: bool) -> Result<()> {
+async fn execute_nostr_spawn(provider_npub: String, args: SpawnArgs, ssh_user: String, ssh_pass: String, verbose: bool) -> Result<()> {
     println!("{}", "Spawning Workload".blue().bold());
     println!("{}", "-".repeat(50).blue());
     println!();
@@ -174,12 +188,14 @@ async fn execute_nostr_spawn(provider_npub: String, args: SpawnArgs, verbose: bo
     println!("  {} Found tier: {} ({} msat/sec)", "OK".green(), spec.name, spec.rate_msats_per_sec);
 
     // Build and send spawn request
+    println!("  {} user: {}, pass: {}", "SSH Credentials:".bold(), ssh_user.cyan(), ssh_pass.cyan());
+
     let request = EncryptedSpawnPodRequest {
         cashu_token: args.token.clone(),
         pod_spec_id: Some(args.tier.clone()),
         pod_image: args.image,
-        ssh_username: args.ssh_user,
-        ssh_password: args.ssh_pass,
+        ssh_username: ssh_user,
+        ssh_password: ssh_pass,
     };
 
     println!();

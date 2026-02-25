@@ -56,6 +56,10 @@ pub struct BootstrapArgs {
     /// Dry run - show commands without executing
     #[arg(long)]
     pub dry_run: bool,
+
+    /// Install WireGuard for tunnel support (for machines behind NAT)
+    #[arg(long)]
+    pub tunnel: bool,
 }
 
 pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
@@ -254,7 +258,18 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
         std::io::stdout().flush()?;
         run_ssh_command(&args, &install_deps)?;
         println!("{}", "OK".green());
-        
+
+        if args.tunnel {
+            print!("  Installing WireGuard for tunnel support... ");
+            std::io::stdout().flush()?;
+            let wg_install = format!(
+                "export DEBIAN_FRONTEND=noninteractive && {}apt-get install -y wireguard wireguard-tools",
+                sudo
+            );
+            run_ssh_command(&args, &wg_install)?;
+            println!("{}", "OK".green());
+        }
+
         println!("  Syncing source code... ");
         
         let mut rsync_args = vec![
