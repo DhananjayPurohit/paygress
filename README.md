@@ -37,9 +37,10 @@ Get a Cashu token from a wallet like [Nutstash](https://nutstash.app/) or [Minib
 paygress-cli spawn \
   --provider <PROVIDER_NPUB> \
   --tier basic \
-  --token "cashuA..." \
-  --ssh-pass "my-password"
+  --token "cashuA..."
 ```
+
+SSH credentials are auto-generated and displayed after provisioning. You can also set them explicitly with `--ssh-user` and `--ssh-pass`.
 
 The CLI auto-generates a Nostr identity at `~/.paygress/identity` on first use.
 
@@ -65,7 +66,7 @@ For centralized deployments (Kubernetes + Nginx L402 paywall), pass `--server` i
 
 ```bash
 paygress-cli list --server http://my-server:8080
-paygress-cli spawn --server http://my-server:8080 --tier basic --token "cashuA..." --ssh-pass "pw"
+paygress-cli spawn --server http://my-server:8080 --tier basic --token "cashuA..."
 paygress-cli status --server http://my-server:8080 --pod-id <ID>
 ```
 
@@ -87,7 +88,7 @@ paygress-cli bootstrap \
 
 This will SSH into your server, install LXD (on Ubuntu) or Proxmox (on Debian), compile Paygress, configure a systemd service, and start broadcasting offers to Nostr.
 
-**Requirements:** Linux with systemd, root/sudo access, public IP.
+**Requirements:** Linux with systemd, root/sudo access. Public IP recommended (or use WireGuard tunnel below).
 
 ### Manual Setup
 
@@ -119,6 +120,25 @@ journalctl -u paygress-provider -f
 # Reset (remove all Paygress data from a server)
 paygress-cli system reset --host <IP> --user root
 ```
+
+### Running Behind NAT (No Public IP)
+
+If your machine doesn't have a public IP (e.g., home server behind a router), use a WireGuard VPN tunnel to get one:
+
+```bash
+# Pay for a VPN tunnel with a Cashu token
+paygress-cli provider tunnel \
+  --vpn-url https://vpn.cashu.icu \
+  --token "cashuA..."
+```
+
+This installs WireGuard (if needed), downloads a VPN config, starts the tunnel, and updates your provider config with the public IP and port range. Restart the provider service after:
+
+```bash
+systemctl restart paygress-provider
+```
+
+Your provider is now reachable through the VPN tunnel. Consumers SSH to the tunnel's public IP.
 
 ---
 
