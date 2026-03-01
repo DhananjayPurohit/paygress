@@ -25,7 +25,7 @@ sudo apt update && sudo apt install -y pkg-config libssl-dev
 ## Install
 
 ```bash
-cargo install --path . --bin paygress-cli
+cargo install paygress-cli
 ```
 
 ---
