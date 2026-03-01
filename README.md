@@ -6,6 +6,22 @@ https://github.com/user-attachments/assets/627d2bb1-1a9b-4e66-bc42-7c91a1804fe1
 
 Paygress is a marketplace where anyone can buy or sell compute resources using Cashu ecash tokens. Providers advertise on Nostr, consumers discover and pay - all anonymous, all instant.
 
+## Prerequisites
+
+Install Rust via [rustup](https://rustup.rs/):
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+Install required system libraries (Ubuntu/Debian):
+
+```bash
+sudo apt update && sudo apt install -y pkg-config libssl-dev
+```
+
+---
+
 ## Install
 
 ```bash

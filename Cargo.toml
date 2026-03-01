@@ -2,9 +2,15 @@
 name = "paygress"
 version = "0.1.0"
 edition = "2021"
-authors = ["Dhananjay Purohit <dhananjaypurohit7@gmail.com>"]
-description = "Cashu payment verification and pod provisioning for ingress controllers"
+authors = ["Dhananjay Purohit <dhananjaypurohit7@gmail.com>", "Ritik Jain <ritikjain1272@gmail.com>"]
+description = "Pay-per-use compute marketplace using Cashu ecash and Nostr — no accounts, no signups"
 license = "Apache-2.0"
+repository = "https://github.com/DhananjayPurohit/paygress"
+homepage = "https://paygress.net"
+documentation = "https://github.com/DhananjayPurohit/paygress#readme"
+readme = "README.md"
+keywords = ["cashu", "nostr", "lightning", "compute", "ecash"]
+categories = ["command-line-utilities", "network-programming"]
 
 
 # Unified Paygress service binary
