@@ -133,14 +133,33 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
                 println!("  LXD is already installed.");
             } else {
                 println!("  Installing LXD...");
-                let install_cmd = format!("{}snap install lxd && lxd init --auto", sudo);
+                let install_cmd = format!("{}snap install lxd && {}lxd init --auto", sudo, sudo);
                 run_ssh_command(&args, &install_cmd)?;
                 println!("  LXD installed and initialized!");
             }
-            
-            // Allow root to use lxc
-            // run_ssh_command(&args, "usermod -aG lxd root")?; 
-            // Note: snap lxd usually allows root by default or uses lxd group. Root is always allowed usually.
+
+            // Ensure default storage pool exists (lxd init --auto may not create one,
+            // or LXD may have been pre-installed without a pool)
+            let pool_check = run_ssh_command_output(&args, &format!("{}lxc storage list --format csv 2>/dev/null | wc -l", sudo))?;
+            if pool_check.trim() == "0" {
+                println!("  Creating default storage pool...");
+                let create_pool = format!("{}lxc storage create default dir", sudo);
+                run_ssh_command(&args, &create_pool)?;
+                println!("  Default storage pool created!");
+            } else {
+                println!("  Storage pool already exists.");
+            }
+
+            // Ensure default network bridge exists
+            let net_check = run_ssh_command_output(&args, &format!("{}lxc network list --format csv 2>/dev/null | grep -c lxdbr0 || true", sudo))?;
+            if net_check.trim() == "0" {
+                println!("  Creating default network bridge (lxdbr0)...");
+                let create_net = format!("{}lxc network create lxdbr0", sudo);
+                run_ssh_command(&args, &create_net)?;
+                println!("  Network bridge created!");
+            } else {
+                println!("  Network bridge already exists.");
+            }
         }
     } else if !args.skip_proxmox {
         // Proxmox (Debian) path
