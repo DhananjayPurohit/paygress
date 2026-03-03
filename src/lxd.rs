@@ -42,6 +42,31 @@ impl LxdBackend {
         let s = if raw.trim().is_empty() { "[]" } else { raw };
         serde_json::from_str(s).context("Failed to parse lxc list output")
     }
+
+    /// Return the storage pool to use: the configured one if it exists,
+    /// otherwise the first pool returned by `lxc storage list`.
+    fn resolve_storage_pool(&self) -> Result<String> {
+        let raw = self.run_lxc(&["storage", "list", "--format", "json"])?;
+        let pools: serde_json::Value = serde_json::from_str(if raw.trim().is_empty() { "[]" } else { &raw })
+            .context("Failed to parse lxc storage list output")?;
+
+        let names: Vec<String> = pools.as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .filter_map(|p| p.get("name").and_then(|n| n.as_str()).map(str::to_string))
+            .collect();
+
+        // Use configured pool if it actually exists
+        if names.contains(&self.storage_pool) {
+            return Ok(self.storage_pool.clone());
+        }
+
+        // Fall back to the first available pool
+        names.into_iter().next()
+            .ok_or_else(|| anyhow::anyhow!(
+                "No LXD storage pools found. Run `lxc storage create default dir` on the provider."
+            ))
+    }
 }
 
 #[async_trait]
@@ -89,9 +114,12 @@ impl ComputeBackend for LxdBackend {
         let cpu_limit = format!("limits.cpu={}", config.cpu_cores);
         let mem_limit = format!("limits.memory={}MB", config.memory_mb);
         
+        let pool = self.resolve_storage_pool()?;
+        info!("Using storage pool: {}", pool);
+
         self.run_lxc(&[
             "launch", image, &name,
-            "-s", &self.storage_pool,
+            "-s", &pool,
             "-c", &cpu_limit,
             "-c", &mem_limit,
             "-c", "security.nesting=true",

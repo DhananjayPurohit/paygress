@@ -295,6 +295,9 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
             return Err(anyhow::anyhow!("scp failed — check SSH credentials and path"));
         }
 
+        // Stop the service first — can't overwrite a running binary ("Text file busy")
+        let _ = run_ssh_command(&args, &format!("{}systemctl stop paygress-provider 2>/dev/null || true", sudo));
+
         // Move into place
         let install_remote = format!("{}install -m 755 /tmp/paygress-cli /usr/local/bin/paygress-cli", sudo);
         if !run_ssh_command(&args, &install_remote)? {
@@ -319,6 +322,8 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
             fi
             source "$HOME/.cargo/env" 2>/dev/null || true
             cargo install paygress-cli --force
+            # Stop the running service before overwriting the binary
+            {0}systemctl stop paygress-provider 2>/dev/null || true
             {0}cp "$HOME/.cargo/bin/paygress-cli" /usr/local/bin/paygress-cli
         "#, sudo);
 
