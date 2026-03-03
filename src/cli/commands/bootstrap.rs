@@ -553,22 +553,33 @@ fn run_ssh_command(args: &BootstrapArgs, cmd: &str) -> Result<bool> {
         "-p".to_string(),
         args.port.to_string(),
     ];
-    
+
     if let Some(ref key) = args.key {
         ssh_args.push("-i".to_string());
         ssh_args.push(key.clone());
     }
-    
+
     ssh_args.push(format!("{}@{}", args.user, args.host));
     ssh_args.push(cmd.to_string());
-    
-    let status = Command::new("ssh")
-        .args(&ssh_args)
+
+    // Use sshpass when password is provided to avoid repeated password prompts
+    let (program, final_args) = if let Some(ref password) = args.password {
+        let mut sshpass_args = vec!["-p".to_string(), password.clone(), "ssh".to_string()];
+        sshpass_args.extend(ssh_args);
+        ("sshpass".to_string(), sshpass_args)
+    } else {
+        ("ssh".to_string(), ssh_args)
+    };
+
+    let status = Command::new(&program)
+        .args(&final_args)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status()
-        .context("Failed to execute SSH command")?;
-    
+        .context(format!("Failed to execute {} command. {}", program,
+            if program == "sshpass" { "Is sshpass installed? (apt-get install sshpass / brew install sshpass)" } else { "" }
+        ))?;
+
     Ok(status.success())
 }
 
@@ -579,20 +590,31 @@ fn run_ssh_command_output(args: &BootstrapArgs, cmd: &str) -> Result<String> {
         "-p".to_string(),
         args.port.to_string(),
     ];
-    
+
     if let Some(ref key) = args.key {
         ssh_args.push("-i".to_string());
         ssh_args.push(key.clone());
     }
-    
+
     ssh_args.push(format!("{}@{}", args.user, args.host));
     ssh_args.push(cmd.to_string());
-    
-    let output = Command::new("ssh")
-        .args(&ssh_args)
+
+    // Use sshpass when password is provided to avoid repeated password prompts
+    let (program, final_args) = if let Some(ref password) = args.password {
+        let mut sshpass_args = vec!["-p".to_string(), password.clone(), "ssh".to_string()];
+        sshpass_args.extend(ssh_args);
+        ("sshpass".to_string(), sshpass_args)
+    } else {
+        ("ssh".to_string(), ssh_args)
+    };
+
+    let output = Command::new(&program)
+        .args(&final_args)
         .output()
-        .context("Failed to execute SSH command")?;
-    
+        .context(format!("Failed to execute {} command. {}", program,
+            if program == "sshpass" { "Is sshpass installed? (apt-get install sshpass / brew install sshpass)" } else { "" }
+        ))?;
+
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
