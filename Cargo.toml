@@ -1,6 +1,6 @@
 [package]
 name = "paygress-cli"
-version = "0.1.1"
+version = "0.1.4"
 edition = "2021"
 authors = ["Dhananjay Purohit <dhananjaypurohit7@gmail.com>", "Ritik Jain <ritikjain1272@gmail.com>"]
 description = "Pay-per-use compute marketplace using Cashu ecash and Nostr — no accounts, no signups"
@@ -12,6 +12,9 @@ readme = "README.md"
 keywords = ["cashu", "nostr", "lightning", "compute", "ecash"]
 categories = ["command-line-utilities", "network-programming"]
 
+[lib]
+name = "paygress"
+path = "src/lib.rs"
 
 # Unified Paygress service binary
 [[bin]]
