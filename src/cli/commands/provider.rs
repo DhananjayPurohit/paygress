@@ -444,21 +444,43 @@ async fn execute_config(args: ConfigArgs, _verbose: bool) -> Result<()> {
     Ok(())
 }
 
+/// Check if the current process is running as root (uid 0).
+fn nix_is_root() -> bool {
+    Command::new("id").arg("-u").output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "0")
+        .unwrap_or(false)
+}
+
 async fn execute_tunnel(args: TunnelArgs, _verbose: bool) -> Result<()> {
-    println!("{}", "🔒 WireGuard Tunnel Setup".blue().bold());
+    println!("{}", "WireGuard Tunnel Setup".blue().bold());
     println!("{}", "━".repeat(50).blue());
     println!();
 
+    // Determine if we need sudo (non-root user)
+    let need_sudo = !nix_is_root();
+    let sudo: &[&str] = if need_sudo { &["sudo"] } else { &[] };
+
     let wg_conf_path = format!("/etc/wireguard/{}.conf", args.interface);
 
-    // Check if config already exists
-    if std::path::Path::new(&wg_conf_path).exists() {
-        println!("  {} WireGuard config already exists at {}", "⚠".yellow(), wg_conf_path);
+    // Check if config already exists (use sudo to read since /etc/wireguard may be 700)
+    let exists = if need_sudo {
+        Command::new("sudo").args(["test", "-f", &wg_conf_path]).status().map(|s| s.success()).unwrap_or(false)
+    } else {
+        std::path::Path::new(&wg_conf_path).exists()
+    };
+
+    if exists {
+        println!("  {} WireGuard config already exists at {}", "!".yellow(), wg_conf_path);
         println!("  Delete it first if you want to re-provision.");
         println!();
 
         // Still try to extract info and update provider config
-        let config_content = std::fs::read_to_string(&wg_conf_path)?;
+        let config_content = if need_sudo {
+            let out = Command::new("sudo").args(["cat", &wg_conf_path]).output()?;
+            String::from_utf8_lossy(&out.stdout).to_string()
+        } else {
+            std::fs::read_to_string(&wg_conf_path)?
+        };
         if let Some((public_ip, port_start, port_end)) = parse_wg_config(&config_content) {
             update_provider_tunnel_config(&args.interface, &public_ip, port_start, port_end)?;
         }
@@ -474,17 +496,20 @@ async fn execute_tunnel(args: TunnelArgs, _verbose: bool) -> Result<()> {
         }
         _ => {
             println!("{}", "not found, installing...".yellow());
-            let install = Command::new("apt-get")
-                .args(["install", "-y", "wireguard", "wireguard-tools"])
+            let mut cmd_args: Vec<&str> = sudo.to_vec();
+            cmd_args.extend_from_slice(&["apt-get", "install", "-y", "wireguard", "wireguard-tools"]);
+            let prog = cmd_args.remove(0);
+            let install = Command::new(prog)
+                .args(&cmd_args)
                 .env("DEBIAN_FRONTEND", "noninteractive")
                 .output();
             match install {
                 Ok(o) if o.status.success() => {
-                    println!("  {} WireGuard installed", "✓".green());
+                    println!("  {} WireGuard installed", "V".green());
                 }
                 _ => {
                     return Err(anyhow::anyhow!(
-                        "Failed to install WireGuard. Install manually: apt install wireguard wireguard-tools"
+                        "Failed to install WireGuard. Install manually: sudo apt install wireguard wireguard-tools"
                     ));
                 }
             }
@@ -494,9 +519,10 @@ async fn execute_tunnel(args: TunnelArgs, _verbose: bool) -> Result<()> {
     // 2. Download WireGuard config from VPN service
     print!("  Requesting VPN config from {}... ", args.vpn_url);
     let client = reqwest::Client::new();
+    let version = env!("CARGO_PKG_VERSION");
     let response = client.get(&args.vpn_url)
         .header("Authorization", format!("Cashu {}", args.token))
-        .header("User-Agent", "Paygress-CLI/0.3.0")
+        .header("User-Agent", format!("Paygress-CLI/{}", version))
         .send()
         .await?;
 
@@ -512,36 +538,56 @@ async fn execute_tunnel(args: TunnelArgs, _verbose: bool) -> Result<()> {
     let wg_config = response.text().await?;
     println!("{}", "OK".green());
 
-    // 2. Validate config
+    // 3. Validate config
     if !wg_config.contains("[Interface]") {
-        println!("  {} Received invalid config (no [Interface] section)", "✗".red());
+        println!("  {} Received invalid config (no [Interface] section)", "X".red());
         return Err(anyhow::anyhow!("Invalid WireGuard config received from VPN service"));
     }
-    println!("  {} Config validated", "✓".green());
+    println!("  {} Config validated", "V".green());
 
-    // 3. Save config
-    std::fs::create_dir_all("/etc/wireguard")?;
-    std::fs::write(&wg_conf_path, &wg_config)?;
+    // 4. Save config (use sudo tee to write to /etc/wireguard)
+    if need_sudo {
+        let mut mkdir = Command::new("sudo")
+            .args(["mkdir", "-p", "/etc/wireguard"])
+            .spawn()?;
+        mkdir.wait()?;
 
-    // Set permissions to 600
-    Command::new("chmod")
-        .args(["600", &wg_conf_path])
-        .output()?;
-    println!("  {} Saved to {}", "✓".green(), wg_conf_path);
+        // Write config via sudo tee
+        let mut tee = Command::new("sudo")
+            .args(["tee", &wg_conf_path])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()?;
+        if let Some(ref mut stdin) = tee.stdin {
+            use std::io::Write;
+            stdin.write_all(wg_config.as_bytes())?;
+        }
+        tee.wait()?;
 
-    // 4. Parse tunnel details
+        Command::new("sudo").args(["chmod", "600", &wg_conf_path]).output()?;
+    } else {
+        std::fs::create_dir_all("/etc/wireguard")?;
+        std::fs::write(&wg_conf_path, &wg_config)?;
+        Command::new("chmod").args(["600", &wg_conf_path]).output()?;
+    }
+    println!("  {} Saved to {}", "V".green(), wg_conf_path);
+
+    // 5. Parse tunnel details
     let (public_ip, port_start, port_end) = parse_wg_config(&wg_config)
         .ok_or_else(|| anyhow::anyhow!("Could not extract tunnel IP from WireGuard config"))?;
 
-    println!("  {} Tunnel public IP: {}", "✓".green(), public_ip.cyan());
+    println!("  {} Tunnel public IP: {}", "V".green(), public_ip.cyan());
     if let (Some(ps), Some(pe)) = (port_start, port_end) {
-        println!("  {} Port range: {}-{}", "✓".green(), ps, pe);
+        println!("  {} Port range: {}-{}", "V".green(), ps, pe);
     }
 
-    // 5. Start WireGuard interface
+    // 6. Start WireGuard interface
     print!("  Starting WireGuard interface {}... ", args.interface);
-    let output = Command::new("wg-quick")
-        .args(["up", &args.interface])
+    let mut wg_args: Vec<&str> = sudo.to_vec();
+    wg_args.extend_from_slice(&["wg-quick", "up", &args.interface]);
+    let prog = wg_args.remove(0);
+    let output = Command::new(prog)
+        .args(&wg_args)
         .output()?;
 
     if output.status.success() {
@@ -557,18 +603,24 @@ async fn execute_tunnel(args: TunnelArgs, _verbose: bool) -> Result<()> {
         }
     }
 
-    // 6. Enable on boot
-    let _ = Command::new("systemctl")
-        .args(["enable", &format!("wg-quick@{}", args.interface)])
-        .output();
-    println!("  {} Enabled on boot", "✓".green());
+    // 7. Enable on boot
+    if need_sudo {
+        let _ = Command::new("sudo")
+            .args(["systemctl", "enable", &format!("wg-quick@{}", args.interface)])
+            .output();
+    } else {
+        let _ = Command::new("systemctl")
+            .args(["enable", &format!("wg-quick@{}", args.interface)])
+            .output();
+    }
+    println!("  {} Enabled on boot", "V".green());
 
-    // 7. Update provider config
+    // 8. Update provider config
     update_provider_tunnel_config(&args.interface, &public_ip, port_start, port_end)?;
 
     println!();
     println!("{}", "━".repeat(50).blue());
-    println!("{}", "🎉 Tunnel Active!".green().bold());
+    println!("{}", "Tunnel Active!".green().bold());
     println!();
     println!("  Public IP:  {}", public_ip.cyan());
     println!("  Interface:  {}", args.interface);
