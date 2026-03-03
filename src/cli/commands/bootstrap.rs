@@ -160,6 +160,22 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
             } else {
                 println!("  Network bridge already exists.");
             }
+
+            // Ensure default profile has root disk and network devices
+            // (pool/bridge may exist but profile may have empty devices: {})
+            let profile_devices = run_ssh_command_output(&args, &format!(
+                "{}lxc profile show default 2>/dev/null | grep -c 'root:' || true", sudo
+            ))?;
+            if profile_devices.trim() == "0" {
+                println!("  Configuring default profile with storage and network...");
+                let add_root = format!("{}lxc profile device add default root disk path=/ pool=default", sudo);
+                run_ssh_command(&args, &add_root)?;
+                let add_net = format!("{}lxc network attach-profile lxdbr0 default eth0", sudo);
+                run_ssh_command(&args, &add_net)?;
+                println!("  Default profile configured!");
+            } else {
+                println!("  Default profile already configured.");
+            }
         }
     } else if !args.skip_proxmox {
         // Proxmox (Debian) path
