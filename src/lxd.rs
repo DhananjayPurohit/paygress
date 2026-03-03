@@ -35,15 +35,21 @@ impl LxdBackend {
 
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
+
+    /// Parse lxc list JSON output, treating empty stdout as an empty array.
+    /// `lxc list --format json` returns empty stdout (not `[]`) when no containers exist.
+    fn parse_lxc_json(raw: &str) -> Result<serde_json::Value> {
+        let s = if raw.trim().is_empty() { "[]" } else { raw };
+        serde_json::from_str(s).context("Failed to parse lxc list output")
+    }
 }
 
 #[async_trait]
 impl ComputeBackend for LxdBackend {
     async fn find_available_id(&self, range_start: u32, range_end: u32) -> Result<u32> {
-        // List all containers
-        let output = self.run_lxc(&["list", "--format", "json"])?;
-        let containers: serde_json::Value = serde_json::from_str(&output)?;
-        
+        let raw = self.run_lxc(&["list", "--format", "json"])?;
+        let containers = Self::parse_lxc_json(&raw)?;
+
         let existing_ids: Vec<u32> = containers.as_array()
             .unwrap_or(&vec![])
             .iter()
@@ -85,6 +91,7 @@ impl ComputeBackend for LxdBackend {
         
         self.run_lxc(&[
             "launch", image, &name,
+            "-s", &self.storage_pool,
             "-c", &cpu_limit,
             "-c", &mem_limit,
             "-c", "security.nesting=true",
@@ -204,8 +211,7 @@ impl ComputeBackend for LxdBackend {
             }
         }
         
-        // Use `uptime` or `mpstat` for CPU? Or just 0.5 as placeholder since it's hard to get instantaneous usage portably
-        // Let's use /proc/loadavg
+        // Use /proc/loadavg for CPU
         let loadavg = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
         let load_1min: f64 = loadavg.split_whitespace().next().unwrap_or("0").parse().unwrap_or(0.0);
         let cpu_cores = num_cpus::get() as f64;
@@ -222,8 +228,8 @@ impl ComputeBackend for LxdBackend {
 
     async fn get_container_ip(&self, id: u32) -> Result<Option<String>> {
         let name = format!("paygress-{}", id);
-        let output = self.run_lxc(&["list", &name, "--format", "json"])?;
-        let containers: serde_json::Value = serde_json::from_str(&output)?;
+        let raw = self.run_lxc(&["list", &name, "--format", "json"])?;
+        let containers = Self::parse_lxc_json(&raw)?;
         
         if let Some(container) = containers.as_array().and_then(|a| a.first()) {
             // Traverse json to find eth0 ipv4

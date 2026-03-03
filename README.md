@@ -142,6 +142,11 @@ paygress-cli system reset --host <IP> --user root
 If your machine doesn't have a public IP (e.g., home server behind a router), use a WireGuard VPN tunnel to get one:
 
 ```bash
+# Install WireGuard (Ubuntu/Debian)
+sudo apt install wireguard wireguard-tools
+```
+
+```bash
 # Pay for a VPN tunnel with a Cashu token
 paygress-cli provider tunnel \
   --vpn-url https://vpn.cashu.icu \

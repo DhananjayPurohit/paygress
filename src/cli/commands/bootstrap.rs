@@ -60,6 +60,12 @@ pub struct BootstrapArgs {
     /// Install WireGuard for tunnel support (for machines behind NAT)
     #[arg(long)]
     pub tunnel: bool,
+
+    /// Path to a locally built paygress-cli binary to copy instead of pulling from crates.io.
+    /// Useful for testing without a crates.io release.
+    /// Build it first with: cargo build --release
+    #[arg(long)]
+    pub local_binary: Option<String>,
 }
 
 pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
@@ -89,21 +95,40 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
     println!("{}", "Step 1: Testing SSH Connection".blue().bold());
     println!("{}", "─".repeat(50));
     
-    let ssh_test = build_ssh_command(&args, "echo 'SSH connection successful'");
-    
+
+
     if args.dry_run {
-        println!("  Would run: {}", ssh_test.cyan());
+        println!("  Would connect to {}", args.host.cyan());
     } else {
         print!("  Connecting to {}... ", args.host);
         std::io::stdout().flush()?;
-        
+
+        // Open the ControlMaster — authenticates once, all subsequent SSH calls reuse this socket
+        open_ssh_master(&args)?;
+
         if !run_ssh_command(&args, "echo 'Connected'")? {
             println!("{}", "FAILED".red());
+            close_ssh_master(&args);
             return Err(anyhow::anyhow!("SSH connection failed"));
         }
         println!("{}", "OK".green());
     }
     println!();
+
+    // Step 1.5: Grant passwordless sudo for the rest of this bootstrap session
+    // (prompts once here so every subsequent SSH call is non-interactive)
+    if !is_root && !args.dry_run {
+        println!("{}", "Configuring passwordless sudo for bootstrap session...".yellow());
+        let grant_cmd = format!(
+            "echo '{} ALL=(ALL) NOPASSWD: ALL' | sudo tee /etc/sudoers.d/paygress-bootstrap > /dev/null && echo 'GRANTED'",
+            args.user
+        );
+        if !run_ssh_command(&args, &grant_cmd)? {
+            return Err(anyhow::anyhow!("Failed to configure passwordless sudo. Check that your user has sudo privileges."));
+        }
+        println!("  {} sudo escalation configured (will be removed at end)", "✓".green());
+        println!();
+    }
 
     // Step 2: Check OS & Install Backend
     println!("{}", "Step 2: Checking OS & Installing Backend".blue().bold());
@@ -227,93 +252,92 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
     }
     println!();
 
-    // Step 4: Install Dependencies & Sync Source
-    println!("{}", "Step 4: Installing Dependencies & Syncing Source".blue().bold());
+    // Step 4: Install paygress-cli
+    println!("{}", "Step 4: Installing paygress-cli".blue().bold());
     println!("{}", "─".repeat(50));
-    
-    let install_deps = format!(r#"
-        echo "Checking for Rust environment..."
-        if ! command -v cargo &> /dev/null; then
-             if [ -f "$HOME/.cargo/env" ]; then source "$HOME/.cargo/env"; fi
-        fi
-        if ! command -v cargo &> /dev/null; then
-             echo "Installing Rust..."
-             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-             source "$HOME/.cargo/env"
-        fi
-        
-        if command -v apt-get &> /dev/null; then
-            export DEBIAN_FRONTEND=noninteractive
-            {0}apt-get update -q && {0}apt-get install -y build-essential pkg-config libssl-dev rsync
-        fi
-        
-        # Clean build dir
-        mkdir -p /tmp/paygress-src
-    "#, sudo);
-    
+
     if args.dry_run {
-        println!("  Would install deps and sync source");
-    } else {
-        print!("  Installing system dependencies... ");
-        std::io::stdout().flush()?;
-        run_ssh_command(&args, &install_deps)?;
-        println!("{}", "OK".green());
-
-        if args.tunnel {
-            print!("  Installing WireGuard for tunnel support... ");
-            std::io::stdout().flush()?;
-            let wg_install = format!(
-                "export DEBIAN_FRONTEND=noninteractive && {}apt-get install -y wireguard wireguard-tools",
-                sudo
-            );
-            run_ssh_command(&args, &wg_install)?;
-            println!("{}", "OK".green());
-        }
-
-        println!("  Syncing source code... ");
-        
-        let mut rsync_args = vec![
-             "-az".to_string(),
-             "--exclude=target".to_string(),
-             "--exclude=.git".to_string(),
-             "--exclude=.idea".to_string(),
-             "--delete".to_string(),
-             ".".to_string(),
-        ];
-        
-        // SSH options
-        let ssh_opt = if let Some(ref key) = args.key {
-             format!("ssh -o StrictHostKeyChecking=no -p {} -i {}", args.port, key)
+        if args.local_binary.is_some() {
+            println!("  Would scp local binary to remote and install to /usr/local/bin/");
         } else {
-             format!("ssh -o StrictHostKeyChecking=no -p {}", args.port)
-        };
-        
-        rsync_args.push("-e".to_string());
-        rsync_args.push(ssh_opt);
-        
-        rsync_args.push(format!("{}@{}:/tmp/paygress-src", args.user, args.host));
-        
-        let status = Command::new("rsync")
-            .args(&rsync_args)
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
+            println!("  Would run: cargo install paygress-cli");
+        }
+    } else if let Some(ref bin_path) = args.local_binary {
+        // --- Local binary mode: scp the pre-built binary, no compilation needed ---
+        if !std::path::Path::new(bin_path).exists() {
+            return Err(anyhow::anyhow!(
+                "Local binary not found at '{}'. Build it first with: cargo build --release",
+                bin_path
+            ));
+        }
+        print!("  Copying local binary to {}... ", args.host);
+        std::io::stdout().flush()?;
+
+        // scp via the ControlMaster socket so no re-authentication
+        let cp = control_path(&args.host, args.port);
+        let mut scp_args = vec![
+            "-o".to_string(), "StrictHostKeyChecking=no".to_string(),
+            "-o".to_string(), format!("ControlPath={}", cp),
+            "-P".to_string(), args.port.to_string(),
+        ];
+        if let Some(ref key) = args.key {
+            scp_args.push("-i".to_string());
+            scp_args.push(key.clone());
+        }
+        scp_args.push(bin_path.clone());
+        scp_args.push(format!("{}@{}:/tmp/paygress-cli", args.user, args.host));
+
+        let scp_status = Command::new("scp")
+            .args(&scp_args)
             .status()
-            .context("Failed to execute rsync")?;
-            
-        if !status.success() {
-             // Fallback hint
-             println!("{}", "Rsync failed. Ensure rsync is installed locally.".yellow());
-             return Err(anyhow::anyhow!("Failed to sync source code"));
+            .context("Failed to run scp")?;
+        if !scp_status.success() {
+            return Err(anyhow::anyhow!("scp failed — check SSH credentials and path"));
         }
-        
-        println!("  Compiling Paygress from source (this may take 2-5 mins)...");
-        // Install to user cargo bin then copy with sudo
-        let build_cmd = format!("source $HOME/.cargo/env 2>/dev/null || true; cargo install --path /tmp/paygress-src --bin paygress-cli --force && {}cp $HOME/.cargo/bin/paygress-cli /usr/local/bin/paygress-cli", sudo);
-        
-        if !run_ssh_command(&args, &build_cmd)? {
-             return Err(anyhow::anyhow!("Compilation/Installation failed"));
+
+        // Move into place
+        let install_remote = format!("{}install -m 755 /tmp/paygress-cli /usr/local/bin/paygress-cli", sudo);
+        if !run_ssh_command(&args, &install_remote)? {
+            return Err(anyhow::anyhow!("Failed to install binary on remote"));
         }
-        
+        println!("{}", "OK".green());
+    } else {
+        // --- crates.io mode: cargo install on the remote ---
+        let install_cmd = format!(r#"
+            set -e
+            if ! command -v cargo &> /dev/null; then
+                if [ -f "$HOME/.cargo/env" ]; then source "$HOME/.cargo/env"; fi
+            fi
+            if ! command -v cargo &> /dev/null; then
+                echo "Installing Rust toolchain..."
+                curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+                source "$HOME/.cargo/env"
+            fi
+            if command -v apt-get &> /dev/null; then
+                export DEBIAN_FRONTEND=noninteractive
+                {0}apt-get update -q && {0}apt-get install -y build-essential pkg-config libssl-dev
+            fi
+            source "$HOME/.cargo/env" 2>/dev/null || true
+            cargo install paygress-cli --force
+            {0}cp "$HOME/.cargo/bin/paygress-cli" /usr/local/bin/paygress-cli
+        "#, sudo);
+
+        print!("  Installing paygress-cli from crates.io (this may take a few minutes)... ");
+        std::io::stdout().flush()?;
+        if !run_ssh_command(&args, &install_cmd)? {
+            return Err(anyhow::anyhow!("Failed to install paygress-cli"));
+        }
+        println!("{}", "OK".green());
+    }
+
+    if !args.dry_run && args.tunnel {
+        print!("  Installing WireGuard for tunnel support... ");
+        std::io::stdout().flush()?;
+        let wg_install = format!(
+            "export DEBIAN_FRONTEND=noninteractive && {}apt-get install -y wireguard wireguard-tools",
+            sudo
+        );
+        run_ssh_command(&args, &wg_install)?;
         println!("{}", "OK".green());
     }
     println!();
@@ -496,68 +520,102 @@ WantedBy=multi-user.target
     println!("    {} market list", "paygress-cli".cyan());
     println!();
 
+    // Clean up the temporary NOPASSWD sudoers rule added at bootstrap start
+    if !is_root && !args.dry_run {
+        let _ = run_ssh_command(&args, "sudo rm -f /etc/sudoers.d/paygress-bootstrap");
+        println!("  {} Temporary sudo rule removed", "✓".green());
+    }
+
+    // Close the SSH ControlMaster connection
+    if !args.dry_run {
+        close_ssh_master(&args);
+    }
+
     Ok(())
 }
 
-fn build_ssh_command(args: &BootstrapArgs, cmd: &str) -> String {
-    let mut ssh = format!("ssh -o StrictHostKeyChecking=no -p {} ", args.port);
-    
+fn control_path(host: &str, port: u16) -> String {
+    format!("/tmp/paygress-ssh-{}-{}", host, port)
+}
+
+fn base_ssh_args(args: &BootstrapArgs) -> Vec<String> {
+    let cp = control_path(&args.host, args.port);
+    let mut v = vec![
+        "-o".to_string(), "StrictHostKeyChecking=no".to_string(),
+        "-o".to_string(), "ControlMaster=auto".to_string(),
+        "-o".to_string(), format!("ControlPath={}", cp),
+        "-o".to_string(), "ControlPersist=10m".to_string(),
+        "-p".to_string(), args.port.to_string(),
+    ];
     if let Some(ref key) = args.key {
-        ssh.push_str(&format!("-i {} ", key));
+        v.push("-i".to_string());
+        v.push(key.clone());
     }
-    
-    ssh.push_str(&format!("{}@{} '{}'", args.user, args.host, cmd));
-    ssh
+    v
+}
+
+/// Open a persistent ControlMaster connection (authenticates once).
+fn open_ssh_master(args: &BootstrapArgs) -> Result<()> {
+    let cp = control_path(&args.host, args.port);
+    // If a socket already exists, nothing to do
+    if std::path::Path::new(&cp).exists() {
+        return Ok(());
+    }
+    let mut ssh_args = base_ssh_args(args);
+    ssh_args.extend([
+        "-o".to_string(), "ControlMaster=yes".to_string(),
+        "-N".to_string(), // no command — just keep the connection open
+        "-f".to_string(), // background immediately after auth
+        format!("{}@{}", args.user, args.host),
+    ]);
+    let status = Command::new("ssh")
+        .args(&ssh_args)
+        .status()
+        .context("Failed to open SSH master connection")?;
+    if !status.success() {
+        return Err(anyhow::anyhow!("SSH master connection failed"));
+    }
+    Ok(())
+}
+
+/// Close the ControlMaster connection.
+fn close_ssh_master(args: &BootstrapArgs) {
+    let cp = control_path(&args.host, args.port);
+    let _ = Command::new("ssh")
+        .args([
+            "-o", &format!("ControlPath={}", cp),
+            "-O", "exit",
+            &format!("{}@{}", args.user, args.host),
+        ])
+        .output();
 }
 
 fn run_ssh_command(args: &BootstrapArgs, cmd: &str) -> Result<bool> {
-    let mut ssh_args = vec![
-        "-o".to_string(),
-        "StrictHostKeyChecking=no".to_string(),
-        "-t".to_string(),
-        "-p".to_string(),
-        args.port.to_string(),
-    ];
-    
-    if let Some(ref key) = args.key {
-        ssh_args.push("-i".to_string());
-        ssh_args.push(key.clone());
-    }
-    
+    let mut ssh_args = base_ssh_args(args);
+    ssh_args.push("-t".to_string()); // allocate PTY for interactive commands
     ssh_args.push(format!("{}@{}", args.user, args.host));
     ssh_args.push(cmd.to_string());
-    
+
     let status = Command::new("ssh")
         .args(&ssh_args)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status()
         .context("Failed to execute SSH command")?;
-    
+
     Ok(status.success())
 }
 
 fn run_ssh_command_output(args: &BootstrapArgs, cmd: &str) -> Result<String> {
-    let mut ssh_args = vec![
-        "-o".to_string(),
-        "StrictHostKeyChecking=no".to_string(),
-        "-p".to_string(),
-        args.port.to_string(),
-    ];
-    
-    if let Some(ref key) = args.key {
-        ssh_args.push("-i".to_string());
-        ssh_args.push(key.clone());
-    }
-    
+    let mut ssh_args = base_ssh_args(args);
     ssh_args.push(format!("{}@{}", args.user, args.host));
     ssh_args.push(cmd.to_string());
-    
+
     let output = Command::new("ssh")
         .args(&ssh_args)
         .output()
         .context("Failed to execute SSH command")?;
-    
+
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
