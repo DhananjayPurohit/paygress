@@ -12,7 +12,7 @@ use commands::{list, spawn, topup, status, provider, bootstrap, system};
 #[derive(Parser)]
 #[command(name = "paygress-cli")]
 #[command(author = "Dhananjay Purohit")]
-#[command(version = "0.3.0")]
+#[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(about = "CLI tool for Paygress - spawn compute with Lightning + Nostr", long_about = None)]
 struct Cli {
     /// Enable verbose output

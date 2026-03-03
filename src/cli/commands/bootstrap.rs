@@ -158,14 +158,49 @@ pub async fn execute(args: BootstrapArgs, verbose: bool) -> Result<()> {
                 println!("  LXD is already installed.");
             } else {
                 println!("  Installing LXD...");
-                let install_cmd = format!("{}snap install lxd && lxd init --auto", sudo);
+                let install_cmd = format!("{}snap install lxd && {}lxd init --auto", sudo, sudo);
                 run_ssh_command(&args, &install_cmd)?;
                 println!("  LXD installed and initialized!");
             }
-            
-            // Allow root to use lxc
-            // run_ssh_command(&args, "usermod -aG lxd root")?; 
-            // Note: snap lxd usually allows root by default or uses lxd group. Root is always allowed usually.
+
+            // Ensure default storage pool exists (lxd init --auto may not create one,
+            // or LXD may have been pre-installed without a pool)
+            let pool_check = run_ssh_command_output(&args, &format!("{}lxc storage list --format csv 2>/dev/null | wc -l", sudo))?;
+            if pool_check.trim() == "0" {
+                println!("  Creating default storage pool...");
+                let create_pool = format!("{}lxc storage create default dir", sudo);
+                run_ssh_command(&args, &create_pool)?;
+                println!("  Default storage pool created!");
+            } else {
+                println!("  Storage pool already exists.");
+            }
+
+            // Ensure default network bridge exists
+            let net_check = run_ssh_command_output(&args, &format!("{}lxc network list --format csv 2>/dev/null | grep -c lxdbr0 || true", sudo))?;
+            if net_check.trim() == "0" {
+                println!("  Creating default network bridge (lxdbr0)...");
+                let create_net = format!("{}lxc network create lxdbr0", sudo);
+                run_ssh_command(&args, &create_net)?;
+                println!("  Network bridge created!");
+            } else {
+                println!("  Network bridge already exists.");
+            }
+
+            // Ensure default profile has root disk and network devices
+            // (pool/bridge may exist but profile may have empty devices: {})
+            let profile_devices = run_ssh_command_output(&args, &format!(
+                "{}lxc profile show default 2>/dev/null | grep -c 'root:' || true", sudo
+            ))?;
+            if profile_devices.trim() == "0" {
+                println!("  Configuring default profile with storage and network...");
+                let add_root = format!("{}lxc profile device add default root disk path=/ pool=default", sudo);
+                run_ssh_command(&args, &add_root)?;
+                let add_net = format!("{}lxc network attach-profile lxdbr0 default eth0", sudo);
+                run_ssh_command(&args, &add_net)?;
+                println!("  Default profile configured!");
+            } else {
+                println!("  Default profile already configured.");
+            }
         }
     } else if !args.skip_proxmox {
         // Proxmox (Debian) path
@@ -573,10 +608,21 @@ fn open_ssh_master(args: &BootstrapArgs) -> Result<()> {
         "-f".to_string(), // background immediately after auth
         format!("{}@{}", args.user, args.host),
     ]);
-    let status = Command::new("ssh")
-        .args(&ssh_args)
+    // Use sshpass when password is provided to avoid repeated password prompts
+    let (program, final_args) = if let Some(ref password) = args.password {
+        let mut sshpass_args = vec!["-p".to_string(), password.clone(), "ssh".to_string()];
+        sshpass_args.extend(ssh_args);
+        ("sshpass".to_string(), sshpass_args)
+    } else {
+        ("ssh".to_string(), ssh_args)
+    };
+
+    let status = Command::new(&program)
+        .args(&final_args)
         .status()
-        .context("Failed to open SSH master connection")?;
+        .context(format!("Failed to open SSH master connection. {}", 
+            if program == "sshpass" { "Is sshpass installed? (apt-get install sshpass / brew install sshpass)" } else { "" }
+        ))?;
     if !status.success() {
         return Err(anyhow::anyhow!("SSH master connection failed"));
     }
@@ -601,12 +647,23 @@ fn run_ssh_command(args: &BootstrapArgs, cmd: &str) -> Result<bool> {
     ssh_args.push(format!("{}@{}", args.user, args.host));
     ssh_args.push(cmd.to_string());
 
-    let status = Command::new("ssh")
-        .args(&ssh_args)
+    // Use sshpass when password is provided to avoid repeated password prompts
+    let (program, final_args) = if let Some(ref password) = args.password {
+        let mut sshpass_args = vec!["-p".to_string(), password.clone(), "ssh".to_string()];
+        sshpass_args.extend(ssh_args);
+        ("sshpass".to_string(), sshpass_args)
+    } else {
+        ("ssh".to_string(), ssh_args)
+    };
+
+    let status = Command::new(&program)
+        .args(&final_args)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status()
-        .context("Failed to execute SSH command")?;
+        .context(format!("Failed to execute {} command. {}", program,
+            if program == "sshpass" { "Is sshpass installed? (apt-get install sshpass / brew install sshpass)" } else { "" }
+        ))?;
 
     Ok(status.success())
 }
@@ -616,10 +673,21 @@ fn run_ssh_command_output(args: &BootstrapArgs, cmd: &str) -> Result<String> {
     ssh_args.push(format!("{}@{}", args.user, args.host));
     ssh_args.push(cmd.to_string());
 
-    let output = Command::new("ssh")
-        .args(&ssh_args)
+    // Use sshpass when password is provided to avoid repeated password prompts
+    let (program, final_args) = if let Some(ref password) = args.password {
+        let mut sshpass_args = vec!["-p".to_string(), password.clone(), "ssh".to_string()];
+        sshpass_args.extend(ssh_args);
+        ("sshpass".to_string(), sshpass_args)
+    } else {
+        ("ssh".to_string(), ssh_args)
+    };
+
+    let output = Command::new(&program)
+        .args(&final_args)
         .output()
-        .context("Failed to execute SSH command")?;
+        .context(format!("Failed to execute {} command. {}", program,
+            if program == "sshpass" { "Is sshpass installed? (apt-get install sshpass / brew install sshpass)" } else { "" }
+        ))?;
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }

@@ -95,9 +95,19 @@ paygress-cli status --server http://my-server:8080 --pod-id <ID>
 Set up any Linux VPS as a provider with a single command:
 
 ```bash
+# With SSH password (requires sshpass: apt install sshpass / brew install hudochenkov/sshpass/sshpass)
 paygress-cli bootstrap \
   --host <YOUR_SERVER_IP> \
   --user root \
+  --password "your-ssh-password" \
+  --name "My Node" \
+  --mints "https://testnut.cashu.space"
+
+# With SSH key (no extra dependencies)
+paygress-cli bootstrap \
+  --host <YOUR_SERVER_IP> \
+  --user root \
+  --key ~/.ssh/id_rsa \
   --name "My Node" \
   --mints "https://testnut.cashu.space"
 ```
