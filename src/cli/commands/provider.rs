@@ -2,7 +2,7 @@
 //
 // Commands for machine operators to setup and run a Paygress provider.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 use colored::Colorize;
 use nostr_sdk::ToBech32;
@@ -661,25 +661,58 @@ fn parse_wg_config(config: &str) -> Option<(String, Option<u16>, Option<u16>)> {
     Some((public_ip, port_start, port_end))
 }
 
-/// Update provider config with tunnel settings
+/// Update provider config with tunnel settings (sudo-aware for non-root users)
 fn update_provider_tunnel_config(
     interface: &str,
     public_ip: &str,
     port_start: Option<u16>,
     port_end: Option<u16>,
 ) -> Result<()> {
-    match load_config(CONFIG_PATH) {
+    let need_sudo = !nix_is_root();
+
+    // Load config (use sudo cat if non-root)
+    let config_result = if need_sudo {
+        let out = Command::new("sudo").args(["cat", CONFIG_PATH]).output();
+        match out {
+            Ok(o) if o.status.success() => {
+                let content = String::from_utf8_lossy(&o.stdout).to_string();
+                serde_json::from_str::<crate::provider::ProviderConfig>(&content)
+                    .context("Failed to parse provider config")
+            }
+            _ => Err(anyhow::anyhow!("Config not found")),
+        }
+    } else {
+        load_config(CONFIG_PATH)
+    };
+
+    match config_result {
         Ok(mut config) => {
             config.tunnel_enabled = true;
             config.tunnel_interface = Some(interface.to_string());
             config.public_ip = public_ip.to_string();
             config.ssh_port_start = port_start;
             config.ssh_port_end = port_end;
-            save_config(CONFIG_PATH, &config)?;
-            println!("  {} Provider config updated (public_ip={}, tunnel=enabled)", "✓".green(), public_ip);
+
+            // Save config (use sudo tee if non-root)
+            let content = serde_json::to_string_pretty(&config)?;
+            if need_sudo {
+                let mut tee = Command::new("sudo")
+                    .args(["tee", CONFIG_PATH])
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::null())
+                    .spawn()?;
+                if let Some(ref mut stdin) = tee.stdin {
+                    use std::io::Write;
+                    stdin.write_all(content.as_bytes())?;
+                }
+                tee.wait()?;
+            } else {
+                save_config(CONFIG_PATH, &config)?;
+            }
+            println!("  {} Provider config updated (public_ip={}, tunnel=enabled)", "V".green(), public_ip);
         }
         Err(_) => {
-            println!("  {} No provider config found at {}. Run 'provider setup' first.", "⚠".yellow(), CONFIG_PATH);
+            println!("  {} No provider config found at {}. Run 'provider setup' first.", "!".yellow(), CONFIG_PATH);
             println!("  Tunnel is active but provider config not updated.");
         }
     }
